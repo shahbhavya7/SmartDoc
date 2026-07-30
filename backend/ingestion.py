@@ -28,7 +28,7 @@ import fitz  # PyMuPDF
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-from backend.config import CHUNK_OVERLAP, CHUNK_SIZE
+from backend import config as _config
 
 PDF_SUFFIX = ".pdf"
 
@@ -187,30 +187,49 @@ def extract_pages(pdf_path: str | Path) -> list[PageText]:
         doc.close()
 
 
-def _make_splitter() -> RecursiveCharacterTextSplitter:
+def _make_splitter(
+    chunk_size: int | None = None, chunk_overlap: int | None = None
+) -> RecursiveCharacterTextSplitter:
     """Build the configured splitter.
 
-    Chunk size/overlap are read from ``backend.config`` (backed by
-    ``.env``), never hardcoded here, so Phase 2's chunk-size tuning eval
-    can swap them in one place. Length is measured in tokens via
-    tiktoken so CHUNK_SIZE means "~N tokens", matching the design
+    Chunk size/overlap default to ``backend.config.CHUNK_SIZE`` /
+    ``CHUNK_OVERLAP`` (backed by ``.env``), read dynamically off the
+    ``backend.config`` module (not imported by value) so that callers --
+    notably Phase 2's chunk-size tuning eval -- can override them per call
+    without needing to reload this module. Length is measured in tokens
+    via tiktoken so CHUNK_SIZE means "~N tokens", matching the design
     decision recorded in DECISIONS.md.
+
+    Args:
+        chunk_size: override for ``config.CHUNK_SIZE`` (tokens).
+        chunk_overlap: override for ``config.CHUNK_OVERLAP`` (tokens).
     """
+    size = chunk_size if chunk_size is not None else _config.CHUNK_SIZE
+    overlap = chunk_overlap if chunk_overlap is not None else _config.CHUNK_OVERLAP
     return RecursiveCharacterTextSplitter.from_tiktoken_encoder(
         encoding_name="cl100k_base",
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
+        chunk_size=size,
+        chunk_overlap=overlap,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
 
 
-def chunk_pages(pages: list[PageText], source: str) -> list[Document]:
+def chunk_pages(
+    pages: list[PageText],
+    source: str,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+) -> list[Document]:
     """Split extracted pages into metadata-tagged chunks.
 
     Args:
         pages: Page-ordered, cleaned text as returned by ``extract_pages``.
         source: Filename (not a full path) to attach to every chunk's
             metadata as ``source``.
+        chunk_size: optional override for ``config.CHUNK_SIZE`` (tokens);
+            used by the chunk-size tuning eval to index the same corpus at
+            several sizes without mutating global config.
+        chunk_overlap: optional override for ``config.CHUNK_OVERLAP``.
 
     Returns:
         A list of ``Document`` objects, each with ``page_content`` set to
@@ -220,7 +239,7 @@ def chunk_pages(pages: list[PageText], source: str) -> list[Document]:
         docstring), so it increases monotonically across pages. Chunks
         that are empty/whitespace-only after splitting are dropped.
     """
-    splitter = _make_splitter()
+    splitter = _make_splitter(chunk_size, chunk_overlap)
     chunks: list[Document] = []
     running_index = 0
 
@@ -245,11 +264,17 @@ def chunk_pages(pages: list[PageText], source: str) -> list[Document]:
     return chunks
 
 
-def load_and_chunk(pdf_path: str | Path) -> list[Document]:
+def load_and_chunk(
+    pdf_path: str | Path,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+) -> list[Document]:
     """Extract, clean, and chunk a single PDF end to end.
 
     Args:
         pdf_path: Path to a ``.pdf`` file.
+        chunk_size: optional override for ``config.CHUNK_SIZE`` (tokens).
+        chunk_overlap: optional override for ``config.CHUNK_OVERLAP``.
 
     Returns:
         Metadata-tagged chunks for that document (see ``chunk_pages``).
@@ -260,15 +285,25 @@ def load_and_chunk(pdf_path: str | Path) -> list[Document]:
     """
     path = _require_pdf_path(pdf_path)
     pages = extract_pages(path)
-    return chunk_pages(pages, source=path.name)
+    return chunk_pages(
+        pages, source=path.name, chunk_size=chunk_size, chunk_overlap=chunk_overlap
+    )
 
 
-def load_and_chunk_directory(data_dir: str | Path) -> list[Document]:
+def load_and_chunk_directory(
+    data_dir: str | Path,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+) -> list[Document]:
     """Extract, clean, and chunk every PDF in a directory.
 
     Args:
         data_dir: Directory containing one or more ``.pdf`` files.
             Non-PDF files are ignored; subdirectories are not traversed.
+        chunk_size: optional override for ``config.CHUNK_SIZE`` (tokens);
+            used by the chunk-size tuning eval to index the same corpus at
+            several sizes without mutating global config.
+        chunk_overlap: optional override for ``config.CHUNK_OVERLAP``.
 
     Returns:
         The concatenation of ``load_and_chunk`` results for each PDF,
@@ -293,5 +328,7 @@ def load_and_chunk_directory(data_dir: str | Path) -> list[Document]:
 
     all_chunks: list[Document] = []
     for pdf_path in pdf_paths:
-        all_chunks.extend(load_and_chunk(pdf_path))
+        all_chunks.extend(
+            load_and_chunk(pdf_path, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        )
     return all_chunks
