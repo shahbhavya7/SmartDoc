@@ -1,0 +1,17 @@
+# Secrets
+.env
+
+# Persisted vector store
+chroma_store/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
