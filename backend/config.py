@@ -1,7 +1,10 @@
 """Central configuration, loaded from environment variables / .env.
 
-Every tunable (chunk size, overlap, top-k, model names, store location) lives
-here so no module hardcodes them.
+Every tunable (chunking, retrieval, models, store location, budgets) lives
+here so no module hardcodes them. Values are read at import time; modules that
+need runtime overridability read them via ``import backend.config as config``
+and reference ``config.NAME`` rather than binding the value at import (see
+``backend.ingestion`` for why that matters).
 """
 
 import os
@@ -13,21 +16,221 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 load_dotenv(PROJECT_ROOT / ".env")
 
+
+def _int(name: str, default: int) -> int:
+    return int(os.getenv(name, str(default)))
+
+
+def _float(name: str, default: float) -> float:
+    return float(os.getenv(name, str(default)))
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
 # Secrets
+# ---------------------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
+# ---------------------------------------------------------------------------
 # Models
+# ---------------------------------------------------------------------------
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
-# Chunking / retrieval
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "120"))
-TOP_K = int(os.getenv("TOP_K", "4"))
+# Cheap auxiliary calls (query classification, reranking, grounding checks) run
+# on their own model setting so the answer model can be upgraded independently
+# of the plumbing.
+UTILITY_MODEL = os.getenv("UTILITY_MODEL", "gpt-4o-mini")
 
+# Low temperature everywhere: answers must be reproducible for the consistency
+# check, and the auxiliary calls are classification tasks.
+CHAT_TEMPERATURE = _float("CHAT_TEMPERATURE", 0.0)
+
+# Per-request timeout and retry budget for the OpenAI client. Without an
+# explicit timeout the SDK waits indefinitely, so a single hung connection
+# blocks the calling thread forever -- which stalled an evaluation run for 28
+# minutes with no error, and would hang a FastAPI worker in production.
+REQUEST_TIMEOUT_SECONDS = _float("REQUEST_TIMEOUT_SECONDS", 45.0)
+REQUEST_MAX_RETRIES = _int("REQUEST_MAX_RETRIES", 3)
+
+# ---------------------------------------------------------------------------
+# Chunking
+#
+# Small children are what get embedded and searched; large parents are what the
+# model actually reads. Retrieval precision wants small chunks (a ~350-token
+# chunk about one topic embeds cleanly); answer quality wants large context (a
+# 350-token chunk usually cuts a section in half). Storing both -- searching the
+# child, reading the parent -- gets both, which a single fixed CHUNK_SIZE
+# cannot.
+# ---------------------------------------------------------------------------
+CHILD_CHUNK_SIZE = _int("CHILD_CHUNK_SIZE", 350)
+CHILD_CHUNK_OVERLAP = _int("CHILD_CHUNK_OVERLAP", 60)
+PARENT_CHUNK_SIZE = _int("PARENT_CHUNK_SIZE", 1600)
+
+# Retained for the original single-granularity path and the chunk-size sweep.
+CHUNK_SIZE = _int("CHUNK_SIZE", 800)
+CHUNK_OVERLAP = _int("CHUNK_OVERLAP", 120)
+
+# A line repeated on at least this fraction of a document's pages is treated as
+# a running header/footer and removed. 0.6 is deliberately conservative: a
+# genuine sentence almost never recurs verbatim on 60% of pages, while headers
+# recur on ~100%.
+HEADER_FOOTER_MIN_PAGE_RATIO = _float("HEADER_FOOTER_MIN_PAGE_RATIO", 0.6)
+
+# ---------------------------------------------------------------------------
 # Storage
+# ---------------------------------------------------------------------------
 CHROMA_DIR = PROJECT_ROOT / os.getenv("CHROMA_DIR", "chroma_store")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "smartdoc")
 
+# Explicit distance metric. Chroma's default is "l2"; with unit-norm OpenAI
+# embeddings l2 ranks identically to cosine, but the distance SCALE differs
+# (0-4 vs 0-2), which silently invalidates any tuned distance threshold. Naming
+# it here makes the scale a stated contract rather than an inherited default.
+CHROMA_SPACE = os.getenv("CHROMA_SPACE", "cosine")
+
+# ---------------------------------------------------------------------------
+# Retrieval
+#
+# TOP_K is no longer a single global constant applied to every question -- it is
+# the DEFAULT and the fallback. Per-query-type budgets live in
+# backend/query_analysis.py, because the right k for "how many sick days?" and
+# for "list every fault code" differ by an order of magnitude.
+# ---------------------------------------------------------------------------
+TOP_K = _int("TOP_K", 6)
+
+# Candidates each retriever pulls before fusion/reranking. Recall is cheap here
+# and precision is restored downstream by the reranker, so this sits well above
+# the final k.
+CANDIDATE_K = _int("CANDIDATE_K", 40)
+
+# Reciprocal Rank Fusion constant. 60 is the value from the original RRF paper
+# and behaves well without per-corpus tuning: it damps the influence of deep
+# ranks while keeping the top few ranks decisive.
+RRF_K = _int("RRF_K", 60)
+
+# Diversity cap applied after fusion. Without it, a comparison question can fill
+# every slot from the single best-matching section and never retrieve the
+# counterpart.
+MAX_CHUNKS_PER_SOURCE = _int("MAX_CHUNKS_PER_SOURCE", 4)
+
+# Token ceiling for assembled context. Bounds cost and latency, and keeps the
+# prompt inside the range where models attend reliably.
+MAX_CONTEXT_TOKENS = _int("MAX_CONTEXT_TOKENS", 6000)
+
+# ---------------------------------------------------------------------------
+# Hierarchical retrieval (document routing)
+#
+# Chunk search runs against the whole corpus unless a document-level pass
+# narrows it first. Without that pass an unrelated document wins slots on loose
+# vocabulary overlap, because no stage ever asks which document the question is
+# about -- measured as 0.24 retrieval precision on synthesis questions.
+# ---------------------------------------------------------------------------
+ENABLE_DOC_ROUTING = _bool("ENABLE_DOC_ROUTING", True)
+
+# Chunks sampled corpus-wide to score documents. Independent of the per-query
+# candidate budget: routing wants breadth across documents, not depth in one.
+DOC_ROUTING_CANDIDATES = _int("DOC_ROUTING_CANDIDATES", 60)
+
+# A document is kept only if its score is at least this fraction of the top
+# document's. Relative, not absolute: absolute thresholds do not transfer across
+# corpora or embedding models, whereas the ratio between best and second-best is
+# scale-free.
+DOC_SCORE_DROP_RATIO = _float("DOC_SCORE_DROP_RATIO", 0.45)
+
+# Chunks per document that contribute to its routing score. Bounded so a long
+# document cannot outrank a precise short one on sheer volume of weak hits.
+DOC_SCORE_TOP_CHUNKS = _int("DOC_SCORE_TOP_CHUNKS", 3)
+
+# Candidate slots reserved for chunks OUTSIDE the routed documents on gated
+# modes. Routing should bias retrieval, not blind it: when a question is
+# misclassified as a simple lookup, hard gating deletes the bridging document
+# and the answer is either wrong or a false refusal. Measured: multi-hop recall
+# fell 0.62 -> 0.38 when gating was introduced, entirely on questions the
+# classifier had labelled fact_lookup. A few reserved slots let the reranker
+# still see the bridge.
+CROSS_DOC_RESERVE_SLOTS = _int("CROSS_DOC_RESERVE_SLOTS", 3)
+
+# Ceiling on sections examined by an exhaustive sweep before falling back to
+# keyword pre-filtering. Guards against a 500-page manual.
+SWEEP_MAX_CANDIDATES = _int("SWEEP_MAX_CANDIDATES", 60)
+
+# Candidates per reranking call. Batching keeps a large sweep within a single
+# request's token budget while still scoring every candidate.
+RERANK_BATCH_SIZE = _int("RERANK_BATCH_SIZE", 30)
+
+# ---------------------------------------------------------------------------
+# Pipeline feature flags. Each stage can be disabled independently so the
+# evaluation harness can measure its contribution in isolation (ablation)
+# rather than asserting that it helps.
+# ---------------------------------------------------------------------------
+ENABLE_HYBRID = _bool("ENABLE_HYBRID", True)
+ENABLE_RERANK = _bool("ENABLE_RERANK", True)
+ENABLE_DECOMPOSITION = _bool("ENABLE_DECOMPOSITION", True)
+ENABLE_PARENT_EXPANSION = _bool("ENABLE_PARENT_EXPANSION", True)
+ENABLE_GROUNDING_CHECK = _bool("ENABLE_GROUNDING_CHECK", True)
+
+# ---------------------------------------------------------------------------
+# Grounding remediation
+#
+# Detecting an unsupported claim and returning it anyway defeats the purpose of
+# detecting it. When verification fails the answer is regenerated with the
+# offending claims named for removal; if that still fails, the unsupported
+# sentences are excised.
+# ---------------------------------------------------------------------------
+ENABLE_GROUNDING_REPAIR = _bool("ENABLE_GROUNDING_REPAIR", True)
+MAX_GROUNDING_REPAIRS = _int("MAX_GROUNDING_REPAIRS", 1)
+
+# Requested alias for the flag above, so the orchestration layer can be
+# configured with one naming convention. Repair itself is unchanged.
+GROUNDING_REPAIR_ENABLED = _bool("GROUNDING_REPAIR_ENABLED", ENABLE_GROUNDING_REPAIR)
+
+# ---------------------------------------------------------------------------
+# Orchestration layer (additive, all OFF by default)
+#
+# These gate NEW behaviour layered on top of retrieval. Retrieval itself --
+# dense embeddings, BM25, RRF, hybrid search, chunk sizes, the reranker, the
+# adaptive modes, decomposition, and the grounding verifier's DETECTION logic --
+# is unchanged and is treated here as a fixed input.
+#
+# With every flag below OFF, the pipeline behaves exactly as it does today.
+# ---------------------------------------------------------------------------
+
+# Feature 1: extra document-routing signals (title similarity, explicit
+# references, conversation focus, entity overlap) layered over the existing
+# similarity-derived document scores.
+ROUTER_ENABLED = _bool("ROUTER_ENABLED", False)
+
+# How much the additional signals may move a document's routing score, as a
+# multiplier on the existing score. Bounded so the retriever's own evidence
+# stays dominant: the brief is to bias toward precision WITHOUT dropping true
+# positives, and an unbounded bonus could reorder documents the retriever
+# strongly supports.
+ROUTER_SIGNAL_WEIGHT = _float("ROUTER_SIGNAL_WEIGHT", 0.35)
+
+# A document the retriever supports this strongly is never demoted by the extra
+# signals -- the protection against dropping true positives.
+ROUTER_PROTECT_RATIO = _float("ROUTER_PROTECT_RATIO", 0.85)
+
+# Feature 2: recommendation planner for combination/workflow questions.
+PLANNER_ENABLED = _bool("PLANNER_ENABLED", False)
+
+# Feature 3: outline-driven synthesis guaranteeing section coverage.
+OUTLINE_SYNTHESIS_ENABLED = _bool("OUTLINE_SYNTHESIS_ENABLED", False)
+
+# ---------------------------------------------------------------------------
+# API limits
+# ---------------------------------------------------------------------------
+MAX_UPLOAD_MB = _int("MAX_UPLOAD_MB", 20)
+MAX_QUESTION_CHARS = _int("MAX_QUESTION_CHARS", 4000)
+
+# ---------------------------------------------------------------------------
 # Service wiring
+# ---------------------------------------------------------------------------
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")

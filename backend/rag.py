@@ -1,402 +1,905 @@
-"""Phase 3 — the core RAG query function.
+"""The core RAG query function: plan, retrieve, assemble, answer, verify.
 
-This module is the heart of SmartDoc: given a plain-English question, it
+    analyze -> route -> retrieve -> assemble -> generate -> ground-check -> cite
 
-1. embeds the question with the SAME OpenAI embedding model used at ingest
-   time (``config.EMBED_MODEL``, via ``backend.vectorstore.openai_embed_fn``),
-2. retrieves the top-k most similar chunks (with their ``{source, page,
-   chunk_index}`` metadata) from the already-persisted Chroma collection
-   (``backend.vectorstore.query_collection`` -- no re-embedding of the
-   corpus happens here),
-3. assembles a prompt containing ONLY those retrieved chunks plus a strict
-   system instruction to answer solely from that context, and
-4. calls ``gpt-4o-mini`` (``config.CHAT_MODEL``) at low temperature to
-   produce a grounded answer.
+Design commitments
+------------------
+**Citations cannot diverge from context.** Sources are built from
+``AssembledContext.units_used`` -- exactly the units that entered the prompt. A
+previous implementation passed *all* retrieved hits to the prompt while filtering
+the citation list by a distance margin, so the model could read four passages
+while the user was shown one; any claim drawn from the other three was uncited.
 
-It does not do ingestion, chunking, or embedding of documents -- those are
-Phase 1/2. It does not expose an HTTP API or a UI -- those are Phase 4/5-6.
+**Citations cannot be hallucinated.** Every field of every source comes from
+retrieval metadata and chunk text. Nothing parses the model's output.
 
-Anti-hallucination design (M6S5): the system prompt is the PRIMARY guard --
-it instructs the model to answer only from the provided context and to
-reply with the exact refusal string when the context doesn't contain the
-answer. We deliberately do NOT use a similarity-distance threshold as a
-guard: measured distances for this corpus (see the module's verification
-transcript in the Phase 3 report) show in-corpus and out-of-scope queries
-occupy overlapping distance ranges with only ~21 chunks across 7 short
-documents, so any single cutoff would either refuse valid in-scope
-questions or let out-of-scope ones through. The prompt-based guard handled
-every tested case correctly without a distance floor, so no unjustified
-"magic number" threshold was added.
+**Snippets are language-independent.** The snippet is cut from the child chunk
+that actually matched the query embedding, not chosen by lexical overlap with the
+question -- which silently degrades to head-of-section for any non-English
+question (observed: a Spanish query about annual leave citing the Sick Leave
+section).
 
-Citations (M6S4) are built ENTIRELY from retrieval metadata and chunk text
--- never parsed out of the model's generated answer -- so they cannot be
-hallucinated. See ``_build_sources``.
+**Refusal is graded, not binary.** A half-answerable question used to produce an
+answer with the refusal sentence bolted on. Three cases are distinguished, and
+only "nothing answerable" emits the fixed refusal string.
 
-Decision on sources when the model declines to answer (the "I don't know"
-path): ``sources`` is an EMPTY list. Rationale: sources are supposed to
-mean "this is where the answer came from." If we attached the top-k
-retrieved chunks anyway, a user skimming citations without reading the
-refusal text could mistake them for supporting evidence for an answer that
-was never actually given -- which is precisely the misleading behavior
-this system exists to prevent. An empty ``sources`` list is a deliberate,
-consistent signal that "no document supported this answer," which we judge
-more honest than satisfying "answers include >=1 source" literally in a
-case where doing so would misrepresent what was retrieved as evidence.
+**Answers are checked AND enforced.** Detecting an unsupported claim and
+returning it anyway defeats the purpose of detecting it: verification failures
+are regenerated, pruned, or withdrawn -- subject to guards that stop remediation
+from doing net harm.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import re
-from dataclasses import asdict, dataclass, field
+import time
+from dataclasses import asdict, dataclass, field, replace
 
 import openai
 
-from backend.config import CHAT_MODEL, TOP_K
-from backend.vectorstore import openai_embed_fn, query_collection
+import backend.config as config
+from backend.context import AssembledContext, assemble
+from backend.ingestion import count_tokens
+from backend.query_analysis import (
+    COMPARISON,
+    CROSS_DOCUMENT,
+    EXHAUSTIVE,
+    MULTI_HOP,
+    PROCEDURAL,
+    PROFILES,
+    SYNTHESIS,
+    QueryPlan,
+    analyze,
+)
+from backend.intent import COMBINATION, DOCUMENT_WIDE
+from backend.intent import classify as intent_of
+from backend.retrieval import RetrievalResult, retrieve
+from backend.vectorstore import VectorStoreError, _shared_openai  # noqa: F401
 
-# The exact refusal string the model must use verbatim when the retrieved
-# context does not contain the answer. Comparisons against this use
-# ``_is_refusal`` (normalized), not raw equality -- see that function's
-# docstring for why.
+logger = logging.getLogger("smartdoc.rag")
+
 REFUSAL_MESSAGE = "I don't know based on the available documents."
 
-# Generation is kept deterministic-ish (low temperature) so the same
-# question returns an equivalent answer on repeat runs (M6B1).
-CHAT_TEMPERATURE = 0.0
+SNIPPET_LENGTH = 260
 
-# Length (in characters) of the excerpt/window shown for each cited source.
-# Long enough to give a human a sense of the passage, short enough to stay a
-# "snippet" rather than reproducing the whole chunk. Also governs the size
-# of the lexically-centered window in ``_snippet``.
-SNIPPET_LENGTH = 240
-
-# Structural filter for which retrieved hits become citations (weakness-2
-# fix): keep a hit only if its distance is within this margin of the best
-# (lowest-distance) hit in the batch. Justified by measured distance gaps
-# on this corpus's 3 known-answer questions (real numbers from a live run
-# against the persisted collection):
-#   "annual leave" question:   gaps from best = 0.00, 0.19, 0.69, 0.74
-#   "fault code E-01" question: gaps from best = 0.00, 0.31, 0.32, 0.43
-#   "password length" question: gaps from best = 0.00, 0.19, 0.21, 0.22
-# In every case the genuinely-relevant hits (same document/topic as the
-# best hit) sit within ~0.2 of the best distance, while irrelevant hits
-# from unrelated documents/sections jump by >=0.3-0.7. A margin of 0.30
-# keeps every relevant hit observed in testing while dropping the
-# off-topic ones (e.g. product_manual_widgetx.pdf noise on the fault-code
-# question) -- see the Phase 3 verification transcript for the before/after.
-SOURCE_DISTANCE_MARGIN = 0.30
-
-# Words to ignore when scoring which sentence of a chunk best supports the
-# question, for the lexical snippet-centering heuristic in ``_snippet``.
-# Small, deliberately generic English stopword list -- not corpus-tuned.
-_STOPWORDS = {
-    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-    "of", "in", "on", "at", "to", "for", "and", "or", "but", "if", "then",
-    "so", "do", "does", "did", "what", "which", "who", "whom", "whose",
-    "this", "that", "these", "those", "it", "its", "as", "by", "with",
-    "from", "about", "into", "over", "after", "before", "under", "above",
-    "below", "between", "during", "per", "how", "many", "much", "can",
-    "could", "should", "would", "will", "shall", "may", "might", "must",
-    "not", "no", "yes", "i", "you", "he", "she", "we", "they", "them",
-    "his", "her", "their", "our", "your", "my", "me", "us", "him",
-}
-
-SYSTEM_PROMPT = f"""You are SmartDoc, a company document assistant. You answer \
-employee questions using ONLY the context passages provided below, each \
-labeled with its source document and page number.
-
-Rules (follow all of them exactly):
-- Use ONLY the information in the provided context. Do not use any outside \
-knowledge, training data, or assumptions, even if you are confident about \
-the true answer.
-- If the context fully or partially answers the question, answer it as \
-completely as the context allows, in clear plain English. It is fine if \
-the answer draws on more than one context passage.
-- If the context does not contain information that answers the question, \
-you MUST reply with EXACTLY this sentence and nothing else: \
-"{REFUSAL_MESSAGE}"
-- Do not guess, speculate, or fill gaps with general knowledge. If you are \
-not sure the context supports the answer, prefer the refusal above answering.
-- Do not mention "the context" or "the documents provided" explicitly in a \
-normal answer -- just answer naturally, as if you had read the source \
-material. Do not fabricate citations, page numbers, or filenames in your \
-answer text -- citations are handled separately by the system.
-"""
+# Numbers and identifier-shaped tokens are the claims most worth verifying: a
+# wrong entitlement figure or fault code is the failure mode that matters in
+# policy and manual Q&A.
+_NUMERIC_CLAIM_RE = re.compile(r"\b\d[\d,.]*\b")
+_IDENT_CLAIM_RE = re.compile(r"\b[A-Z]{1,4}-\d{1,4}\b|\bAES-?\d{3}\b|\bTLS\s?\d\.\d\b")
 
 
 class RagError(Exception):
-    """Raised for retrieval or generation failures in the RAG pipeline."""
+    """Base class for retrieval/generation failures."""
 
 
 class InvalidQuestionError(RagError):
-    """Raised when the input question is empty/whitespace-only."""
+    """Raised when the question is empty or whitespace-only."""
 
 
 class GenerationError(RagError):
-    """Raised when the OpenAI chat completion call fails.
-
-    Wraps network errors, auth errors, and rate limiting from the OpenAI
-    SDK so callers (Phase 4's FastAPI layer) can map this to a clean HTTP
-    error response instead of the app crashing or silently returning an
-    empty answer.
-    """
+    """Raised when the OpenAI chat completion call fails."""
 
 
 @dataclass
 class Source:
-    """A single structural citation, derived entirely from retrieval metadata.
-
-    Never constructed from the model's generated text -- see module
-    docstring for why that matters for anti-hallucination guarantees.
-    """
+    """A structural citation, derived only from retrieval metadata and text."""
 
     source: str
     page: int
     snippet: str
+    section: str = ""
+    page_end: int | None = None
+
+
+@dataclass
+class Grounding:
+    """Verification verdict for an answer.
+
+    Two independent signals, kept separate on purpose:
+
+    * ``unsupported_claims`` -- what the LLM entailment judge rejected.
+    * ``unverified_numbers`` -- figures in the answer not verbatim in context.
+      Informational: a legitimately derived value ("a difference of eight days"
+      from 20 and 28) lands here, so it must not by itself condemn an answer.
+    """
+
+    checked: bool = False
+    faithful: bool | None = None
+    unsupported_claims: list[str] = field(default_factory=list)
+    unverified_numbers: list[str] = field(default_factory=list)
+    note: str = ""
+
+    # Remediation trail: "regenerated", "pruned", "declined", or "".
+    repaired: str = ""
+    removed_claims: list[str] = field(default_factory=list)
 
 
 @dataclass
 class RagResponse:
-    """Return type of :func:`query`. Serializes cleanly to JSON via ``asdict``."""
+    """Return type of :func:`query`; serialises cleanly to JSON."""
 
     answer: str
     sources: list[Source] = field(default_factory=list)
+    query_type: str = ""
+    grounding: Grounding = field(default_factory=Grounding)
+    diagnostics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        """Return a plain-dict/JSON-serializable representation."""
         return {
             "answer": self.answer,
             "sources": [asdict(s) for s in self.sources],
+            "query_type": self.query_type,
+            "grounding": asdict(self.grounding),
+            "diagnostics": self.diagnostics,
         }
 
 
-_WORD_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9'-]*")
-# Sentence-ish spans: runs of non-terminator characters, optionally followed
-# by a terminator. Deliberately simple (no NLP dependency) -- good enough
-# for a lexical heuristic over short policy/manual prose.
-_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]*")
+# ---------------------------------------------------------------------------
+# Prompting
+# ---------------------------------------------------------------------------
+
+_BASE_RULES = f"""You are SmartDoc, a company document assistant. You answer \
+employee questions using ONLY the context passages provided, each labelled with \
+its source document and page.
+
+Grounding rules -- follow all of them:
+- Use ONLY information present in the context. Never use outside knowledge or \
+assumptions, even when you are confident of the real answer.
+- Never invent numbers, dates, names, codes, or thresholds. If a figure is not \
+in the context, do not state a figure.
+- Do not fabricate citations, page numbers, or filenames in your answer text; \
+citations are attached separately by the system.
+- Answer naturally, without phrases like "the context says".
+
+How much to answer:
+- If the context fully answers the question, answer it completely.
+- If the context answers PART of the question, answer that part, then add one \
+short final sentence naming exactly what the documents do not cover. Do NOT use \
+the fixed refusal sentence in this case.
+- If the context does not answer the question at all, reply with EXACTLY this \
+sentence and nothing else: "{REFUSAL_MESSAGE}"
+- If two documents give conflicting values, report both and say which document \
+each came from. Do not silently pick one."""
+
+_TYPE_RULES = {
+    COMPARISON: """This is a COMPARISON question. Address every entity named in \
+the question explicitly, even if the context covers one better than another. \
+State each side's value, then the difference. If the context covers only one \
+side, say which side is missing rather than implying symmetry.""",
+    MULTI_HOP: """This is a MULTI-STEP question. The answer depends on an \
+intermediate fact (for example an entity's category, tier, or classification). \
+Identify that intermediate fact from the context first, then apply the rule that \
+governs it, and state both links explicitly so the reasoning is checkable.""",
+    PROCEDURAL: """This is a PROCEDURAL question. Answer as an ordered list of \
+steps in the order the documents give them. Preserve every stated deadline, \
+threshold, and approver. Do not merge or reorder steps, and do not invent steps \
+to bridge a gap in the context -- note the gap instead.""",
+    SYNTHESIS: """This is a DOCUMENT-WIDE SYNTHESIS question. The context is \
+presented in document order and may begin with the document's section outline.
+
+- Organise your answer to follow the document's own structure, using short \
+headings drawn from its sections.
+- Cover every section present in the context rather than generalising across \
+them; a synthesis that collapses five sections into one paragraph has lost the \
+information the question asked for.
+- Preserve concrete values (amounts, deadlines, thresholds) where the context \
+gives them.
+- If the outline lists sections the context does not include, say which parts of \
+the document your answer does not cover. Do not imply the excerpt is the whole \
+document.""",
+    EXHAUSTIVE: """This is an EXHAUSTIVE EXTRACTION question. Completeness is the \
+priority. Enumerate EVERY matching item found anywhere in the context, including \
+items inside tables AND items described only in prose outside tables. Do not \
+summarise, do not truncate with "etc.", and do not stop at the first list you \
+find -- items of the same kind may appear in more than one passage. If you \
+believe the list may be incomplete, say so explicitly at the end.""",
+    CROSS_DOCUMENT: """This is a CROSS-DOCUMENT question. Several documents are \
+in the context by design.
+
+- Attribute every value to the document it came from, by document name only. \
+Never write page numbers in your answer text -- the system attaches exact pages \
+separately, and a page number you invent cannot be checked.
+- Where documents state DIFFERENT values for the same thing, present that \
+explicitly as a difference (or a conflict) rather than choosing one.
+- Where documents agree, say so once rather than repeating it per document.
+- If one document covers the subject and another is silent, say the second is \
+silent rather than treating silence as agreement.""",
+}
 
 
-def _content_words(text: str) -> set[str]:
-    """Lowercased, stopword-filtered word set used for lexical overlap scoring."""
-    words = _WORD_RE.findall(text.lower())
-    return {w for w in words if w not in _STOPWORDS and len(w) > 2}
+def _system_prompt(plan: QueryPlan) -> str:
+    """Base grounding rules plus the instructions for this query type."""
+    return f"{_BASE_RULES}\n\n{_TYPE_RULES.get(plan.query_type, '')}".strip()
 
 
-def _snippet(question: str, text: str, length: int = SNIPPET_LENGTH) -> str:
-    """Extract a snippet of ``text`` centered on its most question-relevant part.
+def build_prompt(question: str, context: AssembledContext) -> str:
+    """Assemble the user turn: labelled context, then the question."""
+    body = context.text or "(no relevant context retrieved)"
+    return (
+        f"Context passages:\n\n{body}\n\n"
+        f"Question: {question}\n\n"
+        "Answer using only the context above."
+    )
 
-    Weakness-1 fix: rather than always taking the head of the chunk (which
-    frequently misses the actual supporting sentence -- e.g. a chunk headed
-    "3. Electrical and Network Connections" whose relevant sentence about
-    fault code E-01 sits several sentences later), this scores each
-    sentence-ish span of ``text`` by its lexical (stopword-filtered,
-    case-insensitive) word overlap with ``question``, and returns a window
-    of ``length`` characters centered on the highest-scoring span. This
-    stays purely structural -- derived only from the question and the
-    retrieved chunk text, never from the model's generated answer -- so it
-    cannot introduce hallucinated citation content.
 
-    If no span scores above zero (no lexical overlap at all), falls back to
-    the original head-of-chunk truncation.
+# ---------------------------------------------------------------------------
+# Refusal / incompleteness detection
+# ---------------------------------------------------------------------------
+
+_QUOTES = "\"'`“”‘’"
+
+# The base prompt instructs a partial answer to end with one sentence naming what
+# the documents do not cover. Because we control that phrasing, matching it is a
+# reliable signal that retrieval came back incomplete -- worth one wider retry,
+# exactly like a refusal.
+_INCOMPLETE_RE = re.compile(
+    r"\b(do(?:es)?\s+not\s+(?:cover|specify|state|mention|provide|include)|"
+    r"not\s+specified|no\s+information\s+(?:about|on)|documents?\s+do\s+not)\b",
+    re.I,
+)
+
+
+def _normalise_answer(text: str) -> str:
+    """Normalise for refusal comparison: whitespace, quotes, case."""
+    collapsed = re.sub(r"\s+", " ", (text or "").strip())
+    while len(collapsed) > 1 and collapsed[0] in _QUOTES and collapsed[-1] in _QUOTES:
+        collapsed = collapsed[1:-1].strip()
+    return collapsed.casefold()
+
+
+def _is_refusal(answer_text: str) -> bool:
+    """True if the WHOLE answer is the refusal sentence.
+
+    Compares the entire normalised answer, not a substring: a genuine partial
+    answer may legitimately contain the same sentence as one clause among others,
+    and that case must keep its citations.
     """
-    stripped = text.strip()
-    if len(stripped) <= length:
-        return stripped
-
-    question_words = _content_words(question)
-    if not question_words:
-        return stripped[:length].rstrip() + "..."
-
-    spans = [(m.start(), m.end()) for m in _SENTENCE_RE.finditer(stripped) if m.group().strip()]
-    best_span = None
-    best_score = 0
-    for start, end in spans:
-        score = len(question_words & _content_words(stripped[start:end]))
-        if score > best_score:
-            best_score = score
-            best_span = (start, end)
-
-    if best_span is None:
-        # No lexical overlap anywhere in the chunk -- fall back to the head.
-        return stripped[:length].rstrip() + "..."
-
-    best_start, best_end = best_span
-    span_len = best_end - best_start
-    if span_len >= length:
-        window_start, window_end = best_start, best_end
-    else:
-        pad_total = length - span_len
-        pad_before = pad_total // 2
-        window_start = max(0, best_start - pad_before)
-        window_end = min(len(stripped), window_start + length)
-        # Re-anchor if one side hit a boundary, so the window still uses
-        # its full length budget where the text allows it.
-        if window_end - window_start < length:
-            window_start = max(0, window_end - length)
-
-    excerpt = stripped[window_start:window_end].strip()
-    prefix = "..." if window_start > 0 else ""
-    suffix = "..." if window_end < len(stripped) else ""
-    return f"{prefix}{excerpt}{suffix}"
+    return _normalise_answer(answer_text) == _normalise_answer(REFUSAL_MESSAGE)
 
 
-def _filter_relevant_hits(
-    hits: list[dict], margin: float = SOURCE_DISTANCE_MARGIN
-) -> list[dict]:
-    """Keep only hits within ``margin`` distance of the best (closest) hit.
-
-    Weakness-2 fix: citing every retrieved chunk regardless of whether it
-    actually contributed dilutes citations with retrieval noise (e.g. an
-    unrelated product manual pulled in only because it shares vocabulary).
-    This is a purely structural filter over retrieval distances -- see
-    ``SOURCE_DISTANCE_MARGIN`` for the measured justification. The best hit
-    is always kept, so an answered response never ends up with zero
-    sources.
-    """
-    if not hits:
-        return []
-    best_distance = min(hit["distance"] for hit in hits)
-    filtered = [hit for hit in hits if hit["distance"] <= best_distance + margin]
-    return filtered or hits[:1]
+def _signals_incomplete(answer_text: str) -> bool:
+    """True if the answer itself reports missing coverage."""
+    return bool(_INCOMPLETE_RE.search(answer_text))
 
 
-def _build_sources(question: str, hits: list[dict]) -> list[Source]:
-    """Build structural citations from retrieval hits (metadata + chunk text).
+# ---------------------------------------------------------------------------
+# Citations
+# ---------------------------------------------------------------------------
 
-    Args:
-        question: the original question, used only to center the lexical
-            snippet window (see ``_snippet``) -- never to alter the
-            source/page metadata itself.
-        hits: results from ``vectorstore.query_collection``, each a dict
-            with ``document`` and ``metadata`` (``source``, ``page``,
-            ``chunk_index``) keys.
 
-    Returns:
-        One ``Source`` per relevant hit (see ``_filter_relevant_hits``), in
-        the same (relevance) order.
-    """
+def _strip_breadcrumb(text: str) -> str:
+    """Remove the ingestion breadcrumb prefix from a chunk for display."""
+    parts = text.split("\n\n", 1)
+    if len(parts) == 2 and " > " in parts[0] and len(parts[0]) < 160:
+        return parts[1]
+    return text
+
+
+def _snippet(text: str, length: int = SNIPPET_LENGTH) -> str:
+    """Trim to ``length`` characters on a word boundary."""
+    clean = re.sub(r"\s+", " ", _strip_breadcrumb(text)).strip()
+    if len(clean) <= length:
+        return clean
+    cut = clean[:length]
+    if " " in cut:
+        cut = cut[: cut.rfind(" ")]
+    return cut + "..."
+
+
+def build_sources(context: AssembledContext) -> list[Source]:
+    """Build citations from exactly the units that entered the prompt."""
     sources: list[Source] = []
-    for hit in _filter_relevant_hits(hits):
-        meta = hit["metadata"]
+    seen: set[tuple[str, int, str]] = set()
+    for unit in context.units_used:
+        section = unit.metadata.get("section", "") or ""
+        key = (unit.source, unit.page, section)
+        if key in seen:
+            continue
+        seen.add(key)
+        page_end_raw = unit.metadata.get("page_end")
+        page_end = int(page_end_raw) if page_end_raw else unit.page
         sources.append(
             Source(
-                source=meta["source"],
-                page=meta["page"],
-                snippet=_snippet(question, hit["document"]),
+                source=unit.source,
+                page=unit.page,
+                snippet=_snippet(unit.matched_text or unit.text),
+                section=section,
+                page_end=page_end if page_end > unit.page else None,
             )
         )
     return sources
 
 
-def _is_refusal(answer_text: str) -> bool:
-    """True iff the ENTIRE answer is a cosmetic variant of ``REFUSAL_MESSAGE``.
+# ---------------------------------------------------------------------------
+# Grounding verification
+# ---------------------------------------------------------------------------
 
-    Weakness-3 fix: raw string equality is brittle -- a wrapped-in-quotes
-    reply, a trailing newline, or different capitalization would all fail
-    an exact match and route a genuine refusal down the "answered" path
-    with citations attached, which is exactly the misleading output this
-    system exists to prevent. This normalizes whitespace, strips a
-    matching pair of surrounding quote characters, and compares
-    case-insensitively.
 
-    Deliberately distinct from substring containment: a longer, genuinely
-    partial answer may include the refusal sentence as one clause among
-    others (e.g. "X is four weeks. I don't know based on the available
-    documents." for the other half of a two-part question) -- that is a
-    real, sourced answer and must keep its citations, so this function
-    returns False for it. Only when the refusal sentence *is* the whole
-    answer (after stripping only cosmetic wrapping) does this return True.
+def _structural_claim_check(answer: str, context_text: str) -> list[str]:
+    """Return numeric/identifier claims in ``answer`` absent from context.
+
+    A cheap, deterministic detector for the error class that matters most here: a
+    fabricated entitlement figure or fault code.
     """
-    normalized = re.sub(r"\s+", " ", answer_text.strip()).strip()
-    quote_chars = "\"'“”‘’"
-    while len(normalized) >= 2 and normalized[0] in quote_chars and normalized[-1] in quote_chars:
-        normalized = normalized[1:-1].strip()
-    return normalized.lower() == REFUSAL_MESSAGE.lower()
+    # Strip list numbering ("1.", "2)") first: an enumerated answer is
+    # formatting, not assertion, and counting its markers as unsupported figures
+    # buries real hallucinations in noise.
+    answer = re.sub(r"(?m)^\s*\d+[.)]\s+", "", answer)
+
+    context_numbers = {
+        n.replace(",", "").rstrip(".") for n in _NUMERIC_CLAIM_RE.findall(context_text)
+    }
+    context_idents = {
+        i.upper().replace(" ", "") for i in _IDENT_CLAIM_RE.findall(context_text)
+    }
+
+    unsupported: list[str] = []
+    for raw in _NUMERIC_CLAIM_RE.findall(answer):
+        value = raw.replace(",", "").rstrip(".")
+        if value and value not in context_numbers:
+            unsupported.append(raw)
+    for raw in _IDENT_CLAIM_RE.findall(answer):
+        if raw.upper().replace(" ", "") not in context_idents:
+            unsupported.append(raw)
+    return list(dict.fromkeys(unsupported))
 
 
-def _build_user_prompt(question: str, hits: list[dict]) -> str:
-    """Assemble the user-turn prompt: labeled context blocks + the question.
+_FAITHFULNESS_PROMPT = """You verify whether an answer is fully supported by the \
+provided context. Reply with JSON only.
 
-    Each context block is labeled with its source and page so the model can
-    ground its answer, but the model is never asked to emit citations
-    itself -- citations are built separately from ``hits`` metadata.
-    """
-    blocks = []
-    for i, hit in enumerate(hits, start=1):
-        meta = hit["metadata"]
-        blocks.append(
-            f"[Context {i} -- source: {meta['source']}, page: {meta['page']}]\n"
-            f"{hit['document']}"
+An answer is faithful if EVERY factual claim in it is stated in, or directly \
+entailed by, the context. It is unfaithful if any claim adds information the \
+context does not contain.
+
+Arithmetic the reader could do from stated values IS entailed: if the context \
+gives 20 days and 28 days, then "a difference of eight days" is faithful. Do not \
+flag such derived values.
+
+Statements about what the context does NOT contain ("the documents do not \
+specify X") are not factual claims about the world and must never be flagged.
+
+Ignore style. Judge only support.
+
+Reply exactly: {"faithful": true|false, "unsupported": ["<claim>", ...]}"""
+
+
+def _llm_faithfulness(answer: str, context_text: str) -> tuple[bool | None, list[str]]:
+    """Judge entailment of ``answer`` by ``context_text`` via one LLM call."""
+    try:
+        completion = _shared_openai().chat.completions.create(
+            model=config.UTILITY_MODEL,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _FAITHFULNESS_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Context:\n{context_text}\n\nAnswer:\n{answer}",
+                },
+            ],
         )
-    context_text = "\n\n".join(blocks) if blocks else "(no relevant context retrieved)"
+        payload = json.loads(completion.choices[0].message.content or "{}")
+    except (openai.OpenAIError, json.JSONDecodeError, KeyError, IndexError) as exc:
+        logger.warning("Faithfulness check failed: %s", exc)
+        return None, []
 
-    return (
-        f"Context passages:\n\n{context_text}\n\n"
-        f"Question: {question}\n\n"
-        "Answer the question using only the context passages above."
+    faithful = payload.get("faithful")
+    unsupported = [str(c) for c in (payload.get("unsupported") or [])][:8]
+    return (bool(faithful) if faithful is not None else None), unsupported
+
+
+def verify_grounding(
+    answer: str, context_text: str, use_llm: bool | None = None
+) -> Grounding:
+    """Verify ``answer`` against ``context_text`` structurally and by LLM."""
+    unverified_numbers = _structural_claim_check(answer, context_text)
+    use_llm = config.ENABLE_GROUNDING_CHECK if use_llm is None else use_llm
+
+    faithful: bool | None = None
+    unsupported: list[str] = []
+    note = ""
+
+    if use_llm:
+        faithful, unsupported = _llm_faithfulness(answer, context_text)
+        if faithful is None:
+            note = "LLM faithfulness check unavailable; structural check only."
+            faithful = not unverified_numbers
+    else:
+        note = "Structural check only (LLM grounding check disabled)."
+        faithful = not unverified_numbers
+
+    return Grounding(
+        checked=True,
+        faithful=faithful,
+        unsupported_claims=unsupported,
+        unverified_numbers=unverified_numbers,
+        note=note,
     )
+
+
+# ---------------------------------------------------------------------------
+# Grounding remediation
+# ---------------------------------------------------------------------------
+
+_REPAIR_PROMPT = """You are correcting an answer that contains claims the source \
+context does not support.
+
+Rewrite the answer so every remaining statement is fully supported by the \
+context. Specifically:
+- DELETE each unsupported claim listed below. Do not rephrase or soften it.
+- Keep every supported statement exactly as informative as it was.
+- Do not add anything new.
+- If removing the unsupported claims leaves nothing substantive, reply with \
+EXACTLY: "{refusal}"
+
+Return only the corrected answer text."""
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _regenerate_without(
+    question: str,
+    answer: str,
+    context_text: str,
+    unsupported: list[str],
+    chat_model: str | None,
+    temperature: float | None,
+) -> str | None:
+    """Rewrite ``answer`` with ``unsupported`` claims removed."""
+    claims = "\n".join(f"- {c}" for c in unsupported)
+    try:
+        completion = _shared_openai().chat.completions.create(
+            model=chat_model or config.CHAT_MODEL,
+            temperature=config.CHAT_TEMPERATURE if temperature is None else temperature,
+            messages=[
+                {
+                    "role": "system",
+                    "content": _REPAIR_PROMPT.format(refusal=REFUSAL_MESSAGE),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Context:\n{context_text}\n\nQuestion: {question}\n\n"
+                        f"Answer to correct:\n{answer}\n\n"
+                        f"Unsupported claims to delete:\n{claims}"
+                    ),
+                },
+            ],
+        )
+        return (completion.choices[0].message.content or "").strip() or None
+    except openai.OpenAIError as exc:
+        logger.warning("Grounding repair call failed: %s", exc)
+        return None
+
+
+def _prune_sentences(answer: str, unsupported: list[str]) -> tuple[str, list[str]]:
+    """Excise sentences carrying an unsupported claim.
+
+    The deterministic fallback when regeneration fails. Crude, but unlike another
+    generation attempt it cannot introduce a NEW unsupported claim, so it is the
+    safe terminal step. Matching is by content-word overlap because the judge
+    paraphrases the claims it reports.
+    """
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(answer.strip()) if s.strip()]
+    if not sentences:
+        return answer, []
+
+    def words(text: str) -> set[str]:
+        return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 3}
+
+    removed: list[str] = []
+    kept: list[str] = []
+    claim_words = [words(c) for c in unsupported]
+    for sentence in sentences:
+        sentence_words = words(sentence)
+        drop = any(
+            claim and len(sentence_words & claim) / max(1, len(claim)) >= 0.6
+            for claim in claim_words
+        )
+        (removed if drop else kept).append(sentence.strip())
+
+    if not kept:
+        return REFUSAL_MESSAGE, removed
+    return " ".join(kept).strip(), removed
+
+
+def _repairable_claims(claims: list[str]) -> list[str]:
+    """Keep only claims worth rewriting an answer over.
+
+    The judge sometimes flags a statement about what the context does NOT contain.
+    That is not a claim about the world and cannot be unsupported. Acting on such
+    flags is actively harmful: remediation then deletes a legitimate hedge, and in
+    one observed case regeneration dropped a correct "AES-256" along with it.
+    """
+    return [c for c in claims if not _signals_incomplete(c)]
+
+
+def _supported_values(text: str, context_text: str) -> set[str]:
+    """Identifiers and figures in ``text`` that the context DOES support."""
+    values = set(_IDENT_CLAIM_RE.findall(text)) | set(_NUMERIC_CLAIM_RE.findall(text))
+    stripped_context = context_text.replace(",", "")
+    return {
+        v.replace(",", "").rstrip(".")
+        for v in values
+        if v.replace(",", "").rstrip(".")
+        and v.replace(",", "").rstrip(".") in stripped_context
+    }
+
+
+def _repair_is_safe(original: str, repaired: str, context_text: str) -> bool:
+    """True if ``repaired`` kept every context-supported value from ``original``.
+
+    A repair only improves things if it removes what the context does not
+    support. If it also drops a value the context DOES support, it has traded a
+    flagged answer for a less complete one -- observed live, where regenerating
+    to remove a hedge also deleted the correct "AES-256" requirement.
+    """
+    lost = _supported_values(original, context_text) - _supported_values(
+        repaired, context_text
+    )
+    if lost:
+        logger.info("Rejecting grounding repair: it dropped supported %s", sorted(lost))
+    return not lost
+
+
+def enforce_grounding(
+    question: str,
+    answer: str,
+    context_text: str,
+    grounding: Grounding,
+    chat_model: str | None = None,
+    temperature: float | None = None,
+) -> tuple[str, Grounding]:
+    """Return an answer that verification accepts, repairing it if necessary.
+
+    Order: regenerate once with the offending claims named -> re-verify -> prune
+    the offending sentences -> withdraw to the refusal if nothing substantive
+    survives. ``unverified_numbers`` alone never triggers repair.
+    """
+    if not config.ENABLE_GROUNDING_REPAIR:
+        return answer, grounding
+    if grounding.faithful is not False or not grounding.unsupported_claims:
+        return answer, grounding
+
+    unsupported = _repairable_claims(grounding.unsupported_claims)
+    if not unsupported:
+        grounding.faithful = True
+        grounding.note = (
+            "Flagged claims were statements about missing coverage, not "
+            "unsupported assertions; answer left unchanged."
+        )
+        return answer, grounding
+
+    original_answer = answer
+
+    for _ in range(max(1, config.MAX_GROUNDING_REPAIRS)):
+        rewritten = _regenerate_without(
+            question, answer, context_text, unsupported, chat_model, temperature
+        )
+        if not rewritten:
+            break
+        if not _is_refusal(rewritten) and not _repair_is_safe(
+            answer, rewritten, context_text
+        ):
+            # The rewrite removed supported content along with the unsupported
+            # claim. Fall through to sentence pruning.
+            break
+        if _is_refusal(rewritten):
+            return REFUSAL_MESSAGE, Grounding(
+                checked=True,
+                faithful=True,
+                note="All claims were unsupported; answer withdrawn.",
+                repaired="regenerated",
+                removed_claims=unsupported,
+            )
+        recheck = verify_grounding(rewritten, context_text)
+        if recheck.faithful is not False:
+            recheck.repaired = "regenerated"
+            recheck.removed_claims = unsupported
+            return rewritten, recheck
+        next_claims = _repairable_claims(recheck.unsupported_claims)
+        if not next_claims:
+            recheck.faithful = True
+            recheck.repaired = "regenerated"
+            recheck.removed_claims = unsupported
+            return rewritten, recheck
+        answer, unsupported = rewritten, next_claims
+
+    pruned, removed = _prune_sentences(original_answer, unsupported)
+    if not _is_refusal(pruned) and not _repair_is_safe(
+        original_answer, pruned, context_text
+    ):
+        # Even sentence surgery would cost supported information: the unsupported
+        # claim shares a sentence with a supported fact. Returning the original
+        # with the flag visible is more useful than a quieter, less complete
+        # answer -- the caller can see exactly which claim is unverified.
+        grounding.note = (
+            "Contains an unsupported claim that could not be removed without also "
+            "losing supported detail; the flagged claim is listed."
+        )
+        grounding.repaired = "declined"
+        return original_answer, grounding
+
+    if _is_refusal(pruned):
+        return REFUSAL_MESSAGE, Grounding(
+            checked=True,
+            faithful=True,
+            note="Unsupported claims could not be separated; answer withdrawn.",
+            repaired="pruned",
+            removed_claims=removed or unsupported,
+        )
+
+    final = verify_grounding(pruned, context_text)
+    final.repaired = "pruned"
+    final.removed_claims = removed or unsupported
+    if final.faithful is False:
+        final.note = "Residual unsupported content after pruning; treat with caution."
+    return pruned, final
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+def _escalation_allowed(plan: QueryPlan) -> bool:
+    """True if this plan was cheap enough that a shortfall deserves a retry."""
+    return not plan.profile.decompose
 
 
 def query(
     question: str,
     top_k: int | None = None,
     chat_model: str | None = None,
-    temperature: float = CHAT_TEMPERATURE,
+    temperature: float | None = None,
+    collection_name: str | None = None,
+    persist_directory=None,
+    embed_fn=None,
+    conversation_focus: str | None = None,
+    _allow_escalation: bool = True,
+    _force_type: str | None = None,
 ) -> RagResponse:
-    """Answer ``question`` using retrieval-augmented generation.
-
-    Embeds ``question`` with the same embedding model used at ingest,
-    retrieves the top-k most similar chunks from the persisted Chroma
-    collection, and asks ``gpt-4o-mini`` to answer strictly from that
-    context. See the module docstring for the anti-hallucination and
-    citation design.
-
-    Args:
-        question: the natural-language question to answer. Must not be
-            empty/whitespace-only.
-        top_k: number of chunks to retrieve; defaults to ``config.TOP_K``.
-        chat_model: override for ``config.CHAT_MODEL`` (mainly for tests).
-        temperature: generation temperature; defaults to the module's low,
-            near-deterministic constant.
-
-    Returns:
-        A ``RagResponse`` with ``answer`` (str) and ``sources`` (list of
-        ``Source``, empty when the model declines to answer -- see module
-        docstring for that decision's rationale).
+    """Answer ``question`` with adaptive, intent-aware retrieval-augmented generation.
 
     Raises:
-        InvalidQuestionError: if ``question`` is empty or whitespace-only.
-        GenerationError: if the OpenAI chat completion call fails (auth,
-            network, rate limit, or any other API error).
+        InvalidQuestionError: blank or whitespace-only question.
+        GenerationError: the answer model call failed.
+        VectorStoreError: misconfiguration (e.g. embedding-model mismatch).
     """
     if not question or not question.strip():
         raise InvalidQuestionError("Question must not be empty or whitespace-only.")
 
-    model = chat_model or CHAT_MODEL
-    hits = query_collection(
-        query_text=question, top_k=top_k or TOP_K, embed_fn=openai_embed_fn()
+    started = time.perf_counter()
+    question = question.strip()
+
+    plan = analyze(question)
+    if _force_type:
+        # Escalation: keep the question but adopt a wider profile and force
+        # decomposition, so the retry searches differently rather than repeating
+        # the attempt that just fell short.
+        forced = analyze(question, use_llm=True)
+        plan = QueryPlan(
+            question=question,
+            query_type=_force_type,
+            sub_queries=forced.sub_queries or [question],
+            keywords=forced.keywords or plan.keywords,
+            profile=PROFILES[_force_type],
+            classified_by="escalated",
+        )
+    if top_k is not None:
+        plan.profile = replace(
+            plan.profile,
+            final_k=top_k,
+            candidate_k=max(plan.profile.candidate_k, top_k * 4),
+        )
+
+    retrieval: RetrievalResult = retrieve(
+        plan,
+        collection_name=collection_name,
+        persist_directory=persist_directory,
+        embed_fn=embed_fn,
+        conversation_focus=conversation_focus,
+    )
+    retrieved_at = time.perf_counter()
+
+    # ---- orchestration layer (all flags default OFF) --------------------
+    # Everything below consumes retrieval's output. With every flag off,
+    # `units` is retrieval.units unchanged and no extra prompt text is added,
+    # so the pipeline behaves exactly as it did before this layer existed.
+    orchestration_intent = intent_of(plan)
+    units = retrieval.units
+    plan_scaffold = ""
+    workflow_plan = None
+    coverage_report = None
+
+    # Feature 3: guarantee every major section of the routed document is
+    # represented before generating a document-wide answer.
+    if (
+        config.OUTLINE_SYNTHESIS_ENABLED
+        and orchestration_intent == DOCUMENT_WIDE
+        and isinstance(retrieval.stages.get("documents_selected"), list)
+    ):
+        from backend.outline_synthesis import ensure_section_coverage
+
+        units, coverage_report = ensure_section_coverage(
+            units,
+            retrieval.stages["documents_selected"],
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+        )
+
+    context = assemble(
+        units,
+        max_tokens=min(plan.profile.max_context_tokens, config.MAX_CONTEXT_TOKENS),
+        document_order=plan.profile.document_order,
+        merge_adjacent=plan.profile.merge_adjacent,
+        outline=retrieval.outline,
     )
 
-    user_prompt = _build_user_prompt(question, hits)
+    # Coverage must hold in what the model actually READS, not just in the
+    # candidate list: the token budget runs during assembly and dropped the very
+    # sections coverage had added. If any are missing, re-assemble once with a
+    # budget raised just enough to seat them.
+    if coverage_report is not None and coverage_report.added_sections:
+        from backend.outline_synthesis import sections_missing_from_context
+
+        dropped = sections_missing_from_context(context.units_used, units)
+        if dropped:
+            # Re-assembling at the SAME budget changes nothing -- the dropped
+            # units are dropped again. Extend the budget by exactly what the
+            # missing sections need, capped so a pathological document cannot
+            # blow the context window open.
+            base = min(plan.profile.max_context_tokens, config.MAX_CONTEXT_TOKENS)
+            needed = sum(count_tokens(u.text) for u in dropped)
+            context = assemble(
+                units,
+                max_tokens=min(base + needed, int(base * 1.6)),
+                document_order=plan.profile.document_order,
+                merge_adjacent=plan.profile.merge_adjacent,
+                outline=retrieval.outline,
+            )
+            coverage_report.still_missing.extend(
+                f"{u.source}: {u.metadata.get('section', '')}"
+                for u in sections_missing_from_context(context.units_used, units)
+            )
+
+    # Feature 2: build an explicit workflow from the ranked sections, then
+    # answer from that plan rather than letting the generator pick a few.
+    if config.PLANNER_ENABLED and orchestration_intent == COMBINATION:
+        from backend.planner import PLAN_INSTRUCTIONS, build_plan, keyed_context, render_plan
+
+        workflow_plan = build_plan(question, context.units_used or units)
+        if workflow_plan.ok:
+            plan_scaffold = (
+                f"{PLAN_INSTRUCTIONS}\n\nPlanned workflow:\n{render_plan(workflow_plan)}"
+            )
+            # Only the key map is prepended; the passages themselves, and
+            # therefore the citations, are exactly what assembly produced.
+            context = replace(
+                context, text=keyed_context(workflow_plan, context.text)
+            )
 
     try:
-        client = openai.OpenAI()
-        completion = client.chat.completions.create(
-            model=model,
-            temperature=temperature,
+        completion = _shared_openai().chat.completions.create(
+            model=chat_model or config.CHAT_MODEL,
+            temperature=config.CHAT_TEMPERATURE if temperature is None else temperature,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        f"{_system_prompt(plan)}\n\n{plan_scaffold}"
+                        if plan_scaffold
+                        else _system_prompt(plan)
+                    ),
+                },
+                {"role": "user", "content": build_prompt(question, context)},
             ],
         )
         answer_text = (completion.choices[0].message.content or "").strip()
     except openai.OpenAIError as exc:
         raise GenerationError(f"OpenAI chat completion failed: {exc}") from exc
+    answered_at = time.perf_counter()
+
+    diagnostics = {
+        "plan": plan.to_dict(),
+        "retrieval": retrieval.stages,
+        "routing": retrieval.routing.to_dict() if retrieval.routing else None,
+        "outline_sections": len(retrieval.outline),
+        "orchestration": {
+            "intent": orchestration_intent,
+            "router_enabled": config.ROUTER_ENABLED,
+            "planner": workflow_plan.to_dict() if workflow_plan else None,
+            "outline_coverage": coverage_report.to_dict() if coverage_report else None,
+        },
+        "candidates_considered": retrieval.candidates_considered,
+        "reranked": retrieval.reranked,
+        "hybrid": retrieval.hybrid,
+        "context_tokens": context.tokens,
+        "context_blocks": len(context.blocks),
+        "duplicates_removed": context.duplicates_removed,
+        "adjacent_merges": context.merges_performed,
+        "document_ordered": context.document_ordered,
+        "dropped_units": context.dropped_units,
+        "latency_ms": {
+            "retrieval": round((retrieved_at - started) * 1000),
+            "generation": round((answered_at - retrieved_at) * 1000),
+        },
+    }
+
+    # ESCALATION. A refusal -- or an answer reporting its own missing coverage --
+    # from a cheap single-query plan is ambiguous: the corpus may genuinely lack
+    # the answer, or the plan may have been too narrow. Some questions need an
+    # intermediate lookup with no surface marker saying so. Rather than pay for
+    # decomposition on every question, escalate only after a cheap attempt falls
+    # short.
+    if (
+        (_is_refusal(answer_text) or _signals_incomplete(answer_text))
+        and _escalation_allowed(plan)
+        and _allow_escalation
+    ):
+        logger.info("Incomplete result on %s plan; escalating.", plan.query_type)
+        escalated = query(
+            question,
+            top_k=top_k,
+            chat_model=chat_model,
+            temperature=temperature,
+            collection_name=collection_name,
+            persist_directory=persist_directory,
+            embed_fn=embed_fn,
+            conversation_focus=conversation_focus,
+            _allow_escalation=False,
+            _force_type=MULTI_HOP,
+        )
+        escalated.diagnostics["escalated_from"] = plan.query_type
+        escalated.diagnostics["latency_ms"]["total"] = round(
+            (time.perf_counter() - started) * 1000
+        )
+        if not _is_refusal(escalated.answer):
+            return escalated
+        escalated.diagnostics["escalation_recovered"] = False
+        if _is_refusal(answer_text):
+            return escalated
+        # The wider retry found nothing either, but the first attempt answered
+        # part of the question -- keep that rather than downgrading to a refusal.
 
     if _is_refusal(answer_text):
-        # Normalize to the canonical refusal string so callers can rely on
-        # exact-match downstream, regardless of cosmetic model variation.
-        return RagResponse(answer=REFUSAL_MESSAGE, sources=[])
+        diagnostics["latency_ms"]["total"] = round((time.perf_counter() - started) * 1000)
+        return RagResponse(
+            answer=REFUSAL_MESSAGE,
+            sources=[],
+            query_type=plan.query_type,
+            grounding=Grounding(checked=False, note="Refusal: nothing to verify."),
+            diagnostics=diagnostics,
+        )
 
-    return RagResponse(answer=answer_text, sources=_build_sources(question, hits))
+    grounding = verify_grounding(answer_text, context.text)
+    answer_text, grounding = enforce_grounding(
+        question, answer_text, context.text, grounding, chat_model, temperature
+    )
+
+    diagnostics["latency_ms"]["verification"] = round(
+        (time.perf_counter() - answered_at) * 1000
+    )
+    diagnostics["latency_ms"]["total"] = round((time.perf_counter() - started) * 1000)
+
+    if _is_refusal(answer_text):
+        # Remediation withdrew the answer; citations would misrepresent the
+        # passages as supporting something no longer claimed.
+        return RagResponse(
+            answer=REFUSAL_MESSAGE,
+            sources=[],
+            query_type=plan.query_type,
+            grounding=grounding,
+            diagnostics=diagnostics,
+        )
+
+    return RagResponse(
+        answer=answer_text,
+        sources=build_sources(context),
+        query_type=plan.query_type,
+        grounding=grounding,
+        diagnostics=diagnostics,
+    )

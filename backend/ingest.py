@@ -1,15 +1,19 @@
-"""Idempotent ingest entrypoint: chunk data/ PDFs and write them to Chroma.
+"""Ingest entrypoint: parse data/ PDFs and index them in Chroma.
 
-Default behavior upserts by deterministic chunk id (``source:chunk_index``),
-so re-running this script does not duplicate the collection. Pass
-``--reset`` to instead delete and rebuild the collection from scratch.
+Per document, this parses structure (headings, tables, page ranges), builds
+parent and child chunks, embeds the children, and replaces any previously
+indexed version of that document.
+
+Replacement, not just idempotency
+---------------------------------
+Re-running over an unchanged corpus is free: each document's content hash is
+compared against what is indexed, and unchanged documents are skipped without
+embedding calls. When a document HAS changed, every chunk of the old version is
+deleted before the new ones are written -- so an edited or shortened policy
+cannot leave superseded text behind in the index, which upsert-by-id alone did.
 
 Usage:
-    .venv/bin/python -m backend.ingest [--reset] [--data-dir DIR]
-
-This uses the REAL OpenAI embedding path (``backend.vectorstore.openai_embed_fn``)
-and will raise a clear error if OPENAI_API_KEY is not set in .env -- it never
-silently substitutes a fake embedder.
+    .venv/bin/python -m backend.ingest [--reset] [--force] [--data-dir DIR]
 """
 
 from __future__ import annotations
@@ -18,9 +22,15 @@ import argparse
 import time
 from pathlib import Path
 
-from backend.config import CHROMA_COLLECTION, CHROMA_DIR, PROJECT_ROOT
-from backend.ingestion import load_and_chunk_directory
-from backend.vectorstore import collection_stats, ingest_documents
+import backend.config as config
+from backend.ingestion import _pdfs_in, build_chunks, extract_document
+from backend.vectorstore import (
+    collection_stats,
+    get_collection,
+    indexed_hashes,
+    ingest_documents,
+    reset_collection,
+)
 
 
 def main() -> None:
@@ -28,31 +38,70 @@ def main() -> None:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=PROJECT_ROOT / "data",
+        default=config.PROJECT_ROOT / "data",
         help="Directory of PDFs to ingest (default: data/).",
     )
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Delete and rebuild the collection instead of upserting.",
+        help="Delete and rebuild the whole collection before ingesting.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-embed documents even if their content hash is unchanged.",
     )
     args = parser.parse_args()
 
-    print(f"Loading + chunking PDFs from: {args.data_dir}")
-    chunks = load_and_chunk_directory(args.data_dir)
-    print(f"Chunked into {len(chunks)} documents.")
-
+    print(f"Data directory : {args.data_dir}")
+    print(f"Collection     : {config.CHROMA_COLLECTION} at {config.CHROMA_DIR}")
+    print(f"Embedding model: {config.EMBED_MODEL}")
     print(
-        f"{'Resetting' if args.reset else 'Upserting into'} collection "
-        f"'{CHROMA_COLLECTION}' at {CHROMA_DIR} ..."
+        f"Chunking       : child {config.CHILD_CHUNK_SIZE}/"
+        f"{config.CHILD_CHUNK_OVERLAP} tokens, parent {config.PARENT_CHUNK_SIZE}\n"
     )
-    start = time.time()
-    upserted = ingest_documents(chunks, reset=args.reset)
-    elapsed = time.time() - start
 
-    stats = collection_stats()
-    print(f"Upserted {upserted} chunks in {elapsed:.1f}s.")
-    print(f"Collection stats: {stats}")
+    if args.reset:
+        print("Resetting collection ...")
+        reset_collection()
+
+    collection = get_collection()
+    known = {} if args.reset else indexed_hashes(collection)
+
+    total_children = 0
+    total_parents = 0
+    skipped = 0
+    start = time.time()
+
+    for pdf_path in _pdfs_in(args.data_dir):
+        parsed = extract_document(pdf_path)
+
+        if not args.force and known.get(parsed.source) == parsed.content_hash:
+            print(f"  {parsed.source:48} unchanged, skipped")
+            skipped += 1
+            continue
+
+        parents, children = build_chunks(parsed)
+        if not children:
+            # A PDF with no extractable text layer (e.g. a pure scan) yields
+            # nothing; say so rather than reporting a silent success.
+            print(f"  {parsed.source:48} NO TEXT EXTRACTED - skipped (scanned?)")
+            continue
+
+        indexed = ingest_documents(children, parents=parents)
+        total_children += indexed
+        total_parents += len(parents)
+        print(
+            f"  {parsed.source:48} {parsed.page_count:3}p  "
+            f"{len(parents):3} parents  {indexed:4} chunks"
+        )
+
+    elapsed = time.time() - start
+    print(
+        f"\nIndexed {total_children} chunks ({total_parents} parents) in "
+        f"{elapsed:.1f}s; {skipped} document(s) unchanged."
+    )
+    print(f"Collection stats: {collection_stats()}")
 
 
 if __name__ == "__main__":

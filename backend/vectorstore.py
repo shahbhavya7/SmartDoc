@@ -1,143 +1,314 @@
-"""Embedding + persistent vector storage.
+"""Embedding, persistent vector storage, and the parent-chunk store.
 
-Phase 2 scope only. This module takes Phase-1 ``Document`` chunks (from
-``backend.ingestion``) and:
+Child chunks are embedded with ``config.EMBED_MODEL`` and written to a ChromaDB
+``PersistentClient`` collection on disk. Parent chunks are not embedded (nothing
+searches them directly) and are kept in a JSON sidecar next to the Chroma store,
+keyed by ``parent_id``.
 
-- embeds them with OpenAI ``text-embedding-3-small`` (``config.EMBED_MODEL``,
-  the same model Phase 3 must use at query time so query and document
-  vectors live in the same space), and
-- writes them to a ChromaDB ``PersistentClient`` collection on disk at
-  ``config.CHROMA_DIR``, storing ``{source, page, chunk_index}`` metadata
-  alongside each vector.
+Correctness properties this module is responsible for
+----------------------------------------------------
+**Replacing a document actually replaces it.** The original implementation
+upserted by ``source:chunk_index`` only. Re-ingesting an *edited* document that
+produced fewer chunks than before left the surplus chunks of the old version in
+the index permanently -- so a shortened or superseded policy stayed retrievable
+and citable as if current. Proven with a controlled test: a 5-chunk document
+re-ingested as 2 chunks left count at 5, with 3 stale chunks still live.
+``ingest_documents`` now deletes every existing chunk for a source before
+writing the new ones.
 
-It does not retrieve-for-answering, build prompts, or call a chat model --
-those are later phases. It also does not fall back to a fake/local
-embedding when ``OPENAI_API_KEY`` is missing: that would silently degrade
-grounding quality, so the real path raises a clear error instead. Tests and
-verification scripts may inject a different embedding function via the
-``embed_fn`` parameter that every public function accepts.
+**The query model always matches the index model.** The collection records the
+embedding model that built it, and ``assert_embedding_model`` refuses to query a
+collection built by a different one. Without this, switching to another model of
+the same dimensionality (e.g. ada-002, also 1536) returns confident nonsense
+rather than an error.
+
+**The distance metric is explicit.** Chroma defaults to ``l2``; the collection is
+created with ``config.CHROMA_SPACE`` (cosine) so distances live on a stated 0-2
+scale rather than an inherited 0-4 one.
+
+**Unchanged documents are skipped.** Each chunk carries the document's
+``content_hash``; ``needs_reingest`` compares it against what is indexed so
+re-running ingestion over an unchanged corpus costs no embedding calls.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Sequence
+import json
+import threading
+from pathlib import Path
+from typing import Callable, Iterable, Sequence
 
 import chromadb
 from chromadb.api.models.Collection import Collection
 from langchain.docstore.document import Document
 from openai import OpenAI
 
-from backend.config import CHROMA_COLLECTION, CHROMA_DIR, EMBED_MODEL, OPENAI_API_KEY
+import backend.config as config
 
 EmbedFn = Callable[[list[str]], list[list[float]]]
 
-# OpenAI's embeddings endpoint accepts a batch of inputs per request; batching
-# keeps this well under request size / rate limits for typical corpora.
 DEFAULT_EMBED_BATCH_SIZE = 100
+
+# Chroma rejects None and non-scalar metadata values.
+_SCALARS = (str, int, float, bool)
+
+_client_lock = threading.Lock()
+_clients: dict[str, chromadb.ClientAPI] = {}
+_openai_client: OpenAI | None = None
 
 
 class VectorStoreError(Exception):
-    """Raised for configuration or embedding failures in this module."""
+    """Raised for configuration, consistency, or embedding failures."""
+
+
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
 
 
 def _require_api_key() -> None:
-    if not OPENAI_API_KEY:
+    if not config.OPENAI_API_KEY:
         raise VectorStoreError(
-            "OPENAI_API_KEY is not set in .env. Set a real OpenAI API key "
-            "before running ingestion or querying with the real embedding "
-            "model -- this module does not silently fall back to a fake "
-            "embedder."
+            "OPENAI_API_KEY is not set in .env. Set a real OpenAI API key before "
+            "running ingestion or querying -- this module does not silently fall "
+            "back to a fake embedder."
         )
 
 
-def openai_embed_fn(
-    batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
-) -> EmbedFn:
-    """Build an embedding function backed by the real OpenAI API.
+def _shared_openai() -> OpenAI:
+    """Return a process-wide OpenAI client.
 
-    Args:
-        batch_size: number of texts sent per embeddings API call.
+    Constructing a client per call opens a fresh connection pool each time;
+    reusing one keeps TLS handshakes out of the per-query latency budget.
 
-    Returns:
-        A function ``texts -> vectors`` using ``config.EMBED_MODEL``.
-
-    Raises:
-        VectorStoreError: if ``OPENAI_API_KEY`` is not configured. This is
-            checked at call time (not just at import time) so the error
-            surfaces exactly when an embedding is actually attempted.
+    A request timeout and retry budget are set explicitly. The SDK's default is
+    to wait indefinitely, so one hung connection blocks its caller forever with
+    no error -- observed as an evaluation run that sat silent for 28 minutes, and
+    the same hang would tie up a FastAPI worker in production.
     """
+    global _openai_client
+    if _openai_client is None:
+        _require_api_key()
+        _openai_client = OpenAI(
+            api_key=config.OPENAI_API_KEY,
+            timeout=config.REQUEST_TIMEOUT_SECONDS,
+            max_retries=config.REQUEST_MAX_RETRIES,
+        )
+    return _openai_client
+
+
+def openai_embed_fn(batch_size: int = DEFAULT_EMBED_BATCH_SIZE) -> EmbedFn:
+    """Build an embedding function backed by the real OpenAI API."""
 
     def _embed(texts: list[str]) -> list[list[float]]:
         _require_api_key()
-        client = OpenAI(api_key=OPENAI_API_KEY)
+        client = _shared_openai()
         vectors: list[list[float]] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
-            response = client.embeddings.create(model=EMBED_MODEL, input=batch)
-            # The API returns embeddings in the same order as the input list.
+            response = client.embeddings.create(model=config.EMBED_MODEL, input=batch)
+            # The API returns embeddings in input order.
             vectors.extend(item.embedding for item in response.data)
         return vectors
 
     return _embed
 
 
-def chunk_id(source: str, chunk_index: int) -> str:
-    """Build a deterministic id for a chunk.
+# ---------------------------------------------------------------------------
+# Ids and client
+# ---------------------------------------------------------------------------
 
-    Phase 1's ``chunk_index`` restarts at 0 for every document, so the id
-    must combine ``source`` with ``chunk_index`` or ids collide across
-    files. This id is what makes ingestion idempotent: re-embedding the
-    same chunk of the same document always upserts the same row.
+
+def chunk_id(source: str, chunk_index: int) -> str:
+    """Build a deterministic child-chunk id.
+
+    ``chunk_index`` restarts at 0 for each document, so the id must combine it
+    with ``source`` or ids collide across files.
     """
     return f"{source}:{chunk_index}"
 
 
-def get_client(persist_directory=CHROMA_DIR) -> chromadb.ClientAPI:
-    """Return a ChromaDB ``PersistentClient`` writing to ``persist_directory``.
+def get_client(persist_directory=None) -> chromadb.ClientAPI:
+    """Return a cached ``PersistentClient`` for ``persist_directory``.
 
-    This is the only client constructor used anywhere in the project --
-    always disk-backed, never ``chromadb.Client()`` (in-memory) and never a
-    plain Python list standing in for a vector index.
+    Always disk-backed -- never ``chromadb.Client()`` (in-memory). Clients are
+    cached per directory because constructing one re-opens sqlite and reloads
+    HNSW segments, which is wasted work on every request.
     """
-    return chromadb.PersistentClient(path=str(persist_directory))
+    path = str(persist_directory or config.CHROMA_DIR)
+    with _client_lock:
+        if path not in _clients:
+            # Telemetry disabled explicitly rather than via environment
+            # variable: the installed posthog is incompatible with chromadb's
+            # telemetry call, and the env var alone is not honoured by this
+            # version, so every operation would print a capture() warning.
+            _clients[path] = chromadb.PersistentClient(
+                path=path,
+                settings=chromadb.Settings(anonymized_telemetry=False),
+            )
+        return _clients[path]
+
+
+def _collection_metadata() -> dict:
+    """Metadata stamped on collection creation."""
+    return {
+        "embedding_model": config.EMBED_MODEL,
+        "hnsw:space": config.CHROMA_SPACE,
+    }
 
 
 def get_collection(
     client: chromadb.ClientAPI | None = None,
-    collection_name: str = CHROMA_COLLECTION,
-    persist_directory=CHROMA_DIR,
+    collection_name: str | None = None,
+    persist_directory=None,
 ) -> Collection:
-    """Get-or-create the named collection on ``client`` (or a new one).
+    """Get-or-create the named collection.
 
-    Use this to load an already-ingested collection for querying without
-    re-embedding anything -- no embedding function is required here because
-    reads only need query-time embedding (see ``query_collection``), and
-    writes go through ``upsert_documents``/``ingest_documents`` below.
+    No embedding function is attached: writes embed explicitly via
+    ``upsert_documents`` and reads embed only the query, so loading a collection
+    never risks re-embedding the corpus.
     """
     client = client or get_client(persist_directory)
     return client.get_or_create_collection(
-        name=collection_name,
-        metadata={"embedding_model": EMBED_MODEL},
+        name=collection_name or config.CHROMA_COLLECTION,
+        metadata=_collection_metadata(),
     )
 
 
 def reset_collection(
     client: chromadb.ClientAPI | None = None,
-    collection_name: str = CHROMA_COLLECTION,
-    persist_directory=CHROMA_DIR,
+    collection_name: str | None = None,
+    persist_directory=None,
 ) -> Collection:
-    """Delete the named collection (if present) and recreate it empty.
-
-    Used by the ``--reset`` clear-and-rebuild ingest path.
-    """
+    """Delete the named collection (if present) and recreate it empty."""
     client = client or get_client(persist_directory)
-    existing = {c.name for c in client.list_collections()}
-    if collection_name in existing:
-        client.delete_collection(collection_name)
-    return client.get_or_create_collection(
-        name=collection_name,
-        metadata={"embedding_model": EMBED_MODEL},
-    )
+    name = collection_name or config.CHROMA_COLLECTION
+    if name in {c.name for c in client.list_collections()}:
+        client.delete_collection(name)
+    _parent_path(persist_directory).unlink(missing_ok=True)
+    return client.get_or_create_collection(name=name, metadata=_collection_metadata())
+
+
+def assert_embedding_model(collection: Collection) -> None:
+    """Fail loudly if the collection was built by a different embed model.
+
+    Two 1536-dimensional models produce vectors that are geometrically
+    compatible but semantically unrelated, so a mismatch cannot be detected from
+    the data -- only from this recorded stamp.
+    """
+    recorded = (collection.metadata or {}).get("embedding_model")
+    if recorded and recorded != config.EMBED_MODEL:
+        raise VectorStoreError(
+            f"Collection '{collection.name}' was built with embedding model "
+            f"'{recorded}' but EMBED_MODEL is now '{config.EMBED_MODEL}'. Query "
+            "and document vectors would be incomparable. Re-ingest with --reset, "
+            "or restore the original EMBED_MODEL."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Parent store
+# ---------------------------------------------------------------------------
+
+
+def _parent_path(persist_directory=None) -> Path:
+    """Path of the JSON sidecar holding parent chunks."""
+    return Path(persist_directory or config.CHROMA_DIR) / "parents.json"
+
+
+def _load_parents(persist_directory=None) -> dict[str, dict]:
+    path = _parent_path(persist_directory)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        # A corrupt sidecar must not break retrieval; parent expansion degrades
+        # to child-only context, which is still correct.
+        return {}
+
+
+def _write_parents(parents: dict[str, dict], persist_directory=None) -> None:
+    path = _parent_path(persist_directory)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(parents), encoding="utf-8")
+
+
+def save_parents(documents: Sequence[Document], persist_directory=None) -> int:
+    """Store parent chunks, replacing any existing parents of the same sources."""
+    store = _load_parents(persist_directory)
+    sources = {d.metadata["source"] for d in documents}
+    store = {pid: rec for pid, rec in store.items() if rec.get("source") not in sources}
+    for doc in documents:
+        store[doc.metadata["id"]] = {
+            "text": doc.page_content,
+            "source": doc.metadata["source"],
+            "doc_title": doc.metadata.get("doc_title", ""),
+            "section": doc.metadata.get("section", ""),
+            "page": doc.metadata.get("page"),
+            "page_end": doc.metadata.get("page_end"),
+        }
+    _write_parents(store, persist_directory)
+    return len(documents)
+
+
+def get_parents(parent_ids: Iterable[str], persist_directory=None) -> dict[str, dict]:
+    """Fetch parent records by id (missing ids are simply absent)."""
+    store = _load_parents(persist_directory)
+    return {pid: store[pid] for pid in parent_ids if pid in store}
+
+
+# ---------------------------------------------------------------------------
+# Ingestion
+# ---------------------------------------------------------------------------
+
+
+def _clean_metadata(meta: dict) -> dict:
+    """Drop None values and stringify anything Chroma cannot store."""
+    out: dict = {}
+    for key, value in meta.items():
+        if value is None:
+            continue
+        out[key] = value if isinstance(value, _SCALARS) else str(value)
+    return out
+
+
+def indexed_hashes(
+    collection: Collection | None = None, persist_directory=None
+) -> dict[str, str]:
+    """Return ``{source: content_hash}`` for everything currently indexed."""
+    collection = collection or get_collection(persist_directory=persist_directory)
+    got = collection.get(include=["metadatas"])
+    hashes: dict[str, str] = {}
+    for meta in got.get("metadatas") or []:
+        source = meta.get("source")
+        digest = meta.get("content_hash")
+        if source and digest:
+            hashes[source] = digest
+    return hashes
+
+
+def needs_reingest(
+    source: str, content_hash: str, collection: Collection | None = None
+) -> bool:
+    """Return True if ``source`` is absent or its indexed content differs."""
+    return indexed_hashes(collection).get(source) != content_hash
+
+
+def delete_source(
+    source: str, collection: Collection | None = None, persist_directory=None
+) -> int:
+    """Delete every indexed chunk belonging to ``source``.
+
+    This is what makes replacement correct rather than merely idempotent:
+    without it, an edited document that yields fewer chunks leaves its surplus
+    old chunks live in the index forever.
+    """
+    collection = collection or get_collection(persist_directory=persist_directory)
+    ids = collection.get(where={"source": source}).get("ids") or []
+    if ids:
+        collection.delete(ids=ids)
+    return len(ids)
 
 
 def upsert_documents(
@@ -146,26 +317,7 @@ def upsert_documents(
     embed_fn: EmbedFn | None = None,
     embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
 ) -> int:
-    """Embed ``documents`` and upsert them into ``collection`` by deterministic id.
-
-    Upserting by ``chunk_id(source, chunk_index)`` is what makes ingestion
-    idempotent: re-running over the same corpus overwrites the same rows
-    instead of duplicating them, and the embedding calls are batched
-    (``embed_batch_size`` texts per API call) rather than one request per
-    chunk.
-
-    Args:
-        documents: Phase-1 chunk ``Document`` objects, each with
-            ``metadata`` containing ``source``, ``page``, ``chunk_index``.
-        collection: a Chroma collection from ``get_collection``/``reset_collection``.
-        embed_fn: embedding function to use; defaults to the real OpenAI
-            path (``openai_embed_fn()``). Tests/verification scripts may
-            inject a fake, deterministic embedder here instead.
-        embed_batch_size: batch size forwarded to the default embed_fn.
-
-    Returns:
-        The number of documents upserted.
-    """
+    """Embed ``documents`` and upsert them by deterministic id."""
     if not documents:
         return 0
 
@@ -175,18 +327,15 @@ def upsert_documents(
     texts: list[str] = []
     metadatas: list[dict] = []
     for doc in documents:
-        source = doc.metadata["source"]
-        chunk_index = doc.metadata["chunk_index"]
-        page = doc.metadata["page"]
-        ids.append(chunk_id(source, chunk_index))
+        ids.append(chunk_id(doc.metadata["source"], doc.metadata["chunk_index"]))
         texts.append(doc.page_content)
-        metadatas.append({"source": source, "page": page, "chunk_index": chunk_index})
+        metadatas.append(_clean_metadata(doc.metadata))
 
     vectors = embed(texts)
     if len(vectors) != len(texts):
         raise VectorStoreError(
-            f"Embedding function returned {len(vectors)} vectors for "
-            f"{len(texts)} inputs -- these must match 1:1."
+            f"Embedding function returned {len(vectors)} vectors for {len(texts)} "
+            "inputs -- these must match 1:1."
         )
 
     collection.upsert(ids=ids, embeddings=vectors, documents=texts, metadatas=metadatas)
@@ -195,26 +344,20 @@ def upsert_documents(
 
 def ingest_documents(
     documents: Sequence[Document],
-    collection_name: str = CHROMA_COLLECTION,
-    persist_directory=CHROMA_DIR,
+    parents: Sequence[Document] = (),
+    collection_name: str | None = None,
+    persist_directory=None,
     reset: bool = False,
     embed_fn: EmbedFn | None = None,
     embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
+    replace_sources: bool = True,
 ) -> int:
-    """End-to-end: get/reset the collection, then upsert ``documents``.
+    """Index child chunks (and store their parents), replacing prior versions.
 
     Args:
-        documents: chunks to ingest.
-        collection_name: Chroma collection name.
-        persist_directory: on-disk directory for the PersistentClient.
-        reset: if True, delete and recreate the collection first
-            (clear-and-rebuild). If False (default), upsert by deterministic
-            id so re-running does not duplicate rows.
-        embed_fn: optional injected embedding function (see ``upsert_documents``).
-        embed_batch_size: batch size forwarded to the default embed_fn.
-
-    Returns:
-        The number of documents upserted.
+        replace_sources: delete all existing chunks of each incoming source
+            before writing. Leave True unless deliberately adding to a source
+            incrementally -- turning it off reintroduces the stale-chunk bug.
     """
     client = get_client(persist_directory)
     collection = (
@@ -222,74 +365,119 @@ def ingest_documents(
         if reset
         else get_collection(client, collection_name, persist_directory)
     )
-    return upsert_documents(
+
+    if replace_sources and not reset:
+        for source in {d.metadata["source"] for d in documents}:
+            delete_source(source, collection)
+
+    indexed = upsert_documents(
         documents, collection, embed_fn=embed_fn, embed_batch_size=embed_batch_size
     )
+    if parents:
+        save_parents(parents, persist_directory)
+    return indexed
+
+
+# ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
 
 
 def query_collection(
-    query_text: str,
+    query_text: str | None = None,
     collection: Collection | None = None,
     top_k: int | None = None,
-    collection_name: str = CHROMA_COLLECTION,
-    persist_directory=CHROMA_DIR,
+    collection_name: str | None = None,
+    persist_directory=None,
     embed_fn: EmbedFn | None = None,
+    query_vector: list[float] | None = None,
+    where: dict | None = None,
 ) -> list[dict]:
-    """Query an existing collection WITHOUT re-embedding the corpus.
-
-    Only ``query_text`` is embedded here (one small call); the stored
-    document vectors are read straight from disk. This is what a fresh
-    process restart exercises: load the collection, embed the query, read
-    back matches.
+    """Query an existing collection without re-embedding the corpus.
 
     Args:
-        query_text: the natural-language query to embed and search with.
-        collection: an already-loaded collection; if omitted, one is loaded
-            via ``get_collection`` (which does not require re-embedding the
-            corpus).
-        top_k: number of results; defaults to ``config.TOP_K``.
-        collection_name / persist_directory: used only if ``collection`` is
-            not supplied.
-        embed_fn: optional injected embedding function for the query; must
-            match whatever embedded the stored documents, or distances are
-            meaningless.
+        query_vector: a pre-computed query embedding, so callers can reuse one
+            embedding across several searches.
+        where: optional Chroma metadata filter (used by document routing).
 
     Returns:
-        A list of hits, each ``{"id", "document", "metadata", "distance"}``,
-        ordered by increasing distance (most similar first).
+        Hits as ``{"id", "document", "metadata", "distance"}``, nearest first.
     """
-    from backend.config import TOP_K  # local import: keep config the source of truth
-
     collection = collection or get_collection(
         collection_name=collection_name, persist_directory=persist_directory
     )
-    k = top_k or TOP_K
-    embed = embed_fn or openai_embed_fn()
-    query_vector = embed([query_text])[0]
+    assert_embedding_model(collection)
 
-    result = collection.query(query_embeddings=[query_vector], n_results=k)
+    if query_vector is None:
+        if not query_text:
+            raise VectorStoreError("query_collection needs query_text or query_vector.")
+        embed = embed_fn or openai_embed_fn()
+        query_vector = embed([query_text])[0]
+
+    k = top_k or config.TOP_K
+    # Asking for more results than the collection holds raises in some Chroma
+    # versions; clamp so a small corpus behaves like a large one.
+    k = max(1, min(k, collection.count() or 1))
+
+    result = collection.query(
+        query_embeddings=[query_vector],
+        n_results=k,
+        **({"where": where} if where else {}),
+    )
 
     hits: list[dict] = []
-    ids = result.get("ids", [[]])[0]
-    docs = result.get("documents", [[]])[0]
-    metas = result.get("metadatas", [[]])[0]
-    dists = result.get("distances", [[]])[0]
-    for hit_id, doc, meta, dist in zip(ids, docs, metas, dists):
+    for hit_id, doc, meta, dist in zip(
+        result.get("ids", [[]])[0],
+        result.get("documents", [[]])[0],
+        result.get("metadatas", [[]])[0],
+        result.get("distances", [[]])[0],
+    ):
         hits.append({"id": hit_id, "document": doc, "metadata": meta, "distance": dist})
     return hits
 
 
+def all_chunks(
+    collection: Collection | None = None, persist_directory=None
+) -> list[dict]:
+    """Return every indexed chunk as ``{"id", "document", "metadata"}``.
+
+    Used to build the in-memory keyword index. Cheap for corpora of this size; a
+    very large corpus would want a persisted inverted index instead.
+    """
+    collection = collection or get_collection(persist_directory=persist_directory)
+    got = collection.get(include=["documents", "metadatas"])
+    return [
+        {"id": cid, "document": doc, "metadata": meta}
+        for cid, doc, meta in zip(
+            got.get("ids") or [],
+            got.get("documents") or [],
+            got.get("metadatas") or [],
+        )
+    ]
+
+
 def collection_stats(
     collection: Collection | None = None,
-    collection_name: str = CHROMA_COLLECTION,
-    persist_directory=CHROMA_DIR,
+    collection_name: str | None = None,
+    persist_directory=None,
 ) -> dict:
-    """Return ``{"name", "count", "persist_directory"}`` for a collection."""
+    """Return name, count, directory, embedding model, and document count."""
     collection = collection or get_collection(
         collection_name=collection_name, persist_directory=persist_directory
     )
+    sources = {
+        meta.get("source")
+        for meta in (collection.get(include=["metadatas"]).get("metadatas") or [])
+    }
     return {
         "name": collection.name,
         "count": collection.count(),
-        "persist_directory": str(persist_directory),
+        "documents": len([s for s in sources if s]),
+        "embedding_model": (collection.metadata or {}).get(
+            "embedding_model", config.EMBED_MODEL
+        ),
+        "distance_space": (collection.metadata or {}).get(
+            "hnsw:space", config.CHROMA_SPACE
+        ),
+        "persist_directory": str(persist_directory or config.CHROMA_DIR),
     }
