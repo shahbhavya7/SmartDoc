@@ -5,7 +5,7 @@
  *
  * The two roles are given deliberately different weight. A question is a compact
  * accent-tinted card aligned right; an answer is a full-width glass panel with
- * its citations and any grounding flags attached — because the answer is the
+ * its citations and any grounding flags attached because the answer is the
  * artifact the user has to be able to check, and the question is just the prompt
  * that produced it.
  */

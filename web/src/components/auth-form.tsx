@@ -4,7 +4,7 @@
  * The shared sign-in / sign-up form.
  *
  * One component for both modes because they differ only in which API call runs
- * and what the copy says — duplicating it would let the two screens drift apart
+ * and what the copy says duplicating it would let the two screens drift apart
  * visually, which on an auth screen reads as a phishing page.
  *
  * Error handling deliberately shows the server's message verbatim. The API

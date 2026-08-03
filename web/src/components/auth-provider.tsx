@@ -8,7 +8,7 @@
  * **The stored token is verified against the server before the app trusts it.**
  * On mount, a stored token is presented to `GET /auth/me`; only its reply
  * populates `user`. A token whose account was deleted, or which was hand-edited
- * in devtools, therefore never yields a signed-in UI — the backend re-reads the
+ * in devtools, therefore never yields a signed-in UI the backend re-reads the
  * user row on every request, so `/auth/me` is the authoritative check.
  *
  * **A 401 from anywhere ends the session once.** `authorizedFetch` funnels every
@@ -90,7 +90,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // nonetheless correct: the stored token lives in localStorage, which is
   // unreadable during render and absent on the server. Deriving it with a lazy
   // `useState` initialiser instead would make the first client render disagree
-  // with the prerendered HTML for any signed-in user — a hydration mismatch
+  // with the prerendered HTML for any signed-in user a hydration mismatch
   // rather than a fix.
   useEffect(() => {
     let cancelled = false;

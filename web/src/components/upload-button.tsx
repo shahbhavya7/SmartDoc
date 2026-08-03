@@ -9,7 +9,7 @@
  * the two that worked.
  *
  * The client-side checks (extension, size) exist to save a pointless round trip
- * on an obviously wrong file. They are not the enforcement — the server
+ * on an obviously wrong file. They are not the enforcement the server
  * sanitizes the filename, caps the byte count as it reads, and rejects
  * non-PDF content types regardless of what this component let through.
  */

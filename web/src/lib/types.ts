@@ -4,7 +4,7 @@
  * These are a transcription of the server's contract, not a second source of
  * truth: nothing here is computed, defaulted, or reinterpreted. The frontend
  * makes no identity or retrieval decisions, so there is no client-side model of
- * a user's permissions or of how an answer was produced — only of what the API
+ * a user's permissions or of how an answer was produced only of what the API
  * returned.
  */
 

@@ -3,7 +3,7 @@
 /**
  * The sessions sidebar: the user's last 10 chats.
  *
- * Selecting one is a plain state change in the parent — no navigation — which is
+ * Selecting one is a plain state change in the parent no navigation which is
  * what makes switching instant. Hovering or focusing an entry prefetches its
  * history into the parent's cache, so by the time the click lands the messages
  * are usually already there.

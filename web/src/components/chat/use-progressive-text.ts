@@ -8,7 +8,7 @@
  * SmartDoc's grounding stage reads the COMPLETE answer, and may regenerate it,
  * prune sentences from it, or withdraw it entirely to the refusal string
  * (DECISIONS.md C14). Tokens streamed straight from the model would therefore be
- * text the server has not yet decided to stand behind — and retracting an answer
+ * text the server has not yet decided to stand behind and retracting an answer
  * a user has already read is a worse experience than waiting for a verified one.
  *
  * So the network trip stays a single request for a verified answer, and the
@@ -16,8 +16,8 @@
  * useful token would have arrived (the answer is not knowable earlier), and the
  * text that appears is final: nothing on screen is ever taken back.
  *
- * The rate is length-aware — a one-line refusal should not crawl, and a
- * three-paragraph synthesis should not take ten seconds — so total reveal time
+ * The rate is length-aware a one-line refusal should not crawl, and a
+ * three-paragraph synthesis should not take ten seconds so total reveal time
  * is bounded to roughly `MAX_MS` regardless of size.
  */
 
@@ -39,7 +39,7 @@ interface Progress {
 
 export function useProgressiveText(
   text: string,
-  /** False shows the text in full with no animation — used for history. */
+  /** False shows the text in full with no animation used for history. */
   animate: boolean,
 ): { visible: string; done: boolean } {
   const [progress, setProgress] = useState<Progress>({ text: "", revealed: 0 });

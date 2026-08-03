@@ -9,7 +9,7 @@
  * best answers its least readable ones.
  *
  * `react-markdown` is used with no raw-HTML plugin, so model output cannot inject
- * markup — the answer is untrusted text as far as this component is concerned,
+ * markup the answer is untrusted text as far as this component is concerned,
  * even though it originates from our own backend.
  */
 

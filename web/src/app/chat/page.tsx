@@ -5,7 +5,7 @@ import { AppShell } from "@/components/app-shell";
 import { ChatWorkspace } from "@/components/chat/chat-workspace";
 import { RequireAuth } from "@/components/require-auth";
 
-export const metadata = { title: "Chat — SmartDoc" };
+export const metadata = { title: "Chat SmartDoc" };
 
 export default function ChatPage() {
   return (

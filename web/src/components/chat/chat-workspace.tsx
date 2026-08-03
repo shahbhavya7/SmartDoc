@@ -6,7 +6,7 @@
  *
  * Switching sessions is instant, and that is a structural choice rather than an
  * optimisation. The active session id lives in component state, and the URL is
- * kept in sync with `history.replaceState` — NOT with `router.push`. An App Router
+ * kept in sync with `history.replaceState` NOT with `router.push`. An App Router
  * navigation would fetch an RSC payload for a route whose content is entirely
  * client-fetched anyway, adding a network hop to a switch that needs none. The URL
  * still updates, so a chat stays linkable and reload-safe.
@@ -17,7 +17,7 @@
  * The server owns memory. Each `POST /ask` with a `session_id` stores both
  * messages, resolves references from that session's running summary, and updates
  * the summary in a background task after responding. This component therefore
- * never sends conversation history — sending it would duplicate the memory the
+ * never sends conversation history sending it would duplicate the memory the
  * server already maintains, and let the two disagree.
  */
 
@@ -87,7 +87,7 @@ export function ChatWorkspace() {
   /**
    * The one message allowed to play the reveal animation: the answer to the turn
    * just asked. Explicit state rather than a "seen" set, so nothing is mutated
-   * during render and history can never re-animate — a reloaded conversation
+   * during render and history can never re-animate a reloaded conversation
    * whose answers all typed themselves back in would look broken.
    */
   const [animatingId, setAnimatingId] = useState<string | null>(null);
@@ -284,8 +284,8 @@ export function ChatWorkspace() {
    *
    * `POST /ask` returns the answer but not the ids of the two rows it stored, and
    * the citation cache is keyed by the assistant message's real id so it survives
-   * a reload. So the message list is re-read once per turn — a cheap indexed
-   * SQLite query — purely to learn that id.
+   * a reload. So the message list is re-read once per turn a cheap indexed
+   * SQLite query purely to learn that id.
    *
    * It deliberately does NOT swap the optimistic rows for the fetched ones. Their
    * text is identical, and replacing them would change the rendered answer's
@@ -363,7 +363,7 @@ export function ChatWorkspace() {
             query_type: response.query_type,
           },
         }));
-        // This — and only this — answer gets the progressive reveal.
+        // This and only this answer gets the progressive reveal.
         setAnimatingId(optimisticAnswerId);
         setPending(null);
 
@@ -462,7 +462,7 @@ export function ChatWorkspace() {
     // columns inside scroll independently so neither the sidebar nor the
     // composer moves with the conversation.
     <div className="glass-chrome flex min-h-0 flex-1 overflow-hidden rounded-2xl border border-white/10 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.65)]">
-      {/* Sidebar — a fixed rail from lg up, an overlay drawer below it. */}
+      {/* Sidebar a fixed rail from lg up, an overlay drawer below it. */}
       <aside
         className={cn(
           "z-30 w-[17.5rem] shrink-0 border-r border-white/[0.07]",
@@ -598,7 +598,7 @@ export function ChatWorkspace() {
             {!documents.loading && !hasDocuments ? (
               <p className="mb-2 flex items-center gap-2 text-xs text-amber-200/85">
                 <FileWarning className="size-3.5 shrink-0" aria-hidden />
-                You have no documents indexed yet — upload a PDF or every question
+                You have no documents indexed yet upload a PDF or every question
                 will be refused.
               </p>
             ) : null}

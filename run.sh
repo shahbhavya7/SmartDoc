@@ -69,7 +69,13 @@ if ! grep -qE '^OPENAI_API_KEY=.+' "$PROJECT_ROOT/.env"; then
     exit 1
 fi
 
-port_in_use() { lsof -ti :"$1" >/dev/null 2>&1; }
+# `-sTCP:LISTEN` matters: a bare `lsof -ti :"$1"` matches ANY socket that
+# mentions the port, including another process's now-closed connection TO a
+# server that used to listen there (e.g. a browser tab's lingering CLOSE_WAIT
+# socket after a dev server was killed). That is not a listener and does not
+# block a new process from binding the port, but it made this check report a
+# false "in use" long after the port was actually free.
+port_in_use() { lsof -ti :"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 
 if [ "$START_BACKEND" -eq 1 ] && port_in_use "$API_PORT"; then
     echo "ERROR: port $API_PORT is already in use." >&2
@@ -190,7 +196,23 @@ if [ "$START_UI" -eq 1 ]; then
     # The browser reaches the API directly, so the client bundle needs the API's
     # address at build time. Passing it here keeps a non-default API_PORT working
     # without editing web/.env.local.
-    export NEXT_PUBLIC_API_BASE_URL="${NEXT_PUBLIC_API_BASE_URL:-http://${API_HOST}:${API_PORT}}"
+    #
+    # The default host is NOT simply API_HOST: Google's OAuth flow sets a
+    # session cookie when the browser first hits /auth/google/login, then
+    # reads it back on /auth/google/callback -- and browsers scope cookies to
+    # the exact host in the URL, so localhost and 127.0.0.1 do NOT share one
+    # even though both mean "this machine". GOOGLE_REDIRECT_URI in .env is a
+    # fixed string pre-registered with Google, so whichever host it names is
+    # the one every request in the flow must use throughout -- including the
+    # very first one, which is this variable, built here from API_HOST. If the
+    # two ever disagree, the callback's state check fails with a bare
+    # "mismatching_state" and the browser sees only "Google sign-in failed or
+    # was cancelled." -- this is that bug, at its actual source. Falling back
+    # to GOOGLE_REDIRECT_URI's own host keeps the two locked together
+    # regardless of what either default happens to be.
+    GOOGLE_REDIRECT_HOST="$(grep -E '^GOOGLE_REDIRECT_URI=' "$PROJECT_ROOT/.env" 2>/dev/null \
+        | tail -n1 | cut -d= -f2- | sed -E 's#^(https?://[^/]+).*#\1#')"
+    export NEXT_PUBLIC_API_BASE_URL="${NEXT_PUBLIC_API_BASE_URL:-${GOOGLE_REDIRECT_HOST:-http://${API_HOST}:${API_PORT}}}"
 
     echo "Starting frontend -> http://localhost:${UI_PORT}  (log: ${UI_LOG#$PROJECT_ROOT/})"
     echo "  API base for the browser: $NEXT_PUBLIC_API_BASE_URL"

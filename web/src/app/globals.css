@@ -5,7 +5,7 @@
 @custom-variant dark (&:is(.dark *));
 
 /* ---------------------------------------------------------------------------
-   SmartDoc design system — "glass on black"
+   SmartDoc design system "glass on black"
    ---------------------------------------------------------------------------
    A near-black base, frosted translucent cards, and the champagne/sand accent
    carried over from the V1 Streamlit theme (rgb(200 180 140) / #f4e9d0 text).
@@ -70,7 +70,7 @@
   --background: oklch(0.115 0.008 264);
   --foreground: oklch(0.962 0.005 264);
 
-  /* Frosted glass. Translucency is the point — these sit over the page glow. */
+  /* Frosted glass. Translucency is the point these sit over the page glow. */
   --card: oklch(1 0 0 / 6%);
   --card-foreground: oklch(0.962 0.005 264);
   --popover: oklch(0.17 0.01 264 / 92%);
@@ -245,7 +245,7 @@
 }
 
 /* Faint diagonal hatch, carried over from V1's repeating-linear-gradient.
-   Used sparingly — on empty states, so a blank panel is not a flat void. */
+   Used sparingly on empty states, so a blank panel is not a flat void. */
 @utility hatch {
   background-image: repeating-linear-gradient(
     135deg,

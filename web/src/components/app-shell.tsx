@@ -5,7 +5,7 @@
  * account menu, wrapped around whatever the route renders.
  *
  * The bar is sticky and translucent so content scrolls *under* it, which is what
- * sells the glass — an opaque bar would just look like a header. It floats with
+ * sells the glass an opaque bar would just look like a header. It floats with
  * a fixed margin on every side (rather than sitting flush against the viewport
  * edge) so it reads as a card above the page instead of a bolted-on strip.
  *
@@ -159,7 +159,7 @@ export function AppShell({
             // can fill it with `flex-1` rather than `h-full`. That is NOT a
             // style preference: a percentage height does not reliably resolve
             // against a flex ITEM's flex-computed size in this stack (verified
-            // in Chromium — even an inline `height:100%` on the child measured
+            // in Chromium even an inline `height:100%` on the child measured
             // short of `main`'s actual height). Flex-grow has no percentage to
             // resolve, so it isn't exposed to that failure; it's also exactly
             // how `main` itself already gets its own height from ITS flex-col

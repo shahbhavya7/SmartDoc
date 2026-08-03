@@ -6,7 +6,7 @@
  * The backend's `/auth/google/callback` finishes the code exchange server-side,
  * mints the same kind of JWT that password login issues, and redirects here with
  * `?token=`. So this page never sees an authorization code, a client secret, or
- * Google's tokens — only the finished bearer token. That is the whole reason auth
+ * Google's tokens only the finished bearer token. That is the whole reason auth
  * is owned by FastAPI: the browser is handed a result, not a credential exchange
  * to perform.
  *
@@ -42,8 +42,8 @@ export function OAuthCallback() {
 
   const token = searchParams.get("token");
 
-  // Arriving with no token at all — the user cancelled at Google's consent
-  // screen, or OAUTH_SUCCESS_REDIRECT is misconfigured — is derived straight
+  // Arriving with no token at all the user cancelled at Google's consent
+  // screen, or OAUTH_SUCCESS_REDIRECT is misconfigured is derived straight
   // from the URL rather than stored, so no state write is needed to render it.
   const error =
     failure ?? (token ? null : "Google sign-in did not complete. No token was returned.");

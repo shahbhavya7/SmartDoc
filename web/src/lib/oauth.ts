@@ -13,7 +13,7 @@ export function takeOAuthNext(fallback = "/dashboard"): string {
     // callback into an open redirect to another site.
     if (stored && stored.startsWith("/") && !stored.startsWith("//")) return stored;
   } catch {
-    /* storage unavailable — fall through */
+    /* storage unavailable fall through */
   }
   return fallback;
 }

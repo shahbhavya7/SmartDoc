@@ -3,7 +3,7 @@
 /**
  * Client-side route protection for the authenticated shell.
  *
- * This is a UX guard, not a security boundary — and the distinction is worth
+ * This is a UX guard, not a security boundary and the distinction is worth
  * being explicit about. Nothing here decides what data anyone may see: every
  * protected endpoint verifies the JWT server-side and derives `user_id` from the
  * token, so bypassing this component yields an authenticated-looking chrome with

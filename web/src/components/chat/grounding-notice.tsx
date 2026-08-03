@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * Surfaces the grounding verdict when — and only when — it means something.
+ * Surfaces the grounding verdict when and only when it means something.
  *
  * The backend verifies every answer's claims against the retrieved context and
  * remediates before responding: it regenerates, or prunes the offending

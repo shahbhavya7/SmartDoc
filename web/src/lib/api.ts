@@ -8,7 +8,7 @@
  * 1. **No endpoint is ever called without the token**, because attaching it is
  *    not the caller's job.
  * 2. **No request names a user.** There is no `user_id` parameter anywhere in
- *    this module — the server derives identity from the token's `sub` claim, so
+ *    this module the server derives identity from the token's `sub` claim, so
  *    a client-supplied id would be ignored even if one were sent. Data isolation
  *    is a server property; the frontend's part is simply not to invent a second
  *    notion of "whose data this is".

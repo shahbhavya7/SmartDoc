@@ -1,7 +1,7 @@
 /**
  * Keeps citations attached to an answer across a page reload.
  *
- * `GET /sessions/{id}/messages` returns `{role, content}` — the durable record of
+ * `GET /sessions/{id}/messages` returns `{role, content}` the durable record of
  * *what was said*. It does not carry the sources or the grounding verdict, which
  * `POST /ask` returns alongside the answer and which the server does not persist.
  * So on a reload, message history alone would render every past answer with its
@@ -12,7 +12,7 @@
  *
  * - It is keyed by the assistant message's server-assigned id, so an entry can
  *   only ever be shown against the exact message it was produced for.
- * - A miss renders the answer text with no sources panel — never a guess, and
+ * - A miss renders the answer text with no sources panel never a guess, and
  *   never another answer's citations.
  * - It is per-origin browser storage, so it does not follow the user to another
  *   device. That is a known limitation of not persisting sources server-side,

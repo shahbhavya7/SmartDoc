@@ -7,7 +7,7 @@
  * a 401 signs the user out globally rather than surfacing as a broken panel.
  * None of these hooks takes a `user_id`: the server derives the owner from the
  * token, which is why "the UI must not leak across accounts" needs no filtering
- * on this side — there is nothing to filter, only what the server returned.
+ * on this side there is nothing to filter, only what the server returned.
  *
  * In-flight requests are aborted on unmount and superseded by newer ones, so a
  * slow response cannot land after a faster one and overwrite it.

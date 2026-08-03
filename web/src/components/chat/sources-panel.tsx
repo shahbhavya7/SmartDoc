@@ -3,7 +3,7 @@
 /**
  * The citations under an answer.
  *
- * These come from retrieval metadata, not from the model — the document, page,
+ * These come from retrieval metadata, not from the model the document, page,
  * and section are structural facts about which passage was read, which is why
  * they cannot be hallucinated. Presenting them as the primary way to check an
  * answer is the point, so each one shows the actual snippet that entered the

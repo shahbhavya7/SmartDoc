@@ -3,7 +3,7 @@
 /**
  * The question input.
  *
- * Enter sends and Shift+Enter breaks the line — a question about a policy is
+ * Enter sends and Shift+Enter breaks the line a question about a policy is
  * often one line, and the alternative (Enter always breaking) makes the common
  * case need a mouse.
  *

@@ -1,4 +1,4 @@
-# SmartDoc — Architecture Decisions
+# SmartDoc Architecture Decisions
 
 Original locked decisions, then every change made during the production-quality
 review: the problem, why it occurred, the trade-off accepted, and why the chosen
@@ -6,7 +6,7 @@ option beat the alternatives.
 
 ---
 
-## Part 1 — Original locked decisions (unchanged)
+## Part 1 Original locked decisions (unchanged)
 
 | Decision | Rationale |
 |---|---|
@@ -20,7 +20,7 @@ option beat the alternatives.
 
 ---
 
-## Part 2 — Verified bugs
+## Part 2 Verified bugs
 
 These were defects, not preferences. Each was proven with a controlled test.
 
@@ -37,7 +37,7 @@ zero stale chunks.
 touches 2–4. Earlier idempotency testing only re-uploaded *byte-identical* files,
 which cannot expose this.
 
-**Consequence.** A repealed HR policy stays answerable as though current — the
+**Consequence.** A repealed HR policy stays answerable as though current the
 worst failure mode a policy assistant has.
 
 **Fix.** `ingest_documents` deletes every chunk of a source before writing, plus
@@ -45,7 +45,7 @@ a `content_hash` per document so unchanged files are skipped without embedding
 calls.
 
 **Trade-off.** Replacement is not atomic: a crash between delete and upsert
-leaves the document unindexed. Accepted — a *missing* document produces a
+leaves the document unindexed. Accepted a *missing* document produces a
 refusal, while a *stale* document produces a confident wrong answer. Rejected
 alternative: version-suffixed ids with a tombstone sweep, which needs a
 background reaper and adds its own failure mode.
@@ -55,14 +55,14 @@ background reaper and adds its own failure mode.
 All retrieved hits went into the prompt while the citation list was filtered by a
 distance margin. The model read four passages; the user was shown one. Any claim
 from the other three was uncited. Filtering now happens once, upstream, and
-citations are built from `AssembledContext.units_used` — exactly what entered the
-prompt — so the two cannot diverge by construction.
+citations are built from `AssembledContext.units_used` exactly what entered the
+prompt so the two cannot diverge by construction.
 
 ### B3. The index was L2 while the tuned threshold assumed cosine
 
 The collection was created without `hnsw:space`, so Chroma defaulted to `l2`
 (0–4 scale) while docstrings described the values as cosine distances and a
-`0.30` margin was calibrated on that misdescribed scale — within 0.01 of flipping
+`0.30` margin was calibrated on that misdescribed scale within 0.01 of flipping
 a real citation. `CHROMA_SPACE=cosine` is now explicit, and the fragile margin is
 gone entirely, replaced by rank-based selection (RRF + reranking) that needs no
 per-corpus distance constant. The collection also records its embedding model and
@@ -73,13 +73,13 @@ return confident nonsense.
 ### B4. No request timeout
 
 The OpenAI client had no timeout, so one hung connection blocked its caller
-forever with no error — observed as an evaluation run that sat silent for 28
+forever with no error observed as an evaluation run that sat silent for 28
 minutes, and the same hang would tie up a FastAPI worker. Timeout (45s) and
 bounded retries are now configured.
 
 ---
 
-## Part 3 — Retrieval architecture
+## Part 3 Retrieval architecture
 
 ### C1. Chunking: page-independent → document-stream, heading-aware, parent/child
 
@@ -87,12 +87,12 @@ bounded retries are now configured.
 
 Chunking ran per page, so any section spanning a page break was severed and
 overlap never crossed the boundary. Measured: the old pipeline produced **0**
-chunks spanning a page break — structurally impossible. The new one produces 124.
+chunks spanning a page break structurally impossible. The new one produces 124.
 
 Text is now assembled into a document-level stream of structural blocks
 (heading / paragraph / table) carrying page numbers, and chunking runs over that.
 Blocks are kept on each chunk so a parent can be re-split into children without
-flattening to text — otherwise every child inherits the parent's start page and
+flattening to text otherwise every child inherits the parent's start page and
 page attribution silently breaks (a bug caught during implementation).
 
 Children (~350 tokens) are embedded and searched; parents (~1600) are what the
@@ -112,7 +112,7 @@ boundary at ingest, boundaries no human can predict, small gain on documents tha
 every fault-code and entitlement table at ingest. PyMuPDF's table finder now
 renders tables as pipe-delimited rows, and prose blocks overlapping a table's
 bounding box are skipped so cells are not emitted twice. Tables are never split
-mid-row — half a table loses its header row and becomes uninterpretable.
+mid-row half a table loses its header row and becomes uninterpretable.
 
 **Verified:** "list all diagnostic fault codes" returns all 9 codes across a table
 split over two pages **plus** 2 conditions documented only in prose.
@@ -124,7 +124,7 @@ Frequency beats pattern-matching "Page X of Y": body sentences do not recur
 verbatim across most pages.
 
 **Caveat found in testing.** A document's title block is usually the *same string*
-as its running header, so stripping deleted the title — and with it the breadcrumb
+as its running header, so stripping deleted the title and with it the breadcrumb
 that helps every chunk. Page 1 is therefore exempt, and only the first repeating
 line on page 1 may become a heading, so a footer like "Internal Use Only" cannot
 become a section title (also observed).
@@ -142,7 +142,7 @@ those words.
 ### C5. Hybrid retrieval and rank fusion
 
 Dense search plus BM25. Dense generalises across paraphrase; BM25 nails rare
-exact tokens — "E-07", "AES-256", "Tier 3" — where embeddings are weakest because
+exact tokens "E-07", "AES-256", "Tier 3" where embeddings are weakest because
 such tokens carry little distributional signal. The tokenizer preserves
 hyphenated identifiers, since splitting "E-01" into "e" and "01" defeats the
 purpose.
@@ -188,7 +188,7 @@ document's **top few** chunk scores. Summing all hits ranks by length: a 33-page
 manual accumulates more weak matches than a 6-page register that answers the
 question exactly.
 
-Selection is **relative** — a document survives at ≥ `DOC_SCORE_DROP_RATIO` of the
+Selection is **relative** a document survives at ≥ `DOC_SCORE_DROP_RATIO` of the
 leader. Absolute thresholds do not transfer across corpora or embedding models;
 the ratio between best and second-best is scale-free. Modes that draw heavily from
 each document they keep use a stricter gate (`outline` 0.60, `sweep` 0.65).
@@ -219,7 +219,7 @@ like "testing" cannot wander into an unrelated document's testing section.
 ### C9. Reranking credits bridging passages
 
 The reranker judged candidates against the original question, which structurally
-penalises the passage stating a **rule** in a multi-hop chain — "Restricted data
+penalises the passage stating a **rule** in a multi-hop chain "Restricted data
 must be encrypted with AES-256" never mentions "payroll records", so it ranked #1
 in dense search and was then discarded. The prompt now awards 3 to a passage
 supplying a rule, classification, or definition the answer depends on, *even when
@@ -227,7 +227,7 @@ it shares no vocabulary with the question*.
 
 ### C10. Escalation on shortfall
 
-A refusal — or an answer reporting its own missing coverage — from a cheap
+A refusal or an answer reporting its own missing coverage from a cheap
 single-query plan triggers **one** retry with the multi-hop profile. Some
 questions need an intermediate lookup with no surface marker saying so ("what
 encryption is required for payroll records?" reads like a plain lookup). Paying
@@ -236,7 +236,7 @@ for decomposition only after a cheap attempt fails keeps the fast path fast.
 A question naming a capitalised entity also never takes the no-classifier fast
 path. Found the hard way: "How often must Northwind Logistics complete a SOC 2
 review?" was fast-pathed, the bridging fact was never retrieved, and the model
-asserted "Tier 3" **unsupported** — right answer, no evidence.
+asserted "Tier 3" **unsupported** right answer, no evidence.
 
 ### C11. Context assembly
 
@@ -249,8 +249,8 @@ Near-duplicates are detected by shingle **containment** (chunk overlap produces 
 *subset* relationship, which symmetric measures like Jaccard score as only
 moderately similar and therefore miss). Adjacent passages are merged before the
 model sees them. For synthesis and procedures, relevance-interleaving is
-**deliberately disabled** and document order preserved — scrambling a policy's
-sections to fight position bias destroys the sequence the answer must follow — and
+**deliberately disabled** and document order preserved scrambling a policy's
+sections to fight position bias destroys the sequence the answer must follow and
 the document outline is prepended so the model can state what it did not cover.
 
 **Bug caught here.** The first implementation budgeted whole document *groups*, so
@@ -264,7 +264,7 @@ Failure modes differ by intent, so instructions do too: exhaustive extraction is
 told to enumerate items from tables *and* prose; comparison to address every named
 entity; synthesis to follow the document's structure and say what it omits;
 cross-document to attribute by document name and surface conflicts rather than
-silently choosing. Refusal is graded — previously binary, which produced answers
+silently choosing. Refusal is graded previously binary, which produced answers
 with the refusal sentence bolted on ("Secondary caregivers get four weeks. I don't
 know based on the available documents.").
 
@@ -274,7 +274,7 @@ Snippets were cut from the head of a chunk, so the cited text usually did not
 contain the supporting sentence. A lexical-centering fix worked in English only: a
 Spanish query about annual leave cited the *Sick Leave* section, because zero
 English content-word overlap fell back to head-of-section. The snippet is now cut
-from the **child chunk that matched** — selected by embedding similarity, hence
+from the **child chunk that matched** selected by embedding similarity, hence
 the semantically matched span regardless of query language.
 
 Cross-lingual questions are also translated for retrieval, because BM25
@@ -321,7 +321,7 @@ embedding call covers all sub-queries; the BM25 index is cached on
 
 ---
 
-## Part 4 — Evaluation framework
+## Part 4 Evaluation framework
 
 **Corpus.** 21 chunks over 7 mostly-synthetic 1–2 page PDFs meant `top_k=4`
 touched 19% of the corpus per query; the hard query classes could not be
@@ -344,7 +344,7 @@ Two measurement bugs were found and fixed in the harness itself:
 
 * Page-pair windows were merged with single-page hits, attributing every fact to
   both pages of every containing window. That inflated the gold set ~3× and
-  dragged reported recall from 0.98 to 0.43 — a pure artifact that looked exactly
+  dragged reported recall from 0.98 to 0.43 a pure artifact that looked exactly
   like a retrieval regression. Resolution is now precise-first.
 * The LLM correctness judge was unreproducible: asked which of 4 required facts
   were missing, it returned 7. Correctness is now scored structurally against
@@ -366,13 +366,13 @@ move the numbers on this corpus should be called out, not defended.
 
 ---
 
-# V2 — multi-tenant SmartDoc
+# V2 multi-tenant SmartDoc
 
-Everything above is carried over unchanged. The retrieval stack — dense, BM25,
-RRF, reranking, the adaptive modes, grounding — is treated as a fixed input; V2
+Everything above is carried over unchanged. The retrieval stack dense, BM25,
+RRF, reranking, the adaptive modes, grounding is treated as a fixed input; V2
 adds ownership around it and does not alter how anything is found or ranked.
 
-## Part 5 — Phase 1: users, auth, and isolation
+## Part 5 Phase 1: users, auth, and isolation
 
 ### D1. Two stores, joined on `document_id`
 
@@ -387,7 +387,7 @@ survives both.
 
 `PRAGMA foreign_keys = ON` is issued per connection. SQLite compiles foreign-key
 support in but leaves it **off**, so the declared constraints would otherwise be
-documentation — integrity that looks enforced and is not.
+documentation integrity that looks enforced and is not.
 
 ### D2. Isolation is enforced at one choke point, not at each call site
 
@@ -407,13 +407,13 @@ from maintenance scripts, never from a request.
 **Why `contextvars` and not a module global.** FastAPI runs sync endpoints in a
 threadpool; contextvars are copied into those workers, so two concurrent
 requests from different users each carry their own scope. A global would be
-shared between them — an isolation bug that appears only under load, which is
+shared between them an isolation bug that appears only under load, which is
 the worst kind.
 
 **Trade-off, stated plainly.** The scope is ambient rather than explicit in each
 function signature, so reading `retrieval.py` alone does not reveal that its
 reads are filtered. Mitigated by three things: `vectorstore.py` is the only
-module that touches the collection directly (verified — no `collection.get` or
+module that touches the collection directly (verified no `collection.get` or
 `collection.query` survives anywhere else), `ScopeError` fails closed rather
 than falling back to unfiltered access, and the isolation test asserts the
 property end to end rather than trusting the mechanism.
@@ -425,7 +425,7 @@ fused.
 
 ### D3. Chunk ids are namespaced per user
 
-Ids were `"<source>:<chunk_index>"` — unique per document, **not** per user. Two
+Ids were `"<source>:<chunk_index>"` unique per document, **not** per user. Two
 users uploading `handbook.pdf` would produce identical ids, and the second
 upsert would silently overwrite the first user's chunks: data loss dressed as an
 update. Ids written under a scope are now prefixed `u<user_id>|`, and the
@@ -438,7 +438,7 @@ already owned indexed 16 new chunks and left the dev user's 16 untouched.
 ### D4. BM25 is per-user, and the cache key says so
 
 The lexical index is a *materialised copy* of the corpus, so unlike a Chroma
-query it cannot be filtered after the fact — an index built across tenants would
+query it cannot be filtered after the fact an index built across tenants would
 surface another user's passage as a keyword hit with no metadata filter in the
 path to stop it. `all_chunks()` is scoped, and the cache key gained the user_id.
 
@@ -453,14 +453,14 @@ question is which. Vectors-first leaves a listed document with no vectors —
 unanswerable, visible, and retryable by the user. Row-first would leave
 orphaned vectors with no row to delete them by: still retrievable, still
 citable, and no longer visible in any UI. That is bug B1 one level up, and the
-same reasoning applies — a missing document produces a refusal, a stale one
+same reasoning applies a missing document produces a refusal, a stale one
 produces a confident wrong answer.
 
 ### D6. Ownership is part of the lookup, not a check after it
 
 `get_document(user_id, document_id)` filters on both columns; there is no
 `get_document(document_id)` to forget to guard. Another user's id simply does
-not resolve, so the endpoint returns **404 rather than 403** — a 403 would
+not resolve, so the endpoint returns **404 rather than 403** a 403 would
 confirm that the id exists, letting a caller enumerate the id space.
 
 Messages have no owner column of their own; `list_messages` joins to
@@ -478,7 +478,7 @@ Messages have no owner column of their own; `list_messages` joins to
   a password that is weaker than it looks.
 * **Google accounts are matched on `sub`, not email.** `sub` is the stable
   account identifier; an email can be reassigned. An existing password account
-  is linked only when Google reports the address *verified* — otherwise an
+  is linked only when Google reports the address *verified* otherwise an
   unverified claim to an address takes over the account behind it.
 * **The user row is re-read on every request** rather than trusted from the
   token body, so a deleted account stops working immediately instead of at token
@@ -492,7 +492,7 @@ Messages have no owner column of their own; `list_messages` joins to
 491 existing chunks had no owner, and an ownerless chunk is invisible to
 everyone under the new rules. `scripts/seed_dev_user.py` stamps `user_id` and
 `document_id` onto their metadata and registers one `documents` row per source,
-making the whole existing library the dev user's. Metadata only — no vectors,
+making the whole existing library the dev user's. Metadata only no vectors,
 text, boundaries, or embedding calls. The 247 parent records are stamped too;
 skipping them would leave parent expansion silently returning nothing, which
 degrades every answer to child-only context while still appearing to work.
@@ -523,19 +523,19 @@ single-user behaviour breaking, and Streamlit is replaced by the Next.js client
 in a later phase. The eval harness in `scripts/` calls the pipeline in-process
 with no scope bound, so it continues to run against the full corpus.
 
-## Part 6 — Phase 2: conversational memory and orchestration upgrades
+## Part 6 Phase 2: conversational memory and orchestration upgrades
 
-The retrieval stack — dense, BM25, RRF, reranking, the adaptive modes,
-grounding — is unchanged again this phase. Everything below either sits
+The retrieval stack dense, BM25, RRF, reranking, the adaptive modes,
+grounding is unchanged again this phase. Everything below either sits
 strictly above it (session memory) or is a bounded, flag-gated override applied
 before or after it (Part B).
 
-### Part A — per-session memory
+### Part A per-session memory
 
 **E1. The summary replaces the transcript as what feeds the next turn.**
 `sessions.summary` is a single condensed paragraph, rewritten on every turn by
 one `UTILITY_MODEL` call that reads the OLD summary and the LATEST turn and
-returns a new, bounded (`MAX_SUMMARY_CHARS` = 800) summary — not an append.
+returns a new, bounded (`MAX_SUMMARY_CHARS` = 800) summary not an append.
 Storing and re-sending the raw transcript would grow the prompt without bound
 and dilute it with small talk; asking the model to re-condense every time is
 what keeps the result a fixed, small cost regardless of session length, with no
@@ -545,20 +545,20 @@ separate truncation logic needed.
 inserted into the GENERATION prompt only, in a block labelled "Conversation
 memory (for resolving references only)", and the system prompt is told
 explicitly to use it only for pronouns/references and never as a source of
-claims — every factual statement must still come from the retrieved context.
+claims every factual statement must still come from the retrieved context.
 Without this split, a wrong or stale summary line becomes a fact the model
 repeats, which defeats the whole "answer only from retrieved context"
 guarantee (locked decision, Part 1).
 
 Retrieval itself is NOT given the summary text. Only `conversation_focus` (the
 filename most recently cited) reaches retrieval, through the SAME parameter
-Feature 1 already used — deliberately not a new lever, so a follow-up's
+Feature 1 already used deliberately not a new lever, so a follow-up's
 retrieval quality does not depend on how well summarization went, only on
 which document was last discussed.
 
 **E3. `last_document` is set synchronously; the summary is not.** After an
 answer, `sessions.last_document` is written immediately from
-`response.sources[0].source` — a plain field assignment, no LLM call, so it
+`response.sources[0].source` a plain field assignment, no LLM call, so it
 costs nothing on the request path. Only the summary needs an LLM round trip,
 and that is the one thing deferred to the background task.
 
@@ -572,7 +572,7 @@ own failure modes. Verified two ways:
   `TestClient`, which awaits background tasks as part of the same call and so
   cannot distinguish "before" from "after" the response): median latency
   stateless vs. a session's later turns differed by **+312ms** against a
-  ~3000ms run-to-run noise floor on this corpus — not the several-hundred-ms-to-
+  ~3000ms run-to-run noise floor on this corpus not the several-hundred-ms-to-
   seconds cost an inline summarization call would add. Script:
   `scripts/measure_memory_latency.py`.
 * The stored summary was independently confirmed to exist after the request
@@ -584,13 +584,13 @@ proven, not assumed.** A test with an unsafe stand-in task showed Starlette
 propagating a background task's exception straight through the request
 (`test_background_task_exception_is_not_swallowed_by_starlette`). The actual
 scheduled function, `backend.memory.summarize_turn_and_store`, therefore wraps
-its own body in `try/except Exception: logger.exception(...)` — the safety net
+its own body in `try/except Exception: logger.exception(...)` the safety net
 has to be the callee's, because nothing upstream provides one. A failed
 summarization degrades to "this turn wasn't remembered", never a 500.
 
 **E6. Sidebar ordering is "last active", not "last created".** `GET /sessions`
 (default `limit=10`) orders by `COALESCE(MAX(messages.created_at),
-sessions.created_at)` — a session replied to five minutes ago outranks one
+sessions.created_at)` a session replied to five minutes ago outranks one
 created an hour ago with no reply. A dedicated `last_activity` column, updated
 on every message insert, was rejected: at this schema's scale a `LEFT JOIN` +
 `GROUP BY` over the existing `idx_messages_session` index is already fast and
@@ -598,14 +598,14 @@ needs no write-path bookkeeping to keep in sync.
 
 **Bug found and fixed while building this.** `messages` were ordered by
 `(created_at, id)`. `created_at` has second resolution, and a question and its
-own answer are routinely stored within the same second — at which point `id`
+own answer are routinely stored within the same second at which point `id`
 (a random UUID) decided the order, silently reversing a real turn roughly half
 the time. Reordered to `(created_at, rowid)`: SQLite's implicit, monotonically
 increasing insertion-order column, which needed no schema change. Caught by a
 Phase 2 test asserting message order, not by anything in Phase 1, which only
 asserted message *count*.
 
-### Part B — orchestration upgrades (each flag OFF by default)
+### Part B orchestration upgrades (each flag OFF by default)
 
 **E7. Feature 5, document lock, is a new binary decision, not a bigger
 Feature-1 weight.** Feature 1 (`ROUTER_ENABLED`) already nudges a document's
@@ -614,11 +614,11 @@ Feature-1 weight.** Feature 1 (`ROUTER_ENABLED`) already nudges a document's
 evidence. A genuine lock needs the opposite property on the cases it fires for:
 when the user names one document, or refers to "this document" with a
 conversation focus already established, retrieval should restrict to exactly
-that document regardless of the ratio-based gate — a user's explicit reference
+that document regardless of the ratio-based gate a user's explicit reference
 outranks a similarity score. `backend.doc_router.detect_lock` is therefore a
 separate, conservative decision function, not a tuning of Feature 1's weight:
 
-* Fires only when the question reads as ambiguous-free — exactly one scored
+* Fires only when the question reads as ambiguous-free exactly one scored
   document's title/filename terms are a subset of the question's terms, or a
   bare reference resolves to an existing `conversation_focus`. Naming two
   documents, or naming none with no focus set, does not lock.
@@ -627,7 +627,7 @@ separate, conservative decision function, not a tuning of Feature 1's weight:
   is the exact failure the per-entity retrieval mode exists to prevent.
 * Never fires for `multi_hop`/`cross_document` intents, whose evidence lives in
   a document the user did not name by definition (Part 3, C7's
-  `CROSS_DOC_RESERVE_SLOTS` exists for exactly this reason) — locking there
+  `CROSS_DOC_RESERVE_SLOTS` exists for exactly this reason) locking there
   would delete the bridging passage.
 * When it fires, `CROSS_DOC_RESERVE_SLOTS` still runs against the locked
   document exactly as it does against a routing-gated one, so the same safety
@@ -639,11 +639,11 @@ answerable part and name what's missing (Part 1's graded-refusal design, C12).
 The gap was narrower and one level lower: when `enforce_grounding` finds an
 unsupported claim that shares a sentence with a supported one, pruning would
 cost the supported content, so remediation "declines" and returns the ORIGINAL
-answer — with the unverified claim visible only in
+answer with the unverified claim visible only in
 `grounding.unsupported_claims`, metadata a UI is not guaranteed to render. With
 the flag on, that specific path appends a clearly delimited
-`[Unverified — not confirmed by the documents: ...]` block to the answer TEXT
-itself. The prose is untouched — still a normal-looking answer — but a caller
+`[Unverified not confirmed by the documents: ...]` block to the answer TEXT
+itself. The prose is untouched still a normal-looking answer but a caller
 that only renders `answer` can no longer mistake the flagged claim for a
 grounded one. Scoped to exactly the "declined" branch: it changes nothing for
 an answer that verifies cleanly or repairs cleanly.
@@ -651,7 +651,7 @@ an answer that verifies cleanly or repairs cleanly.
 **E9. Feature 7 (planner intent expansion) and Feature 8 (exhaustive trigger)
 are post-classification overrides, not new heuristic-path signals.** The
 existing `heuristic_type()` regexes (`_SYNTHESIS_RE`, `_EXHAUSTIVE_RE`) only
-gate the FAST heuristic path and the fallback — the common case for any
+gate the FAST heuristic path and the fallback the common case for any
 non-trivial question is the LLM classifier, which never consults them. Adding
 these signals there would have no effect on most real questions. Both
 features are instead applied by `_apply_lexical_overrides`, called at every
@@ -661,26 +661,26 @@ override what the classifier decided:
 * Feature 7 upgrades `fact_lookup`/`procedural` to the `synthesis` profile
   (outline mode) when the question names a whole-document artifact type
   (guide, playbook, checklist, manual, SOP, onboarding, policy, journey,
-  timeline) — "what's in the onboarding guide?" names an artifact rather than a
+  timeline) "what's in the onboarding guide?" names an artifact rather than a
   fact, and a plain-lookup profile under-retrieves it. Never downgrades a type
   already scored as something more specific (comparison, multi-hop,
   exhaustive, cross-document, synthesis itself).
 * Feature 8 forces the `exhaustive` profile (a full sweep) on "all X", "every
-  X", or "everything" regardless of classification, and is checked FIRST — a
+  X", or "everything" regardless of classification, and is checked FIRST a
   question can trip both regexes ("list every SOP requirement"), and
   completeness is the stronger of the two claims, so upgrading to synthesis
   afterward would be a downgrade.
 * Neither feature re-runs LLM decomposition for the upgraded type: `sub_queries`
   keeps whatever the original classification produced (typically just the bare
   question), and `retrieve()`'s `plan.sub_queries or [plan.question]` fallback
-  already handles that — the retrieval MODE changes (outline/sweep instead of
+  already handles that the retrieval MODE changes (outline/sweep instead of
   focused), which is what each feature is actually for, even without the
   extra decomposed sub-queries a full synthesis/exhaustive classification
   would have produced.
 
 **Measurement.** `scripts/eval_feature.py` already existed for exactly this
 purpose (flag OFF vs. flag ON over the labelled gold set, regression as a
-non-zero exit code) — no new harness was built. Results for all four Part B
+non-zero exit code) no new harness was built. Results for all four Part B
 flags, full 30-question gold set, both passes:
 
 | Feature | Answer correctness | Retrieval precision | Faithfulness | Median latency | Verdict |
@@ -695,7 +695,7 @@ flags, full 30-question gold set, both passes:
 **Every flag was run through `scripts/eval_feature.py` at least twice** (the
 full 30-question gold set, both passes), because the first pass surfaced a
 real methodological problem: this corpus contains at least two questions —
-`hop-northwind-review` and `exh-tier3-vendors` — whose correctness varies
+`hop-northwind-review` and `exh-tier3-vendors` whose correctness varies
 run-to-run at temperature 0, independent of any flag. Proven by running each
 flagged question several times, flag OFF and flag ON, outside the paired
 harness: `hop-northwind-review` was wrong on an OFF run and right on the
@@ -703,13 +703,13 @@ matching ON run in one probe, then wrong on ON and right on OFF in a *later,
 unrelated* flag's run. A single paired OFF/ON comparison cannot tell that
 apart from a real regression; repeating the comparison can. **This is a gap in
 the harness at n=30 with single-sample passes, not a property of any Part B
-feature** — worth fixing in the harness itself (repeated sampling on
+feature** worth fixing in the harness itself (repeated sampling on
 borderline questions) before trusting a single `eval_feature` run on a
 near-tied result.
 
 **`DOC_LOCK_ENABLED` (Feature 5).** Clean on the first run: zero questions
 flipped from correct to wrong. Faithfulness dipped slightly (0.962→0.926) with
-no matching correctness loss — the questions affected were already answered
+no matching correctness loss the questions affected were already answered
 correctly either way; locking changed which passages were read without
 changing the answer. Latency improved (candidates narrow to one document
 instead of running the ratio-gate's document scoring against every
@@ -725,28 +725,28 @@ found `hop-medical-records-mfa` correct in both states every time, and
 entirely different code path than this feature touches) on an OFF run. This
 matches the code: `_fence_unsupported` only appends text inside the single
 "declined" branch of `enforce_grounding`, is only reachable when
-`grounding.faithful is False`, and always returns non-refusal text — there is
+`grounding.faithful is False`, and always returns non-refusal text there is
 no path from this feature to `_is_refusal(answer_text)` becoming true.
 **Shippable behind its flag.**
 
 **`PLANNER_INTENT_EXPANSION_ENABLED` (Feature 7).** Two separate runs each
 flagged exactly one question, and it was a DIFFERENT question each time
-(`exh-tier3-vendors`, then `hop-northwind-review`) — the second of which the
+(`exh-tier3-vendors`, then `hop-northwind-review`) the second of which the
 feature's own guard (`plan.query_type in (FACT_LOOKUP, PROCEDURAL)`) makes
 structurally impossible to affect, since that question classifies as
 `multi_hop`. Both are consistent with corpus noise, not a causal defect. No
 structural mechanism by which this feature could cause either failure was
-found. **Provisionally shippable behind its flag** — re-measure before
+found. **Provisionally shippable behind its flag** re-measure before
 enabling by default in any environment, given the corpus's noise floor.
 
-**`EXHAUSTIVE_TRIGGER_ENABLED` (Feature 8) — a real bug, found and fixed.**
+**`EXHAUSTIVE_TRIGGER_ENABLED` (Feature 8) a real bug, found and fixed.**
 Unlike the other three, the first run's regressions had a clear, reproducible,
 structural cause: the override had no type guard, so it forced the exhaustive
 profile's GATED sweep (`restrict_documents=True, max_documents=2`) onto
 `syn-leave-overview` (needs `synthesis`'s outline breadth) and
 `xdoc-leave-across-policies` (needs `cross_document`'s deliberately UNGATED
-retrieval — the same reason Feature 5's lock excludes it, see E7 above). Both
-regressed identically on a second, independent run — reproducible, not noise.
+retrieval the same reason Feature 5's lock excludes it, see E7 above). Both
+regressed identically on a second, independent run reproducible, not noise.
 **Fixed** by adding the same guard Feature 7 already had:
 `plan.query_type in (FACT_LOOKUP, PROCEDURAL)`, so the override can no longer
 touch a question already classified as something needing a different
@@ -762,11 +762,11 @@ system revertible to known-good, not to promote a feature once it measures
 clean. Raw output for every run: `eval/phase2/*.log` and `*.json`
 (git-ignored, like the rest of `eval/`).
 
-## Part 7 — Phase 3: the Next.js frontend
+## Part 7 Phase 3: the Next.js frontend
 
 The retrieval stack is untouched for the third phase running. The backend edits
 this phase are three, all additive and all made because the UI needed data or
-access the API did not yet expose — no endpoint's behaviour changed.
+access the API did not yet expose no endpoint's behaviour changed.
 
 ### F1. The frontend holds no logic that could disagree with the server
 
@@ -779,7 +779,7 @@ That is what makes "the UI must not leak across accounts" a property rather than
 a discipline. There is no client-side filtering step to get wrong: the UI renders
 what a scoped endpoint returned, and it has no notion of whose data it is holding.
 The one place a stale identity *could* have shown through is the data hooks, so
-`useResource` is keyed on the user id — switching accounts in one tab refetches
+`useResource` is keyed on the user id switching accounts in one tab refetches
 instead of showing the previous account's list from state.
 
 **`RequireAuth` is a UX guard, not a security boundary**, and it says so in its
@@ -790,7 +790,7 @@ someone else's documents.
 
 A token in `localStorage` is presented to `GET /auth/me` on mount, and only that
 reply populates `user`. A hand-edited token, or one whose account was deleted,
-therefore never produces a signed-in UI — the backend re-reads the user row on
+therefore never produces a signed-in UI the backend re-reads the user row on
 every request (D7), so `/auth/me` is authoritative.
 
 The failure branch distinguishes two cases that look identical if you only check
@@ -818,13 +818,13 @@ credentials off, `allow_origins` is the only thing standing between a token
 scraped from `localStorage` and a cross-origin replay from any page on the
 machine. `CORS_ALLOW_ORIGINS` defaults to both spellings of localhost:3000,
 because Next.js serves on `localhost` while the API's defaults use `127.0.0.1`
-and the browser treats those as different origins — a distinction that otherwise
+and the browser treats those as different origins a distinction that otherwise
 presents as "every call fails for no visible reason".
 
 ### F4. "Storage used" is measured, not estimated
 
 The dashboard asks for storage used and the schema had no size column, so one was
-added — `documents.size_bytes`, written at ingest from the uploaded byte count.
+added `documents.size_bytes`, written at ingest from the uploaded byte count.
 Three details are deliberate:
 
 * **Nullable, not `DEFAULT 0`.** A row written before the column existed has an
@@ -834,7 +834,7 @@ Three details are deliberate:
   All 13 of the adopted pre-V2 documents resolved to real sizes this way.
 * **The API reports the gap rather than hiding it.** `total_bytes` is a stated
   lower bound and `documents_with_unknown_size` says how many rows were left out,
-  so the dashboard can render "at least 9.9 MB — 2 of unknown size" instead of a
+  so the dashboard can render "at least 9.9 MB 2 of unknown size" instead of a
   confident wrong total.
 * **A re-upload updates the size.** `upsert_document` reuses the row (D1's
   requirement, so the `document_id` stamped on chunks stays stable) but overwrites
@@ -843,7 +843,7 @@ Three details are deliberate:
 `google_oauth_enabled` was added to `/health` for the same class of reason: with
 credentials unset, `/auth/google/login` returns 503, and a plain link would drop
 the user on a raw JSON error page. It exposes a deployment capability, not user
-data — and the login page it feeds would reveal the same fact by having the button
+data and the login page it feeds would reveal the same fact by having the button
 at all.
 
 ### F5. Answers are revealed progressively; they are not token-streamed
@@ -859,7 +859,7 @@ waiting for one that will not be retracted. Streaming the model would mean eithe
 abandoning the enforcement or showing text that can vanish.
 
 The reveal begins at the same instant a token stream's first *trustworthy* token
-could have arrived — the answer is not knowable before the pipeline finishes — so
+could have arrived the answer is not knowable before the pipeline finishes so
 this costs no perceived latency against a stream that respected the same gate. An
 SSE endpoint was considered and rejected for the same reason: it would duplicate
 the session and background-task logic of `/ask` to move a reveal loop across the
@@ -882,12 +882,12 @@ back. History is cached per session and prefetched on hover or focus, so a switc
 usually renders from memory with no request at all.
 
 A `?session=` id that is not in the user's own session list falls through to their
-most recent chat rather than being fetched — a param naming someone else's session
+most recent chat rather than being fetched a param naming someone else's session
 would 404 by design (D6), and there is no reason to ask.
 
 ### F7. Citations survive a reload via a cache that is not treated as data
 
-`GET /sessions/{id}/messages` returns `{role, content}` — the durable record of
+`GET /sessions/{id}/messages` returns `{role, content}` the durable record of
 what was said. It does not carry sources or the grounding verdict, which `/ask`
 returns and the server does not persist. History alone would therefore render
 every past answer with its citations missing, and structural citations are what
@@ -899,7 +899,7 @@ message list once per turn. Three properties keep this a presentation cache
 rather than a second source of truth: an entry can only be shown against the
 exact message it was produced for; a miss renders the answer with no sources
 panel, never a guess and never another answer's citations; and it is bounded at
-400 entries. The limitation is real and stated — it does not follow the user to
+400 entries. The limitation is real and stated it does not follow the user to
 another device. Persisting sources server-side would be a `messages` schema
 change, which is outside this phase.
 
@@ -911,7 +911,7 @@ reveal from an empty panel.
 ### F8. Grounding metadata is surfaced only where it means something
 
 The backend already remediates before responding, so a `faithful` verdict needs no
-badge — labelling every answer "verified" trains the user to ignore the one place
+badge labelling every answer "verified" trains the user to ignore the one place
 it matters. Two cases are shown: `unsupported_claims` on a returned answer (the
 "declined" branch of E8, where pruning would have cost supported content, and the
 flag is exactly what a UI must not silently drop), and `removed_claims` (the user
@@ -938,22 +938,22 @@ because they solve different problems: `glass` for panels, `glass-raised` for
 surfaces stacked *on* another panel (where the standard fill disappears into it),
 `glass-chrome` for framing (sidebar, top bar), and `glass-accent` for the single
 element that should pull the eye. The page's background glows are
-`background-attachment: fixed` — they stay still while panels scroll, which is
+`background-attachment: fixed` they stay still while panels scroll, which is
 what makes the glass read as sitting above the page rather than being part of it.
 
 ### F10. A real bug the browser found that no unit test would have
 
 `DropdownMenuLabel` in this shadcn build maps to Base UI's `Menu.GroupLabel`,
 which **throws** outside a `Menu.Group`. Used directly inside the menu content it
-raised `MenuGroupContext is missing`, and the account menu never opened — so
+raised `MenuGroupContext is missing`, and the account menu never opened so
 **Sign out was completely unreachable**. TypeScript compiled it, the production
 build succeeded, and the page rendered fine until the trigger was clicked.
 
 It was found by driving Chromium against the running stack and asserting on the
 menu item, not by reading the code. The lesson recorded here is the reason the
 verification below is a browser run rather than a component test: this shadcn
-install is Base UI, not Radix — `render` instead of `asChild`, `onClick` instead
-of `onSelect`, `delay` instead of `delayDuration` — and the API differences fail
+install is Base UI, not Radix `render` instead of `asChild`, `onClick` instead
+of `onSelect`, `delay` instead of `delayDuration` and the API differences fail
 at runtime, silently, in a build that passes every static check.
 
 ### Verification
@@ -980,7 +980,7 @@ Specifically confirmed, against the acceptance list:
   address bar, and is stored for later calls; a tampered token is rejected at the
   callback rather than producing a 401-filled shell; an absent token reports
   clearly instead of hanging. The backend's code exchange is Phase 1 code and is
-  unchanged, but **the live Google round trip was not exercised** — this
+  unchanged, but **the live Google round trip was not exercised** this
   environment has no `GOOGLE_CLIENT_ID`/`SECRET`, so `/health` reports
   `google_oauth_enabled: false` and the button correctly renders disabled. That
   one leg needs real credentials to confirm.

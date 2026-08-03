@@ -3,7 +3,7 @@
  *
  * `localStorage`, not a cookie. The API authorizes on an `Authorization: Bearer`
  * header and runs CORS with `allow_credentials=False`, so a cookie would never
- * be sent on an API call anyway — and a non-HttpOnly cookie is readable by the
+ * be sent on an API call anyway and a non-HttpOnly cookie is readable by the
  * same script that can read localStorage, so it would buy nothing while adding a
  * CSRF surface that bearer headers do not have.
  *
@@ -55,7 +55,7 @@ export function saveSession(token: string, expiresInSeconds: number, user: User)
 }
 
 /**
- * Stores a token that arrived without a user body — the Google callback
+ * Stores a token that arrived without a user body the Google callback
  * redirect carries only `?token=`. The caller then resolves the user via
  * `GET /auth/me`, which is the authoritative source for it regardless.
  */

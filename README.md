@@ -19,7 +19,7 @@ documents" rather than guessing. Every answer returns structured sources
 | Vector DB | ChromaDB (`PersistentClient`, on disk) |
 | Embeddings | OpenAI `text-embedding-3-small` |
 | Generation | OpenAI `gpt-4o-mini` (low temperature) |
-| Relational store | SQLite — users, documents, sessions, messages (V2) |
+| Relational store | SQLite users, documents, sessions, messages (V2) |
 | Auth | FastAPI-owned: bcrypt + JWT, Google OAuth via authlib (V2) |
 | Frontend | Next.js App Router + TypeScript + Tailwind + shadcn/ui (V2) |
 | Orchestration | LangChain where it helps |
@@ -52,7 +52,7 @@ per-session chat memory, and the Next.js frontend.
 
 | Document | What it covers |
 |---|---|
-| [`docs/v2-pipeline-dossier.md`](docs/v2-pipeline-dossier.md) | **Current.** All 21 stages end to end — identity, scoping, ingestion, the query pipeline, session memory, the API, and the frontend — with the functions that run at each and flow diagrams. |
+| [`docs/v2-pipeline-dossier.md`](docs/v2-pipeline-dossier.md) | **Current.** All 21 stages end to end identity, scoping, ingestion, the query pipeline, session memory, the API, and the frontend with the functions that run at each and flow diagrams. |
 | [`docs/v1-pipeline-dossier.md`](docs/v1-pipeline-dossier.md) | The V1 pipeline as closed out. Stages 07–16 of the V2 dossier are this code, unmodified. |
 | [`DECISIONS.md`](DECISIONS.md) | Why each decision was made, including what was measured and rejected. |
 
@@ -85,7 +85,7 @@ python -m scripts.seed_dev_user
 ```
 
 That prints the credentials and stamps ownership onto the already-indexed chunks
-(metadata only — nothing is re-embedded). Sign in:
+(metadata only nothing is re-embedded). Sign in:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/auth/login \
@@ -120,7 +120,7 @@ curl -s -X POST localhost:8000/ask -H "Authorization: Bearer $TOKEN" \
 
 `GET /sessions` (default `limit=10`) returns the sidebar list, most recently
 *active* session first. The running summary is rewritten by a background task
-after each answer is sent — it never adds to `/ask`'s response time; see
+after each answer is sent it never adds to `/ask`'s response time; see
 `scripts/measure_memory_latency.py` and DECISIONS.md Part 6 for the empirical
 check.
 
@@ -136,7 +136,7 @@ before trusting it:
 .venv/bin/python -m scripts.eval_feature --flag DOC_LOCK_ENABLED
 ```
 
-Set a real `JWT_SECRET` before exposing the API — the default placeholder is a
+Set a real `JWT_SECRET` before exposing the API the default placeholder is a
 published signing key, and anyone holding it can mint a token for any account.
 
 Verify the isolation guarantees:
@@ -233,7 +233,7 @@ web/src/
 The frontend is a client of the API and nothing more. It holds no retrieval
 logic, no prompt, and no authorization decision: identity is the JWT, which only
 FastAPI issues and verifies, and no request it sends names a user. Data isolation
-is therefore a server property — the UI cannot leak across accounts because it
+is therefore a server property the UI cannot leak across accounts because it
 has no notion of "whose data this is" to get wrong.
 
 ### Google sign-in

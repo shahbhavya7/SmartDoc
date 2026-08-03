@@ -3,7 +3,7 @@
 /**
  * The dashboard: what the signed-in user has, and the fastest route to using it.
  *
- * Everything on this page comes from two authenticated calls — `GET /documents`
+ * Everything on this page comes from two authenticated calls `GET /documents`
  * and `GET /sessions`. Both are scoped server-side to the token's user, so the
  * counts are per-user by construction; there is no client-side filtering step
  * that could be got wrong.
@@ -124,7 +124,7 @@ export function Dashboard() {
             Your document workspace
           </h1>
           <p className="max-w-xl text-sm text-muted-foreground">
-            Ask a question and SmartDoc answers from your PDFs only — with the
+            Ask a question and SmartDoc answers from your PDFs only with the
             document, page, and passage it used.
           </p>
         </div>
@@ -164,7 +164,7 @@ export function Dashboard() {
           value={formatBytes(documents.data?.total_bytes ?? 0)}
           hint={
             unknownSizes > 0
-              ? `At least — ${unknownSizes} of unknown size`
+              ? `At least ${unknownSizes} of unknown size`
               : `Across ${docs.length} ${docs.length === 1 ? "file" : "files"}`
           }
           icon={HardDrive}

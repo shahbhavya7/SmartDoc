@@ -115,7 +115,7 @@ export function DocumentRow({
                 will no longer cite it.
               </span>
               <span className="block text-xs">
-                This cannot be undone — restoring it means uploading the file again.
+                This cannot be undone restoring it means uploading the file again.
                 Past chats keep their text, but their citations to this document will
                 no longer resolve.
               </span>

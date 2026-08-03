@@ -1,4 +1,4 @@
-/** Presentation helpers. Nothing here makes a decision — only formats one. */
+/** Presentation helpers. Nothing here makes a decision only formats one. */
 
 /**
  * Human-readable byte count. Binary units, because that is what a file manager
@@ -54,7 +54,7 @@ export function formatDate(iso: string | null | undefined): string {
 /**
  * The API writes timestamps with `datetime.utcnow().isoformat()`-style output,
  * which carries no timezone designator. `new Date()` would read that as LOCAL
- * time, making every "2h ago" wrong by the UTC offset — so a bare timestamp is
+ * time, making every "2h ago" wrong by the UTC offset so a bare timestamp is
  * explicitly marked as UTC before parsing.
  */
 function parseUtc(iso: string): Date | null {
