@@ -36,8 +36,9 @@ smartdoc/
   README.md
 ```
 
-Current status: **Phase 0 — scaffold only.** No ingestion, retrieval, or
-generation yet.
+Current status: **RAG pipeline implemented.** The backend includes PDF ingestion,
+persistent Chroma indexing, intent-aware hybrid retrieval, context assembly,
+grounded generation, structural citations, and grounding verification/repair.
 
 ## Setup
 
@@ -57,12 +58,39 @@ Configuration lives entirely in `.env` (see `.env.example` for the full list):
 `CHUNK_SIZE`, `CHUNK_OVERLAP`, `TOP_K`, `EMBED_MODEL`, `CHAT_MODEL`. Never
 commit `.env`.
 
+## Run everything
+
+From the project root:
+
+```bash
+./run.sh
+```
+
+This starts the FastAPI backend and the Streamlit UI together, waits for
+`/health` before bringing up the UI, wires the UI to the API, and stops both on
+Ctrl-C. Logs go to `.logs/backend.log` and `.logs/frontend.log`.
+
+| | |
+|---|---|
+| App | <http://localhost:8501> |
+| API docs | <http://127.0.0.1:8000/docs> |
+
+Variations:
+
+```bash
+./run.sh --backend-only            # API only, for curl / Swagger work
+./run.sh --ui-only                 # UI only, against an API already running
+API_PORT=8001 UI_PORT=8503 ./run.sh   # a second instance alongside the first
+```
+
+The sections below cover starting each service by hand.
+
 ## Run backend
 
 From the project root:
 
 ```bash
-uvicorn backend.main:app --reload
+.venv/bin/python -m uvicorn backend.main:app --reload
 ```
 
 The API listens on <http://127.0.0.1:8000>. Verify it:
@@ -79,9 +107,15 @@ Interactive docs: <http://127.0.0.1:8000/docs>
 In a second terminal, with the virtualenv active and the backend running:
 
 ```bash
-streamlit run app/streamlit_app.py
+.venv/bin/python -m streamlit run app/streamlit_app.py
 ```
 
 Streamlit opens on <http://localhost:8501> and shows the backend status card.
 It should read **connected**; if it reads *unreachable*, start the backend
-first or point `BACKEND_URL` in `.env` at the right host.
+first or point `SMARTDOC_API_URL` (or the legacy `BACKEND_URL`) at the right
+host.
+
+> Invoke the tools as `.venv/bin/python -m <module>` rather than through the
+> venv's `uvicorn` / `streamlit` console scripts. Those scripts hard-code an
+> absolute interpreter path in their shebang, so they break if the project
+> directory is ever moved. `run.sh` already does this.

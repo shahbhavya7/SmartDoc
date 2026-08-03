@@ -21,3 +21,5 @@ venv/
 eval/
 docs/
 data/
+# Runtime logs from run.sh
+.logs/
