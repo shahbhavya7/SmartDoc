@@ -363,3 +363,162 @@ accuracy; false and correct refusals; latency.
 decomposition, parent expansion, document routing, grounding repair) so each
 stage's contribution is *measured* rather than asserted. A stage that does not
 move the numbers on this corpus should be called out, not defended.
+
+---
+
+# V2 — multi-tenant SmartDoc
+
+Everything above is carried over unchanged. The retrieval stack — dense, BM25,
+RRF, reranking, the adaptive modes, grounding — is treated as a fixed input; V2
+adds ownership around it and does not alter how anything is found or ranked.
+
+## Part 5 — Phase 1: users, auth, and isolation
+
+### D1. Two stores, joined on `document_id`
+
+SQLite owns `users`, `documents`, `sessions`, `messages`; Chroma keeps vectors
+and metadata and nothing relational. The join key is `document_id`, stamped into
+every chunk's metadata at ingest.
+
+Deleting by *filename* was the obvious alternative and is wrong once filenames
+are no longer unique: two users may both own a `handbook.pdf`, and one of them
+renaming or re-uploading theirs would make the link ambiguous. An immutable id
+survives both.
+
+`PRAGMA foreign_keys = ON` is issued per connection. SQLite compiles foreign-key
+support in but leaves it **off**, so the declared constraints would otherwise be
+documentation — integrity that looks enforced and is not.
+
+### D2. Isolation is enforced at one choke point, not at each call site
+
+Every Chroma read in the system already funnels through `backend/vectorstore.py`.
+Scoping is applied *there*: reads merge `{"user_id": <scope>}` into their filter,
+writes stamp ownership onto metadata. The active user is bound to a
+`contextvars` context by the request layer.
+
+**Why not thread a `user_id` parameter through the pipeline.** Retrieval spans
+six modules and roughly 4000 lines and is explicitly final in V2. Threading an
+argument through it would mean editing the code this phase is forbidden to
+touch, across dozens of call sites, where a *single* missed one is a silent
+cross-tenant leak that no test failure announces. A context variable makes "no
+scope bound" the only way to read unfiltered, and that state is reachable only
+from maintenance scripts, never from a request.
+
+**Why `contextvars` and not a module global.** FastAPI runs sync endpoints in a
+threadpool; contextvars are copied into those workers, so two concurrent
+requests from different users each carry their own scope. A global would be
+shared between them — an isolation bug that appears only under load, which is
+the worst kind.
+
+**Trade-off, stated plainly.** The scope is ambient rather than explicit in each
+function signature, so reading `retrieval.py` alone does not reveal that its
+reads are filtered. Mitigated by three things: `vectorstore.py` is the only
+module that touches the collection directly (verified — no `collection.get` or
+`collection.query` survives anywhere else), `ScopeError` fails closed rather
+than falling back to unfiltered access, and the isolation test asserts the
+property end to end rather than trusting the mechanism.
+
+Three direct-Chroma call sites in `routing.py` and `retrieval.py` were routed
+through new scoped helpers (`get_chunks_where`, `get_chunks_by_ids`). Those
+edits change *which rows* are read, never how results are scored, ordered, or
+fused.
+
+### D3. Chunk ids are namespaced per user
+
+Ids were `"<source>:<chunk_index>"` — unique per document, **not** per user. Two
+users uploading `handbook.pdf` would produce identical ids, and the second
+upsert would silently overwrite the first user's chunks: data loss dressed as an
+update. Ids written under a scope are now prefixed `u<user_id>|`, and the
+id-shaped metadata (`id`, `parent_id`, `prev_id`, `next_id`) is prefixed with
+them so neighbour and parent expansion keep resolving.
+
+Verified live: user B uploading a `vendor_register.pdf` that the dev user
+already owned indexed 16 new chunks and left the dev user's 16 untouched.
+
+### D4. BM25 is per-user, and the cache key says so
+
+The lexical index is a *materialised copy* of the corpus, so unlike a Chroma
+query it cannot be filtered after the fact — an index built across tenants would
+surface another user's passage as a keyword hit with no metadata filter in the
+path to stop it. `all_chunks()` is scoped, and the cache key gained the user_id.
+
+Eviction changed with it: the old code cleared the whole cache on every rebuild,
+which with several signed-in users would make one upload invalidate everyone.
+Only entries built against a stale chunk count are now dropped.
+
+### D5. Deletion order: vectors first, then the row
+
+A crash between the two steps has to leave *some* inconsistent state; the
+question is which. Vectors-first leaves a listed document with no vectors —
+unanswerable, visible, and retryable by the user. Row-first would leave
+orphaned vectors with no row to delete them by: still retrievable, still
+citable, and no longer visible in any UI. That is bug B1 one level up, and the
+same reasoning applies — a missing document produces a refusal, a stale one
+produces a confident wrong answer.
+
+### D6. Ownership is part of the lookup, not a check after it
+
+`get_document(user_id, document_id)` filters on both columns; there is no
+`get_document(document_id)` to forget to guard. Another user's id simply does
+not resolve, so the endpoint returns **404 rather than 403** — a 403 would
+confirm that the id exists, letting a caller enumerate the id space.
+
+Messages have no owner column of their own; `list_messages` joins to
+`sessions.user_id`, so a guessed `session_id` returns nothing.
+
+### D7. Auth details worth naming
+
+* **Login failures are indistinguishable.** Unknown email and wrong password
+  return the identical message; distinguishing them turns the login form into an
+  account-existence oracle. Asserted in the test suite, not just intended.
+* **`algorithms` is pinned on decode.** Otherwise a token declaring
+  `"alg": "none"` is accepted as signed.
+* **Passwords over 72 bytes are rejected, not truncated.** bcrypt silently
+  ignores the excess, so two different long passwords would both authenticate —
+  a password that is weaker than it looks.
+* **Google accounts are matched on `sub`, not email.** `sub` is the stable
+  account identifier; an email can be reassigned. An existing password account
+  is linked only when Google reports the address *verified* — otherwise an
+  unverified claim to an address takes over the account behind it.
+* **The user row is re-read on every request** rather than trusted from the
+  token body, so a deleted account stops working immediately instead of at token
+  expiry.
+* **`/health` no longer reports corpus counts.** It is unauthenticated, and a
+  global chunk total tells an anonymous caller how much every user has uploaded.
+  Per-user counts moved to `GET /documents`.
+
+### D8. The pre-V2 corpus was adopted, not deleted or re-embedded
+
+491 existing chunks had no owner, and an ownerless chunk is invisible to
+everyone under the new rules. `scripts/seed_dev_user.py` stamps `user_id` and
+`document_id` onto their metadata and registers one `documents` row per source,
+making the whole existing library the dev user's. Metadata only — no vectors,
+text, boundaries, or embedding calls. The 247 parent records are stamped too;
+skipping them would leave parent expansion silently returning nothing, which
+degrades every answer to child-only context while still appearing to work.
+
+Legacy ids are deliberately **not** rewritten to the new prefixed scheme. Their
+`prev_id`/`next_id`/`parent_id` links point at each other consistently, so
+renaming would break every link to no benefit. The two id schemes coexist
+because every lookup resolves by metadata, not by id shape.
+
+Verified end to end: signed in as the dev user, "How many days of annual leave
+do Standard band employees get?" still answers *twenty (20) days*, cited to
+`employee_handbook.pdf` p7, through the unmodified routing → hybrid → rerank →
+grounding path.
+
+### D9. `MULTI_USER_ENABLED` defaults ON
+
+The standing V2 rule is that new behaviour hides behind a flag defaulting OFF.
+This one does not, and the exception is deliberate: Phase 1's acceptance gate is
+that isolation is *active*, and a flag defaulting OFF would ship a system that
+passes review by not doing the thing. Setting it false is the documented revert
+to known-good V1 behaviour.
+
+### Known breakage, accepted
+
+The Streamlit client (`app/streamlit_app.py`) calls `/upload` and `/ask`
+unauthenticated and now receives 401s. Expected: the phase brief anticipates
+single-user behaviour breaking, and Streamlit is replaced by the Next.js client
+in a later phase. The eval harness in `scripts/` calls the pipeline in-process
+with no scope bound, so it continues to run against the full corpus.

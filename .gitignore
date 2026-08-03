@@ -4,6 +4,14 @@
 # Persisted vector store
 chroma_store/
 
+# Relational store (users, documents, sessions, messages) and its WAL sidecars
+smartdoc.db
+smartdoc.db-wal
+smartdoc.db-shm
+
+# Per-user uploaded PDFs
+data/users/
+
 # Python
 __pycache__/
 *.pyc

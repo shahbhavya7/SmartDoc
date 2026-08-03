@@ -29,6 +29,14 @@ scale rather than an inherited 0-4 one.
 **Unchanged documents are skipped.** Each chunk carries the document's
 ``content_hash``; ``needs_reingest`` compares it against what is indexed so
 re-running ingestion over an unchanged corpus costs no embedding calls.
+
+**No read escapes the active user's scope (V2).** This module is the only door
+between the pipeline and Chroma, so it is where per-user isolation is applied:
+every read merges ``{"user_id": <scope>}`` into its filter, and every write
+stamps ``user_id``/``document_id`` onto the metadata and namespaces the chunk id.
+The scope is set from a verified JWT by :mod:`backend.user_scope`; callers pass
+no user_id and cannot opt out of the filter. With no scope bound (the ingest
+scripts, or ``MULTI_USER_ENABLED=false``) behaviour is exactly as it was in V1.
 """
 
 from __future__ import annotations
@@ -44,6 +52,13 @@ from langchain.docstore.document import Document
 from openai import OpenAI
 
 import backend.config as config
+from backend.user_scope import (
+    belongs_to_scope,
+    current_user_id,
+    scope_metadata,
+    scoped_id,
+    scoped_where,
+)
 
 EmbedFn = Callable[[list[str]], list[list[float]]]
 
@@ -234,13 +249,25 @@ def _write_parents(parents: dict[str, dict], persist_directory=None) -> None:
     path.write_text(json.dumps(parents), encoding="utf-8")
 
 
-def save_parents(documents: Sequence[Document], persist_directory=None) -> int:
-    """Store parent chunks, replacing any existing parents of the same sources."""
+def save_parents(
+    documents: Sequence[Document], persist_directory=None, document_id: str = ""
+) -> int:
+    """Store parent chunks, replacing this user's existing parents of the same sources.
+
+    The purge is scoped by owner as well as by source: two users may both have a
+    ``handbook.pdf``, and an unscoped purge would delete the other user's parents
+    while re-indexing your own document.
+    """
+    scope = current_user_id()
     store = _load_parents(persist_directory)
     sources = {d.metadata["source"] for d in documents}
-    store = {pid: rec for pid, rec in store.items() if rec.get("source") not in sources}
+    store = {
+        pid: rec
+        for pid, rec in store.items()
+        if not (rec.get("source") in sources and rec.get("user_id") == scope)
+    }
     for doc in documents:
-        store[doc.metadata["id"]] = {
+        record = {
             "text": doc.page_content,
             "source": doc.metadata["source"],
             "doc_title": doc.metadata.get("doc_title", ""),
@@ -248,14 +275,51 @@ def save_parents(documents: Sequence[Document], persist_directory=None) -> int:
             "page": doc.metadata.get("page"),
             "page_end": doc.metadata.get("page_end"),
         }
+        if scope:
+            record["user_id"] = scope
+        if document_id:
+            record["document_id"] = document_id
+        store[scoped_id(doc.metadata["id"])] = record
     _write_parents(store, persist_directory)
     return len(documents)
 
 
 def get_parents(parent_ids: Iterable[str], persist_directory=None) -> dict[str, dict]:
-    """Fetch parent records by id (missing ids are simply absent)."""
+    """Fetch parent records by id, restricted to the active user's parents.
+
+    Parent ids are already namespaced per user, so a cross-user id would not
+    match; the ownership check is a second, explicit barrier rather than a
+    reliance on ids being unguessable.
+    """
     store = _load_parents(persist_directory)
-    return {pid: store[pid] for pid in parent_ids if pid in store}
+    scope = current_user_id()
+    out: dict[str, dict] = {}
+    for pid in parent_ids:
+        record = store.get(pid)
+        if record is None:
+            continue
+        if scope and record.get("user_id") != scope:
+            continue
+        out[pid] = record
+    return out
+
+
+def delete_parents_for_document(document_id: str, persist_directory=None) -> int:
+    """Drop every parent record belonging to ``document_id`` (scoped to owner)."""
+    scope = current_user_id()
+    store = _load_parents(persist_directory)
+    keep = {
+        pid: rec
+        for pid, rec in store.items()
+        if not (
+            rec.get("document_id") == document_id
+            and (not scope or rec.get("user_id") == scope)
+        )
+    }
+    removed = len(store) - len(keep)
+    if removed:
+        _write_parents(keep, persist_directory)
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -276,9 +340,9 @@ def _clean_metadata(meta: dict) -> dict:
 def indexed_hashes(
     collection: Collection | None = None, persist_directory=None
 ) -> dict[str, str]:
-    """Return ``{source: content_hash}`` for everything currently indexed."""
+    """Return ``{source: content_hash}`` for the active user's indexed chunks."""
     collection = collection or get_collection(persist_directory=persist_directory)
-    got = collection.get(include=["metadatas"])
+    got = collection.get(include=["metadatas"], where=scoped_where())
     hashes: dict[str, str] = {}
     for meta in got.get("metadatas") or []:
         source = meta.get("source")
@@ -298,17 +362,75 @@ def needs_reingest(
 def delete_source(
     source: str, collection: Collection | None = None, persist_directory=None
 ) -> int:
-    """Delete every indexed chunk belonging to ``source``.
+    """Delete the active user's indexed chunks for ``source``.
 
     This is what makes replacement correct rather than merely idempotent:
     without it, an edited document that yields fewer chunks leaves its surplus
-    old chunks live in the index forever.
+    old chunks live in the index forever. Under a user scope the deletion is
+    filtered by owner, so replacing your ``handbook.pdf`` cannot delete mine.
     """
     collection = collection or get_collection(persist_directory=persist_directory)
-    ids = collection.get(where={"source": source}).get("ids") or []
+    ids = collection.get(where=scoped_where({"source": source})).get("ids") or []
     if ids:
         collection.delete(ids=ids)
     return len(ids)
+
+
+def delete_document_chunks(
+    document_id: str, collection: Collection | None = None, persist_directory=None
+) -> int:
+    """Delete every chunk of ``document_id``, and its parents. Returns the count.
+
+    Matched on the ``document_id`` metadata stamped at ingest rather than on the
+    filename, so a document deleted here cannot be confused with a same-named
+    document belonging to anyone else.
+    """
+    collection = collection or get_collection(persist_directory=persist_directory)
+    ids = collection.get(where=scoped_where({"document_id": document_id})).get("ids") or []
+    if ids:
+        collection.delete(ids=ids)
+    delete_parents_for_document(document_id, persist_directory)
+    return len(ids)
+
+
+def get_chunks_by_ids(
+    ids: Sequence[str], collection: Collection | None = None, persist_directory=None
+) -> list[dict]:
+    """Fetch chunks by id, dropping any the active user does not own.
+
+    Chroma's ``get(ids=...)`` takes no ``where`` clause, so ownership is applied
+    to the results. Callers that follow ``prev_id``/``next_id``/``parent_id``
+    links go through here rather than touching the collection directly.
+    """
+    if not ids:
+        return []
+    collection = collection or get_collection(persist_directory=persist_directory)
+    got = collection.get(ids=list(ids), include=["documents", "metadatas"])
+    return [
+        {"id": cid, "document": doc, "metadata": meta}
+        for cid, doc, meta in zip(
+            got.get("ids") or [], got.get("documents") or [], got.get("metadatas") or []
+        )
+        if belongs_to_scope(meta)
+    ]
+
+
+def get_chunks_where(
+    where: dict | None = None,
+    collection: Collection | None = None,
+    persist_directory=None,
+    include: list[str] | None = None,
+) -> list[dict]:
+    """Fetch chunks matching ``where``, ANDed with the active user's scope."""
+    collection = collection or get_collection(persist_directory=persist_directory)
+    got = collection.get(
+        where=scoped_where(where), include=include or ["documents", "metadatas"]
+    )
+    documents = got.get("documents") or [None] * len(got.get("ids") or [])
+    return [
+        {"id": cid, "document": doc, "metadata": meta}
+        for cid, doc, meta in zip(got.get("ids") or [], documents, got.get("metadatas") or [])
+    ]
 
 
 def upsert_documents(
@@ -316,8 +438,15 @@ def upsert_documents(
     collection: Collection,
     embed_fn: EmbedFn | None = None,
     embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
+    document_id: str = "",
 ) -> int:
-    """Embed ``documents`` and upsert them by deterministic id."""
+    """Embed ``documents`` and upsert them by deterministic, user-namespaced id.
+
+    Under a user scope, ids are prefixed with the owner and the id-shaped
+    metadata links are prefixed to match. Without the prefix, two users
+    uploading the same filename would produce identical ids and the second
+    upsert would overwrite the first user's chunks.
+    """
     if not documents:
         return 0
 
@@ -327,9 +456,12 @@ def upsert_documents(
     texts: list[str] = []
     metadatas: list[dict] = []
     for doc in documents:
-        ids.append(chunk_id(doc.metadata["source"], doc.metadata["chunk_index"]))
+        raw_id = chunk_id(doc.metadata["source"], doc.metadata["chunk_index"])
+        ids.append(scoped_id(raw_id))
         texts.append(doc.page_content)
-        metadatas.append(_clean_metadata(doc.metadata))
+        metadatas.append(
+            _clean_metadata(scope_metadata(doc.metadata, document_id=document_id))
+        )
 
     vectors = embed(texts)
     if len(vectors) != len(texts):
@@ -351,6 +483,7 @@ def ingest_documents(
     embed_fn: EmbedFn | None = None,
     embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
     replace_sources: bool = True,
+    document_id: str = "",
 ) -> int:
     """Index child chunks (and store their parents), replacing prior versions.
 
@@ -358,6 +491,8 @@ def ingest_documents(
         replace_sources: delete all existing chunks of each incoming source
             before writing. Leave True unless deliberately adding to a source
             incrementally -- turning it off reintroduces the stale-chunk bug.
+        document_id: the SQLite ``documents.id`` these chunks belong to, stamped
+            into every chunk's metadata so deletion can find them by id.
     """
     client = get_client(persist_directory)
     collection = (
@@ -371,10 +506,14 @@ def ingest_documents(
             delete_source(source, collection)
 
     indexed = upsert_documents(
-        documents, collection, embed_fn=embed_fn, embed_batch_size=embed_batch_size
+        documents,
+        collection,
+        embed_fn=embed_fn,
+        embed_batch_size=embed_batch_size,
+        document_id=document_id,
     )
     if parents:
-        save_parents(parents, persist_directory)
+        save_parents(parents, persist_directory, document_id=document_id)
     return indexed
 
 
@@ -398,7 +537,8 @@ def query_collection(
     Args:
         query_vector: a pre-computed query embedding, so callers can reuse one
             embedding across several searches.
-        where: optional Chroma metadata filter (used by document routing).
+        where: optional Chroma metadata filter (used by document routing). It is
+            ANDed with the active user's scope, which the caller cannot remove.
 
     Returns:
         Hits as ``{"id", "document", "metadata", "distance"}``, nearest first.
@@ -419,10 +559,11 @@ def query_collection(
     # versions; clamp so a small corpus behaves like a large one.
     k = max(1, min(k, collection.count() or 1))
 
+    effective_where = scoped_where(where)
     result = collection.query(
         query_embeddings=[query_vector],
         n_results=k,
-        **({"where": where} if where else {}),
+        **({"where": effective_where} if effective_where else {}),
     )
 
     hits: list[dict] = []
@@ -439,13 +580,15 @@ def query_collection(
 def all_chunks(
     collection: Collection | None = None, persist_directory=None
 ) -> list[dict]:
-    """Return every indexed chunk as ``{"id", "document", "metadata"}``.
+    """Return the active user's indexed chunks as ``{"id", "document", "metadata"}``.
 
-    Used to build the in-memory keyword index. Cheap for corpora of this size; a
-    very large corpus would want a persisted inverted index instead.
+    Used to build the in-memory keyword index. Scoping here is what keeps BM25
+    single-tenant: the lexical index is built from this list, so an unfiltered
+    read would let a rare identifier in someone else's document surface as a
+    keyword hit even though dense search never saw it.
     """
     collection = collection or get_collection(persist_directory=persist_directory)
-    got = collection.get(include=["documents", "metadatas"])
+    got = collection.get(include=["documents", "metadatas"], where=scoped_where())
     return [
         {"id": cid, "document": doc, "metadata": meta}
         for cid, doc, meta in zip(
@@ -461,17 +604,24 @@ def collection_stats(
     collection_name: str | None = None,
     persist_directory=None,
 ) -> dict:
-    """Return name, count, directory, embedding model, and document count."""
+    """Return name, count, directory, embedding model, and document count.
+
+    Under a user scope the counts describe *that user's* corpus, not the whole
+    collection: a global chunk total would tell a signed-in user how much other
+    people have uploaded.
+    """
     collection = collection or get_collection(
         collection_name=collection_name, persist_directory=persist_directory
     )
-    sources = {
-        meta.get("source")
-        for meta in (collection.get(include=["metadatas"]).get("metadatas") or [])
-    }
+    scope = scoped_where()
+    metadatas = (
+        collection.get(include=["metadatas"], where=scope).get("metadatas") or []
+    )
+    sources = {meta.get("source") for meta in metadatas}
+    count = len(metadatas) if scope else collection.count()
     return {
         "name": collection.name,
-        "count": collection.count(),
+        "count": count,
         "documents": len([s for s in sources if s]),
         "embedding_model": (collection.metadata or {}).get(
             "embedding_model", config.EMBED_MODEL

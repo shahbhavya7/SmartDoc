@@ -54,8 +54,10 @@ from backend.routing import (
     score_documents,
     select_documents,
 )
+from backend.user_scope import current_user_id
 from backend.vectorstore import (
     all_chunks,
+    get_chunks_by_ids,
     get_collection,
     get_parents,
     openai_embed_fn,
@@ -132,7 +134,7 @@ class RetrievalResult:
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 _bm25_lock = threading.Lock()
-_bm25_cache: dict[tuple[str, int], tuple[BM25Okapi, list[dict]]] = {}
+_bm25_cache: dict[tuple[str, int, str], tuple[BM25Okapi, list[dict]]] = {}
 
 
 def _tokenize(text: str) -> list[str]:
@@ -146,15 +148,22 @@ def _tokenize(text: str) -> list[str]:
 
 
 def _keyword_index(collection_name: str | None = None, persist_directory=None):
-    """Build (or reuse) the BM25 index over all indexed chunks.
+    """Build (or reuse) the BM25 index over the active user's indexed chunks.
 
-    Cached on ``(collection, chunk count)`` so it rebuilds automatically after an
-    upload changes the corpus, without a manual invalidation step.
+    Cached on ``(collection, chunk count, user)`` so it rebuilds automatically
+    after an upload changes the corpus, without a manual invalidation step.
+
+    The user is part of the key, not an afterthought: the index is a materialised
+    copy of the corpus, so one shared across tenants would return another user's
+    passages as keyword hits no metadata filter could catch. ``all_chunks``
+    already restricts the source rows to the active user; the key makes sure the
+    right index is the one that gets reused.
     """
     collection = get_collection(
         collection_name=collection_name, persist_directory=persist_directory
     )
-    key = (collection.name, collection.count())
+    count = collection.count()
+    key = (collection.name, count, current_user_id() or "")
     with _bm25_lock:
         cached = _bm25_cache.get(key)
         if cached:
@@ -163,7 +172,11 @@ def _keyword_index(collection_name: str | None = None, persist_directory=None):
         if not chunks:
             return None
         index = BM25Okapi([_tokenize(c["document"]) for c in chunks])
-        _bm25_cache.clear()  # only the current corpus version is useful
+        # Evict only indexes built against a stale corpus version; other users'
+        # current indexes stay warm, so one upload does not force every signed-in
+        # user to rebuild on their next query.
+        for stale in [k for k in _bm25_cache if k[0] == collection.name and k[1] != count]:
+            del _bm25_cache[stale]
         _bm25_cache[key] = (index, chunks)
         return _bm25_cache[key]
 
@@ -421,11 +434,15 @@ def expand_neighbours(
     collection = get_collection(
         collection_name=collection_name, persist_directory=persist_directory
     )
-    got = collection.get(ids=sorted(origin), include=["documents", "metadatas"])
+    # get(ids=...) cannot take a where clause, so ownership is applied to the
+    # results inside get_chunks_by_ids. Neighbour ids are user-namespaced and
+    # come from chunks already retrieved under this scope, so this is a second
+    # barrier rather than the only one.
     extra: list[RetrievedUnit] = []
-    for cid, doc, meta in zip(
-        got.get("ids") or [], got.get("documents") or [], got.get("metadatas") or []
-    ):
+    for neighbour_chunk in get_chunks_by_ids(sorted(origin), collection=collection):
+        cid = neighbour_chunk["id"]
+        doc = neighbour_chunk["document"]
+        meta = neighbour_chunk["metadata"]
         parent_unit = origin.get(cid)
         inherited = _score_of(parent_unit) * NEIGHBOUR_SCORE_DISCOUNT if parent_unit else 0.0
         extra.append(

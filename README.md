@@ -58,6 +58,42 @@ Configuration lives entirely in `.env` (see `.env.example` for the full list):
 `CHUNK_SIZE`, `CHUNK_OVERLAP`, `TOP_K`, `EMBED_MODEL`, `CHAT_MODEL`. Never
 commit `.env`.
 
+## Accounts and per-user data (V2)
+
+Every endpoint except `/health` and `/auth/*` requires a bearer token, and each
+user sees only their own documents and chats. Create the development account and
+adopt the existing corpus into it:
+
+```bash
+python -m scripts.seed_dev_user
+```
+
+That prints the credentials and stamps ownership onto the already-indexed chunks
+(metadata only — nothing is re-embedded). Sign in:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/auth/login \
+     -H 'Content-Type: application/json' \
+     -d '{"email":"dev@smartdoc.local","password":"devpassword123"}'
+```
+
+Use the returned `access_token` as `Authorization: Bearer <token>` on `/upload`,
+`/ask`, `/documents`, and `/sessions`. Google sign-in is available at
+`/auth/google/login` once `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set;
+without them, only those two routes are disabled.
+
+Set a real `JWT_SECRET` before exposing the API — the default placeholder is a
+published signing key, and anyone holding it can mint a token for any account.
+
+Verify the isolation guarantees:
+
+```bash
+python -m pytest tests/ -q
+```
+
+Relational data (users, documents, sessions, messages) lives in `smartdoc.db`;
+Chroma holds only vectors and metadata. Both are git-ignored.
+
 ## Run everything
 
 From the project root:
@@ -103,6 +139,11 @@ curl http://127.0.0.1:8000/health
 Interactive docs: <http://127.0.0.1:8000/docs>
 
 ## Run frontend
+
+> **V2 note:** the Streamlit client predates authentication and calls `/upload`
+> and `/ask` without a token, so it now receives 401s. It is replaced by the
+> Next.js client in a later phase; until then, drive the API with curl or the
+> Swagger UI at `/docs` (use *Authorize* to paste a bearer token).
 
 In a second terminal, with the virtualenv active and the backend running:
 

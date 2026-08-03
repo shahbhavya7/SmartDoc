@@ -36,7 +36,12 @@ import logging
 from dataclasses import dataclass, field
 
 import backend.config as config
-from backend.vectorstore import all_chunks, get_collection, query_collection
+from backend.vectorstore import (
+    all_chunks,
+    get_chunks_where,
+    get_collection,
+    query_collection,
+)
 
 logger = logging.getLogger("smartdoc.routing")
 
@@ -211,9 +216,13 @@ def document_outline(
     collection = get_collection(
         collection_name=collection_name, persist_directory=persist_directory
     )
-    got = collection.get(where={"source": source}, include=["metadatas"])
+    # Via the scoped helper, so an outline is built only from chunks the
+    # signed-in user owns.
     entries: dict[str, dict] = {}
-    for meta in got.get("metadatas") or []:
+    for chunk in get_chunks_where(
+        {"source": source}, collection=collection, include=["metadatas"]
+    ):
+        meta = chunk["metadata"] or {}
         section = (meta.get("section") or "").strip()
         if not section:
             continue
@@ -246,15 +255,7 @@ def document_chunks(
     where = (
         {"source": sources[0]} if len(sources) == 1 else {"source": {"$in": list(sources)}}
     )
-    got = collection.get(where=where, include=["documents", "metadatas"])
-    chunks = [
-        {"id": cid, "document": doc, "metadata": meta}
-        for cid, doc, meta in zip(
-            got.get("ids") or [],
-            got.get("documents") or [],
-            got.get("metadatas") or [],
-        )
-    ]
+    chunks = get_chunks_where(where, collection=collection)
     chunks.sort(
         key=lambda c: (
             c["metadata"].get("source", ""),

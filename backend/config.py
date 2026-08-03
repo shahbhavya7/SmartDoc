@@ -225,6 +225,54 @@ PLANNER_ENABLED = _bool("PLANNER_ENABLED", False)
 OUTLINE_SYNTHESIS_ENABLED = _bool("OUTLINE_SYNTHESIS_ENABLED", False)
 
 # ---------------------------------------------------------------------------
+# V2 -- relational store, authentication, and per-user isolation
+#
+# SQLite owns every relational entity (users, documents, sessions, messages);
+# Chroma keeps ONLY vectors and their metadata. The two are joined on
+# ``document_id``, which is stamped into each chunk's metadata at ingest.
+# ---------------------------------------------------------------------------
+SQLITE_PATH = PROJECT_ROOT / os.getenv("SQLITE_PATH", "smartdoc.db")
+
+# Master switch for the whole multi-tenant layer. ON by default because Phase 1
+# exists to make isolation real: with it OFF no scope is ever applied and the
+# system reverts to known-good V1 single-user behaviour, which is the escape
+# hatch, not the target state.
+MULTI_USER_ENABLED = _bool("MULTI_USER_ENABLED", True)
+
+# JWT signing. The default is a development-only placeholder; a real deployment
+# MUST set JWT_SECRET. Startup refuses to run with the placeholder unless
+# ALLOW_INSECURE_JWT_SECRET is set, because a known signing key means anyone can
+# mint a token for any user_id and every isolation guarantee below collapses.
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-insecure-secret-change-me")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+JWT_EXPIRE_MINUTES = _int("JWT_EXPIRE_MINUTES", 60 * 24 * 7)
+ALLOW_INSECURE_JWT_SECRET = _bool("ALLOW_INSECURE_JWT_SECRET", True)
+
+# bcrypt work factor. 12 is the common floor in 2026; raising it costs login
+# latency linearly in 2**rounds.
+BCRYPT_ROUNDS = _int("BCRYPT_ROUNDS", 12)
+
+# Google OAuth (authlib). Absent credentials disable only the Google routes --
+# email/password auth keeps working, so the app is runnable without them.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI", "http://127.0.0.1:8000/auth/google/callback"
+)
+# Where the OAuth callback sends the browser once a JWT has been issued. The
+# token is appended as a query parameter for the Next.js client to store.
+OAUTH_SUCCESS_REDIRECT = os.getenv("OAUTH_SUCCESS_REDIRECT", "")
+# Signs the short-lived OAuth state cookie authlib needs. Independent of
+# JWT_SECRET so rotating one does not invalidate the other.
+SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-oauth-session-secret")
+
+# Seeded development account. Everything indexed before V2 is adopted by this
+# user rather than deleted, so the existing corpus stays usable for testing.
+DEV_USER_EMAIL = os.getenv("DEV_USER_EMAIL", "dev@smartdoc.local")
+DEV_USER_PASSWORD = os.getenv("DEV_USER_PASSWORD", "devpassword123")
+DEV_USER_ID = os.getenv("DEV_USER_ID", "dev-user-0001")
+
+# ---------------------------------------------------------------------------
 # API limits
 # ---------------------------------------------------------------------------
 MAX_UPLOAD_MB = _int("MAX_UPLOAD_MB", 20)
