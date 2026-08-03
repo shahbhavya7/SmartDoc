@@ -433,7 +433,11 @@ context. Specifically:
 - Keep every supported statement exactly as informative as it was.
 - Do not add anything new.
 - If removing the unsupported claims leaves nothing substantive, reply with \
-EXACTLY: "{refusal}"
+EXACTLY: "{refusal}" and nothing else.
+- Otherwise -- if any substantive, supported statement remains -- return that \
+statement ALONE. Never combine a real answer with the sentence "{refusal}"; \
+that sentence means "no answer at all" and contradicts a partial answer sitting \
+next to it.
 
 Return only the corrected answer text."""
 
@@ -504,6 +508,26 @@ def _prune_sentences(answer: str, unsupported: list[str]) -> tuple[str, list[str
     if not kept:
         return REFUSAL_MESSAGE, removed
     return " ".join(kept).strip(), removed
+
+
+def _strip_embedded_refusal(text: str) -> str:
+    """Drop the fixed refusal sentence when it sits alongside real content.
+
+    ``REFUSAL_MESSAGE`` means "no answer at all" (see ``_is_refusal``, which
+    only matches when it is the WHOLE answer). A rewrite that keeps a genuine
+    partial answer and also tacks the refusal sentence on as one more clause is
+    self-contradictory -- observed live from the repair model, which the
+    prompt tells what to do when nothing substantive survives but not what to
+    do when something does. This is the code-level backstop for that prompt
+    instruction, not a replacement for it.
+    """
+    if _is_refusal(text):
+        return text
+    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
+    kept = [s for s in sentences if not _is_refusal(s)]
+    if len(kept) == len(sentences):
+        return text
+    return " ".join(kept).strip()
 
 
 def _repairable_claims(claims: list[str]) -> list[str]:
@@ -581,6 +605,7 @@ def enforce_grounding(
         )
         if not rewritten:
             break
+        rewritten = _strip_embedded_refusal(rewritten)
         if not _is_refusal(rewritten) and not _repair_is_safe(
             answer, rewritten, context_text
         ):
@@ -829,17 +854,25 @@ def query(
         },
     }
 
-    # ESCALATION. A refusal -- or an answer reporting its own missing coverage --
-    # from a cheap single-query plan is ambiguous: the corpus may genuinely lack
-    # the answer, or the plan may have been too narrow. Some questions need an
-    # intermediate lookup with no surface marker saying so. Rather than pay for
-    # decomposition on every question, escalate only after a cheap attempt falls
-    # short.
-    if (
-        (_is_refusal(answer_text) or _signals_incomplete(answer_text))
-        and _escalation_allowed(plan)
-        and _allow_escalation
-    ):
+    # ESCALATION. A refusal from a cheap single-query plan is ambiguous: the
+    # corpus may genuinely lack the answer, or the plan may have been too
+    # narrow. Rather than pay for decomposition on every question, escalate
+    # only after a cheap attempt refuses outright.
+    #
+    # `_signals_incomplete` used to trigger escalation here too, on the theory
+    # that an answer admitting missing coverage deserved a wider retry. In
+    # practice that regex (matches "does not provide", "not specified", ...)
+    # fires on the routine hedge a well-grounded model adds to an ALREADY
+    # CORRECT answer -- "The weight limit is 42 kg. The context does not
+    # provide any additional information." That doubled the latency of a
+    # large fraction of ordinary lookups and, worse, the forced retry runs
+    # with `restrict_documents: False`, so it pulled unrelated documents into
+    # context and produced confused, cross-document-flavoured answers to
+    # simple single-document questions. `_signals_incomplete` is still used
+    # (correctly) in `_repairable_claims` to protect a hedge sentence from
+    # being misread as an unsupported factual claim -- that use is unrelated
+    # and stays.
+    if _is_refusal(answer_text) and _escalation_allowed(plan) and _allow_escalation:
         logger.info("Incomplete result on %s plan; escalating.", plan.query_type)
         escalated = query(
             question,
