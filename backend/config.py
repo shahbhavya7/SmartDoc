@@ -276,7 +276,16 @@ MULTI_USER_ENABLED = _bool("MULTI_USER_ENABLED", True)
 # MUST set JWT_SECRET. Startup refuses to run with the placeholder unless
 # ALLOW_INSECURE_JWT_SECRET is set, because a known signing key means anyone can
 # mint a token for any user_id and every isolation guarantee below collapses.
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-insecure-secret-change-me")
+#
+# `or` rather than `os.getenv(..., default)`: .env deliberately ships this key
+# PRESENT but blank (a line for the user to fill in, not an absent one), and
+# os.getenv only falls back to its default when the variable is missing
+# entirely -- a present-but-empty value is returned as "". Without `or`, that
+# resolves JWT_SECRET to "" silently: assert_signing_key_usable()'s check for
+# the placeholder string would not match an empty string either, so the
+# startup guard never fires and the app signs tokens with an empty secret with
+# no warning at all -- quietly worse than the placeholder it was meant to be.
+JWT_SECRET = os.getenv("JWT_SECRET") or "dev-only-insecure-secret-change-me"
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = _int("JWT_EXPIRE_MINUTES", 60 * 24 * 7)
 ALLOW_INSECURE_JWT_SECRET = _bool("ALLOW_INSECURE_JWT_SECRET", True)
@@ -296,8 +305,11 @@ GOOGLE_REDIRECT_URI = os.getenv(
 # token is appended as a query parameter for the Next.js client to store.
 OAUTH_SUCCESS_REDIRECT = os.getenv("OAUTH_SUCCESS_REDIRECT", "")
 # Signs the short-lived OAuth state cookie authlib needs. Independent of
-# JWT_SECRET so rotating one does not invalidate the other.
-SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-oauth-session-secret")
+# JWT_SECRET so rotating one does not invalidate the other. `or`, not a
+# two-arg getenv default, for the same present-but-blank reason as JWT_SECRET
+# above -- an empty string SessionMiddleware secret is a silent weakening, not
+# a fallback to the placeholder.
+SESSION_SECRET = os.getenv("SESSION_SECRET") or "dev-only-oauth-session-secret"
 
 # Seeded development account. Everything indexed before V2 is adopted by this
 # user rather than deleted, so the existing corpus stays usable for testing.

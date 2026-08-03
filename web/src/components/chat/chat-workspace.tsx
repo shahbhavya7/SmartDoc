@@ -453,15 +453,26 @@ export function ChatWorkspace() {
     !!activeId && !loadingHistory && (activeMessages?.length ?? 0) === 0 && !pending;
 
   return (
-    // Fills the viewport below the 4rem top bar; the two columns scroll
-    // independently so neither the sidebar nor the composer moves with the
-    // conversation.
-    <div className="flex h-[calc(100dvh-4rem)] min-h-0">
+    // A floating card matching the top bar's own material (glass-chrome +
+    // border + shadow + rounded-2xl). `flex-1` fills `main` -- which
+    // app-shell.tsx makes a flex-col container for exactly this -- rather
+    // than `h-full`: see the comment there on why a percentage height doesn't
+    // reliably resolve here but flex-grow does. overflow-hidden is what clips
+    // the sidebar's own square corners to this card's rounded ones. The two
+    // columns inside scroll independently so neither the sidebar nor the
+    // composer moves with the conversation.
+    <div className="glass-chrome flex min-h-0 flex-1 overflow-hidden rounded-2xl border border-white/10 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.65)]">
       {/* Sidebar — a fixed rail from lg up, an overlay drawer below it. */}
       <aside
         className={cn(
-          "glass-chrome z-30 w-[17.5rem] shrink-0 border-r border-white/[0.07]",
-          "max-lg:fixed max-lg:inset-y-16 max-lg:left-0 max-lg:transition-transform",
+          "z-30 w-[17.5rem] shrink-0 border-r border-white/[0.07]",
+          // The mobile drawer is `fixed`, which escapes the card above
+          // entirely (a plain `overflow-hidden` ancestor does not clip a
+          // fixed descendant) -- deliberately: a drawer that respected the
+          // card's own margin would be narrower than it needs to be for
+          // mobile use. It re-adds its own background since it's no longer
+          // inside the clipped, glass-chrome-filled card once fixed.
+          "max-lg:fixed max-lg:glass-chrome max-lg:inset-y-[5.5rem] max-lg:left-0 max-lg:transition-transform",
           sidebarOpen ? "max-lg:translate-x-0" : "max-lg:-translate-x-full",
           "lg:block",
         )}
@@ -487,7 +498,7 @@ export function ChatWorkspace() {
           type="button"
           aria-label="Close chat list"
           onClick={() => setSidebarOpen(false)}
-          className="fixed inset-0 top-16 z-20 bg-black/50 lg:hidden"
+          className="fixed inset-0 top-[5.5rem] z-20 bg-black/50 lg:hidden"
         />
       ) : null}
 

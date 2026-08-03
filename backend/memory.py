@@ -24,6 +24,7 @@ only written once a valid replacement has been produced.
 from __future__ import annotations
 
 import logging
+import re
 
 import openai
 
@@ -115,3 +116,89 @@ def summarize_turn_and_store(
         logger.exception(
             "Unhandled error summarizing session %s for user %s", session_id, user_id
         )
+
+
+# ---------------------------------------------------------------------------
+# Questions ABOUT the conversation, not about the documents
+# ---------------------------------------------------------------------------
+#
+# "What did I ask you earlier?" has nothing for the document pipeline to
+# retrieve, so without this check it reaches query()'s fixed refusal --
+# "I don't know based on the available documents" -- which is actively
+# misleading here: the answer isn't unknown, the question just isn't about
+# the documents. The running summary (above) exists to resolve a reference
+# ("that policy") FORWARD into the next turn; it is lossy by design and wrong
+# for reproducing what was actually said, so this reads the real transcript.
+
+_META_QUESTION_RE = re.compile(
+    r"\b("
+    r"what did i (?:ask|say)|"
+    r"what was my (?:last |previous |first |earlier )?question|"
+    r"what did you (?:say|tell me|answer|respond)|"
+    r"what have we (?:talked about|discussed|been discussing)|"
+    r"(?:summarize|recap) (?:this|our|the) conversation|"
+    r"remind me what i asked|"
+    r"what questions (?:have i|did i) ask"
+    r")\b",
+    re.I,
+)
+
+
+def looks_like_meta_question(question: str) -> bool:
+    """True for a question about the conversation itself, not the documents.
+
+    Deliberately narrow -- every pattern requires a first/second-person pronoun
+    next to the verb ("what did I ask", "what did you say"), so a genuine
+    document question that happens to contain "say" or "ask" ("what does the
+    policy say about leave") does not trip it.
+    """
+    return bool(_META_QUESTION_RE.search(question or ""))
+
+
+_META_ANSWER_PROMPT = """You are recalling the ACTUAL transcript of this chat session -- \
+not answering from any uploaded document. The user is asking about the conversation \
+itself: what they asked earlier, or what you told them.
+
+Rules:
+- Answer only from the transcript given below. Never invent a turn that isn't there.
+- If the transcript doesn't contain what's being asked (e.g. there is no earlier turn), \
+say so plainly instead of guessing.
+- Be concise: paraphrase or quote the relevant prior turn, don't repeat the whole transcript.
+- This is about the CONVERSATION, not the documents -- do not refuse just because the \
+documents don't cover it. The transcript itself is the source of truth here."""
+
+
+def answer_meta_question(transcript: list[dict], question: str) -> str:
+    """Answer a question about the conversation itself, from the real transcript.
+
+    Reads ``messages`` rows directly rather than the running summary above --
+    "what did I ask earlier" needs the user's actual words, and the summary
+    exists to resolve references forward, not to reproduce what was said.
+    ``transcript`` is expected to exclude the in-flight question that prompted
+    this call (the caller has just stored it and would otherwise be asking the
+    model to recall a question from itself).
+    """
+    if not transcript:
+        return "This is the start of our conversation -- there's nothing earlier to recall yet."
+
+    lines = [f"{m['role']}: {m['content']}" for m in transcript]
+    try:
+        completion = _shared_openai().chat.completions.create(
+            model=config.UTILITY_MODEL,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": _META_ANSWER_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Transcript so far:\n{chr(10).join(lines)}\n\n"
+                        f"Question: {question}"
+                    ),
+                },
+            ],
+        )
+        text = (completion.choices[0].message.content or "").strip()
+    except openai.OpenAIError as exc:
+        logger.warning("Meta-question answering call failed: %s", exc)
+        return "I couldn't check our conversation history right now -- please try again."
+    return text or "I couldn't find that in our conversation so far."

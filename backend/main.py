@@ -68,7 +68,11 @@ from backend.auth import (
 )
 from backend.config import MAX_QUESTION_CHARS, MAX_UPLOAD_MB, PROJECT_ROOT
 from backend.ingestion import PDFReadError
-from backend.memory import summarize_turn_and_store
+from backend.memory import (
+    answer_meta_question,
+    looks_like_meta_question,
+    summarize_turn_and_store,
+)
 from backend.rag import GenerationError, InvalidQuestionError, RagError, query
 from backend.user_scope import ScopeError, user_scope
 from backend.vectorstore import VectorStoreError, collection_stats, get_chunks_where
@@ -879,6 +883,42 @@ def ask(
         # Stored before generation runs: a session's memory must include the
         # user's own question even if generation then fails.
         db.add_message(user_id, session["id"], "user", question)
+
+    # A question ABOUT the conversation ("what did I ask you earlier") has
+    # nothing for the document pipeline to retrieve, so unhandled it would
+    # reach query()'s fixed refusal -- misleading here, since the question
+    # isn't unanswerable, it just isn't about the documents. Short-circuits
+    # before user_scope/query() entirely; retrieval is never touched.
+    if looks_like_meta_question(question):
+        if session is not None:
+            # Excludes the question just stored above -- otherwise the model
+            # would be asked to recall a question from itself.
+            transcript = (db.list_messages(user_id, session["id"]) or [])[:-1]
+            answer_text = answer_meta_question(transcript, question)
+            db.add_message(user_id, session["id"], "assistant", answer_text)
+            background_tasks.add_task(
+                summarize_turn_and_store,
+                user_id,
+                session["id"],
+                session["summary"],
+                question,
+                answer_text,
+            )
+        else:
+            # No session means no stored history at all -- honest about the
+            # actual limitation, rather than the document-refusal sentence.
+            answer_text = (
+                "I don't have memory of earlier turns outside an active chat "
+                "session. Start a chat session to ask about earlier turns."
+            )
+        return AskResponse(
+            answer=answer_text,
+            sources=[],
+            query_type="conversation_meta",
+            grounding=None,
+            diagnostics=None,
+            session_id=session["id"] if session else None,
+        )
 
     # The scope is bound around the whole pipeline rather than passed into it:
     # retrieval is final code and takes no user argument, and binding here means
