@@ -30,6 +30,7 @@ eval/
 docs/
 data/
 scripts/
+tests/
 # Runtime logs from run.sh
 .logs/
 
