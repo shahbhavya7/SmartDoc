@@ -31,3 +31,11 @@ docs/
 data/
 # Runtime logs from run.sh
 .logs/
+
+# Next.js frontend (web/). Source is tracked; build output and deps are not.
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+web/.env.local
+web/tsconfig.tsbuildinfo

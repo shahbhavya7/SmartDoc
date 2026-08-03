@@ -761,3 +761,236 @@ default regardless of measurement, since the point of the flag is to keep the
 system revertible to known-good, not to promote a feature once it measures
 clean. Raw output for every run: `eval/phase2/*.log` and `*.json`
 (git-ignored, like the rest of `eval/`).
+
+## Part 7 — Phase 3: the Next.js frontend
+
+The retrieval stack is untouched for the third phase running. The backend edits
+this phase are three, all additive and all made because the UI needed data or
+access the API did not yet expose — no endpoint's behaviour changed.
+
+### F1. The frontend holds no logic that could disagree with the server
+
+`web/src/lib/api.ts` is the only module that speaks HTTP, and it has no
+`user_id` parameter anywhere. Identity is the JWT; the server derives the owner
+from the token's `sub` claim, so a client-supplied id would be ignored even if
+one were sent.
+
+That is what makes "the UI must not leak across accounts" a property rather than
+a discipline. There is no client-side filtering step to get wrong: the UI renders
+what a scoped endpoint returned, and it has no notion of whose data it is holding.
+The one place a stale identity *could* have shown through is the data hooks, so
+`useResource` is keyed on the user id — switching accounts in one tab refetches
+instead of showing the previous account's list from state.
+
+**`RequireAuth` is a UX guard, not a security boundary**, and it says so in its
+own docstring. Bypassing it yields authenticated-looking chrome full of 401s, not
+someone else's documents.
+
+### F2. The stored token is verified against the server before the app trusts it
+
+A token in `localStorage` is presented to `GET /auth/me` on mount, and only that
+reply populates `user`. A hand-edited token, or one whose account was deleted,
+therefore never produces a signed-in UI — the backend re-reads the user row on
+every request (D7), so `/auth/me` is authoritative.
+
+The failure branch distinguishes two cases that look identical if you only check
+for "the call failed": an explicit **401** clears the session, while a **network
+error** does not. Signing a user out because the API restarted would lose their
+session for a reason that has nothing to do with their credentials.
+
+**Why `localStorage` and not a cookie.** The API authorizes on an
+`Authorization: Bearer` header and runs CORS with `allow_credentials=False`, so a
+cookie would never be sent on an API call anyway. A non-HttpOnly cookie is
+readable by the same script that can read `localStorage`, so it would buy nothing
+while adding a CSRF surface bearer headers do not have. The trade-off stated
+plainly: `localStorage` is readable by any script achieving XSS on this origin.
+Mitigations are that the app loads no third-party script (the CSP-relevant point
+is that even the Google mark is inline SVG, not a remote image), and that the
+recorded expiry is enforced client-side too, so a stale token stops being
+presented rather than being sent to earn a 401.
+
+### F3. CORS narrowed from `*` to an allowlist
+
+Phase 1 ran `allow_origins=["*"]` on the reasoning that authorization is a header
+rather than a cookie, so the wildcard could not be used to ride an ambient
+session. That reasoning holds and the wildcard was still worth removing: with
+credentials off, `allow_origins` is the only thing standing between a token
+scraped from `localStorage` and a cross-origin replay from any page on the
+machine. `CORS_ALLOW_ORIGINS` defaults to both spellings of localhost:3000,
+because Next.js serves on `localhost` while the API's defaults use `127.0.0.1`
+and the browser treats those as different origins — a distinction that otherwise
+presents as "every call fails for no visible reason".
+
+### F4. "Storage used" is measured, not estimated
+
+The dashboard asks for storage used and the schema had no size column, so one was
+added — `documents.size_bytes`, written at ingest from the uploaded byte count.
+Three details are deliberate:
+
+* **Nullable, not `DEFAULT 0`.** A row written before the column existed has an
+  *unknown* size; zero would report a 33-page manual as empty. `_resolve_size`
+  fills NULL in from the file on disk, checking both `data/users/<id>/` and the
+  legacy `data/` location, and leaves it None when the file is genuinely gone.
+  All 13 of the adopted pre-V2 documents resolved to real sizes this way.
+* **The API reports the gap rather than hiding it.** `total_bytes` is a stated
+  lower bound and `documents_with_unknown_size` says how many rows were left out,
+  so the dashboard can render "at least 9.9 MB — 2 of unknown size" instead of a
+  confident wrong total.
+* **A re-upload updates the size.** `upsert_document` reuses the row (D1's
+  requirement, so the `document_id` stamped on chunks stays stable) but overwrites
+  `size_bytes`, since a replacement changes what is actually on disk.
+
+`google_oauth_enabled` was added to `/health` for the same class of reason: with
+credentials unset, `/auth/google/login` returns 503, and a plain link would drop
+the user on a raw JSON error page. It exposes a deployment capability, not user
+data — and the login page it feeds would reveal the same fact by having the button
+at all.
+
+### F5. Answers are revealed progressively; they are not token-streamed
+
+The brief asks for streaming answers. What ships is a client-side progressive
+reveal of the *verified* answer, and the deviation is deliberate.
+
+Grounding reads the **complete** answer and may regenerate it, prune sentences
+from it, or withdraw it entirely to the refusal string (C14). Tokens streamed
+straight from the model would therefore be text the server has not yet decided to
+stand behind, and retracting an answer a user has already read is worse than
+waiting for one that will not be retracted. Streaming the model would mean either
+abandoning the enforcement or showing text that can vanish.
+
+The reveal begins at the same instant a token stream's first *trustworthy* token
+could have arrived — the answer is not knowable before the pipeline finishes — so
+this costs no perceived latency against a stream that respected the same gate. An
+SSE endpoint was considered and rejected for the same reason: it would duplicate
+the session and background-task logic of `/ask` to move a reveal loop across the
+network boundary for zero user-visible gain.
+
+What *is* honest about progress is the placeholder: "Searching your documents and
+verifying the answer…", with an elapsed counter after four seconds. It never
+claims a percentage, because `query()` is one server call that reports no
+intermediate progress, and a fabricated progress bar is a lie about work.
+
+### F6. Session switching avoids the router on purpose
+
+The active session id lives in component state and the URL is kept in sync with
+`history.replaceState`, not `router.push`. An App Router navigation would fetch an
+RSC payload for a route whose content is entirely client-fetched anyway, adding a
+network hop to a switch that needs none. The URL still updates, so a chat stays
+linkable and reload-safe. Measured in Chromium: **31 ms** to switch with one
+navigation entry for the whole session (proving no reload), and 274 ms to switch
+back. History is cached per session and prefetched on hover or focus, so a switch
+usually renders from memory with no request at all.
+
+A `?session=` id that is not in the user's own session list falls through to their
+most recent chat rather than being fetched — a param naming someone else's session
+would 404 by design (D6), and there is no reason to ask.
+
+### F7. Citations survive a reload via a cache that is not treated as data
+
+`GET /sessions/{id}/messages` returns `{role, content}` — the durable record of
+what was said. It does not carry sources or the grounding verdict, which `/ask`
+returns and the server does not persist. History alone would therefore render
+every past answer with its citations missing, and structural citations are what
+makes an answer checkable.
+
+`lib/answer-cache.ts` files them in `localStorage` keyed by the assistant
+message's **server-assigned id**, which the client learns by re-reading the
+message list once per turn. Three properties keep this a presentation cache
+rather than a second source of truth: an entry can only be shown against the
+exact message it was produced for; a miss renders the answer with no sources
+panel, never a guess and never another answer's citations; and it is bounded at
+400 entries. The limitation is real and stated — it does not follow the user to
+another device. Persisting sources server-side would be a `messages` schema
+change, which is outside this phase.
+
+That re-read deliberately does **not** replace the optimistic message rows with
+the fetched ones. Their text is identical, and swapping them would change the
+rendered answer's React key mid-animation, remounting it and restarting the
+reveal from an empty panel.
+
+### F8. Grounding metadata is surfaced only where it means something
+
+The backend already remediates before responding, so a `faithful` verdict needs no
+badge — labelling every answer "verified" trains the user to ignore the one place
+it matters. Two cases are shown: `unsupported_claims` on a returned answer (the
+"declined" branch of E8, where pruning would have cost supported content, and the
+flag is exactly what a UI must not silently drop), and `removed_claims` (the user
+is reading a deliberately shortened answer).
+
+`unverified_numbers` is deliberately **not** surfaced as a warning. A legitimately
+derived figure lands there too (C14), so flagging it would cry wolf on correct
+arithmetic.
+
+### F9. Design system: glass on black, with V1's accent preserved
+
+The palette is dark-only, so it lives in `:root` rather than being duplicated
+under `.dark`. `--card` is deliberately **translucent**, which means every shadcn
+Card, Popover and Dialog is frosted by virtue of the theme token rather than each
+surface remembering a utility class. The champagne/sand accent carried over from
+the V1 Streamlit CSS (`rgb(200 180 140)` / `#f4e9d0`) becomes `--primary` at
+`oklch(0.815 0.055 86)` with near-black text on top; `--muted-foreground` sits at
+0.72 lightness, which clears 4.5:1 against the base and against every glass tint
+layered over it.
+
+Glass variants are registered with Tailwind's `@utility` rather than written as
+plain classes, so they compose with variants (`hover:glass-raised`). Four exist
+because they solve different problems: `glass` for panels, `glass-raised` for
+surfaces stacked *on* another panel (where the standard fill disappears into it),
+`glass-chrome` for framing (sidebar, top bar), and `glass-accent` for the single
+element that should pull the eye. The page's background glows are
+`background-attachment: fixed` — they stay still while panels scroll, which is
+what makes the glass read as sitting above the page rather than being part of it.
+
+### F10. A real bug the browser found that no unit test would have
+
+`DropdownMenuLabel` in this shadcn build maps to Base UI's `Menu.GroupLabel`,
+which **throws** outside a `Menu.Group`. Used directly inside the menu content it
+raised `MenuGroupContext is missing`, and the account menu never opened — so
+**Sign out was completely unreachable**. TypeScript compiled it, the production
+build succeeded, and the page rendered fine until the trigger was clicked.
+
+It was found by driving Chromium against the running stack and asserting on the
+menu item, not by reading the code. The lesson recorded here is the reason the
+verification below is a browser run rather than a component test: this shadcn
+install is Base UI, not Radix — `render` instead of `asChild`, `onClick` instead
+of `onSelect`, `delay` instead of `delayDuration` — and the API differences fail
+at runtime, silently, in a build that passes every static check.
+
+### Verification
+
+Three suites, all against a live `uvicorn` + `next dev`, plus the pre-existing
+backend tests:
+
+| Suite | Result | Notable |
+|---|---|---|
+| `pytest tests/` | **33 passed** | No Phase 1/2 regression from the schema change |
+| API-level, 2 fresh users + the dev account | **28/28** | Isolation, CORS, sessions, ask, delete |
+| Browser (Chromium) | **23/23** | Login round-trip, dashboard counts, session switching |
+| Browser, upload + delete | **12/12** | UI row *and* DB both confirmed |
+| Browser, OAuth callback | **8/8** | Valid, tampered, and absent token |
+
+Specifically confirmed, against the acceptance list:
+
+* **Login round-trip.** Email/password sign-in reaches an authenticated
+  `/auth/me` and a populated dashboard. Cross-origin preflight from
+  `http://localhost:3000` is allowed and `http://evil.example` is refused with no
+  `Access-Control-Allow-Origin` header.
+* **Google.** The *frontend* half is verified end to end with a real JWT: a valid
+  token at `/auth/callback?token=` lands authenticated, is stripped from the
+  address bar, and is stored for later calls; a tampered token is rejected at the
+  callback rather than producing a 401-filled shell; an absent token reports
+  clearly instead of hanging. The backend's code exchange is Phase 1 code and is
+  unchanged, but **the live Google round trip was not exercised** — this
+  environment has no `GOOGLE_CLIENT_ID`/`SECRET`, so `/health` reports
+  `google_oauth_enabled: false` and the button correctly renders disabled. That
+  one leg needs real credentials to confirm.
+* **Per-user counts.** The dev account shows 13 documents / 9.9 MB / 491 chunks;
+  a freshly created account shows the empty state for both documents and chats.
+  Requesting another user's session or document by id returns 404.
+* **Delete.** Through the UI: the row disappears, the document and chunk counts
+  fall to zero, and an independent API read confirms the row and all 22 chunks
+  are gone, with the id no longer resolving.
+* **Session switching.** 31 ms, one navigation entry, correct history per session
+  and no bleed between two sessions of the same user.
+* **Console.** Zero page or console errors across every run, which is how F10 was
+  caught in the first place.

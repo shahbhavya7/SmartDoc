@@ -60,7 +60,9 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
     dest = stored_path(user_id, filename)
     dest.write_bytes(content)
 
-    record = db.upsert_document(user_id=user_id, filename=filename)
+    record = db.upsert_document(
+        user_id=user_id, filename=filename, size_bytes=len(content)
+    )
 
     parsed = extract_document(dest)
     parents, children = build_chunks(parsed)
@@ -87,9 +89,41 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
     }
 
 
+def _resolve_size(user_id: str, record: dict) -> int | None:
+    """Fill in a missing ``size_bytes`` from the stored file, if it is still there.
+
+    Rows written before the column existed -- including the whole pre-V2 corpus
+    adopted by ``scripts/seed_dev_user.py`` -- have NULL. Reading the file's real
+    size is the honest answer; reporting 0 would show a 33-page manual as taking
+    no space. When the file is genuinely gone the value stays None, and the API
+    reports it as unknown rather than as zero.
+    """
+    if record.get("size_bytes") is not None:
+        return record["size_bytes"]
+
+    # Legacy documents were ingested from data/ directly, before per-user
+    # directories existed, so both locations are worth checking.
+    for candidate in (
+        stored_path(user_id, record["filename"]),
+        DATA_DIR / Path(record["filename"]).name,
+    ):
+        try:
+            if candidate.is_file():
+                return candidate.stat().st_size
+        except OSError:  # pragma: no cover - unreadable path is just "unknown"
+            continue
+    return None
+
+
 def list_documents_for_user(user_id: str) -> list[dict]:
-    """This user's documents. Ownership is in the query, not a later filter."""
-    return db.list_documents(user_id)
+    """This user's documents, each with a resolved size.
+
+    Ownership is in the query, not a later filter.
+    """
+    return [
+        {**record, "size_bytes": _resolve_size(user_id, record)}
+        for record in db.list_documents(user_id)
+    ]
 
 
 def delete_document_for_user(user_id: str, document_id: str) -> dict | None:

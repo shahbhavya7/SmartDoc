@@ -91,12 +91,14 @@ app = FastAPI(
     version="2.0.0",
 )
 
-# Permissive CORS for a Streamlit client on a different localhost port.
+# CORS for the Next.js client, from an explicit allowlist (CORS_ALLOW_ORIGINS).
 # Credentials stay off: the browser sends the JWT in an Authorization header,
-# not a cookie, so "*" origins cannot be used to ride an ambient session.
+# never a cookie, so there is no ambient session for another origin to ride --
+# and with credentials off, `allow_origins` is the only thing standing between a
+# scraped token and a cross-origin replay, which is why it is no longer "*".
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.CORS_ALLOW_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -146,6 +148,15 @@ class HealthResponse(BaseModel):
     indexed_chunks: int | None = Field(default=None)
     documents: int | None = Field(default=None)
     embedding_model: str | None = Field(default=None)
+    google_oauth_enabled: bool = Field(
+        default=False,
+        description=(
+            "Whether GOOGLE_CLIENT_ID/SECRET are configured. Lets a sign-in page "
+            "hide or disable its Google button instead of sending the user into a "
+            "503. Reveals a deployment capability, not user data -- and the login "
+            "page it feeds would expose the same fact by having the button at all."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -155,6 +166,7 @@ class HealthResponse(BaseModel):
                 "indexed_chunks": 471,
                 "documents": 11,
                 "embedding_model": "text-embedding-3-small",
+                "google_oauth_enabled": True,
             }
         }
     }
@@ -337,11 +349,28 @@ class DocumentModel(BaseModel):
     chunks: int | None = Field(
         default=None, description="Indexed chunks for this document."
     )
+    size_bytes: int | None = Field(
+        default=None,
+        description=(
+            "Size of the stored PDF. None when the size is genuinely unknown "
+            "(a pre-V2 row whose file is no longer on disk) -- not zero, which "
+            "would misreport it as empty."
+        ),
+    )
 
 
 class DocumentListResponse(BaseModel):
     documents: list[DocumentModel]
     total_chunks: int = Field(..., description="Indexed chunks across this user only.")
+    total_bytes: int = Field(
+        default=0,
+        description=(
+            "Sum of the known document sizes for this user. Documents of unknown "
+            "size contribute nothing, so this is a lower bound, and "
+            "`documents_with_unknown_size` says how many were left out."
+        ),
+    )
+    documents_with_unknown_size: int = Field(default=0)
 
 
 class DeleteDocumentResponse(BaseModel):
@@ -547,16 +576,18 @@ async def _unexpected_error_handler(request: Request, exc: Exception) -> JSONRes
 )
 def health() -> HealthResponse:
     """Liveness probe used by clients and deploy checks."""
+    google_enabled = auth.google_configured()
     try:
         stats = collection_stats()
         return HealthResponse(
             status="ok",
             collection=stats["name"],
             embedding_model=stats.get("embedding_model"),
+            google_oauth_enabled=google_enabled,
         )
     except Exception:  # pragma: no cover - health must never fail on store issues
         logger.warning("collection_stats() failed during /health.", exc_info=True)
-        return HealthResponse(status="ok")
+        return HealthResponse(status="ok", google_oauth_enabled=google_enabled)
 
 
 # --------------------------------------------------------------------------
@@ -917,10 +948,15 @@ def list_documents(user_id: str = Depends(get_current_user_id)) -> DocumentListR
                 filename=row["filename"],
                 created_at=row["created_at"],
                 chunks=counts.get(row["id"], 0),
+                size_bytes=row.get("size_bytes"),
             )
             for row in rows
         ],
         total_chunks=chunks,
+        total_bytes=sum(row.get("size_bytes") or 0 for row in rows),
+        documents_with_unknown_size=sum(
+            1 for row in rows if row.get("size_bytes") is None
+        ),
     )
 
 

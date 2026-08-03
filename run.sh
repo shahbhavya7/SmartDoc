@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Start SmartDoc: the FastAPI backend and the Streamlit UI, together.
+# Start SmartDoc: the FastAPI backend and the Next.js frontend, together.
 #
 #   ./run.sh                 start both on the default ports
 #   ./run.sh --backend-only  API only (useful for curl / Swagger work)
@@ -9,9 +9,13 @@
 # Ctrl-C stops both. Ports and log locations are overridable by environment
 # variable, so a second instance can be brought up alongside the first:
 #
-#   API_PORT=8001 UI_PORT=8503 ./run.sh
+#   API_PORT=8001 UI_PORT=3001 ./run.sh
 #
-# Everything is invoked as `python -m <module>` rather than through the venv's
+# The UI port is not freely choosable in practice: the API's CORS allowlist
+# names the frontend's origin, so a non-default UI_PORT also needs
+# CORS_ALLOW_ORIGINS updated in .env, or the browser will block every call.
+#
+# Python is invoked as `python -m <module>` rather than through the venv's
 # console scripts. Those scripts hard-code an absolute interpreter path in
 # their shebang, which breaks the moment the project directory is moved;
 # `python -m` has no such dependency.
@@ -23,9 +27,10 @@ cd "$PROJECT_ROOT"
 
 API_HOST="${API_HOST:-127.0.0.1}"
 API_PORT="${API_PORT:-8000}"
-UI_PORT="${UI_PORT:-8501}"
+UI_PORT="${UI_PORT:-3000}"
 LOG_DIR="${LOG_DIR:-$PROJECT_ROOT/.logs}"
 VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
+WEB_DIR="$PROJECT_ROOT/web"
 
 # Seconds to wait for /health before giving up. Cold starts load the Chroma
 # collection from disk, so the first boot is slower than later ones.
@@ -75,6 +80,7 @@ fi
 if [ "$START_UI" -eq 1 ] && port_in_use "$UI_PORT"; then
     echo "ERROR: port $UI_PORT is already in use." >&2
     echo "  Stop the process (lsof -ti :$UI_PORT | xargs kill) or set UI_PORT." >&2
+    echo "  Note: a different UI_PORT also needs CORS_ALLOW_ORIGINS updated in .env." >&2
     exit 1
 fi
 
@@ -82,7 +88,9 @@ mkdir -p "$LOG_DIR"
 API_LOG="$LOG_DIR/backend.log"
 UI_LOG="$LOG_DIR/frontend.log"
 
-# The UI is a thin HTTP client; this is the only wiring it needs.
+# The UI is a thin HTTP client; this is the only wiring it needs. Kept for the
+# retired Streamlit client in app/legacy_v1/; the Next.js client reads
+# NEXT_PUBLIC_API_BASE_URL instead, exported in the frontend block below.
 export SMARTDOC_API_URL="http://${API_HOST}:${API_PORT}"
 
 # ---------------------------------------------------------------------------
@@ -173,23 +181,33 @@ fi
 # ---------------------------------------------------------------------------
 
 if [ "$START_UI" -eq 1 ]; then
+    if [ ! -d "$WEB_DIR/node_modules" ]; then
+        echo "ERROR: $WEB_DIR/node_modules is missing." >&2
+        echo "  Run: (cd web && npm install)" >&2
+        exit 1
+    fi
+
+    # The browser reaches the API directly, so the client bundle needs the API's
+    # address at build time. Passing it here keeps a non-default API_PORT working
+    # without editing web/.env.local.
+    export NEXT_PUBLIC_API_BASE_URL="${NEXT_PUBLIC_API_BASE_URL:-http://${API_HOST}:${API_PORT}}"
+
     echo "Starting frontend -> http://localhost:${UI_PORT}  (log: ${UI_LOG#$PROJECT_ROOT/})"
-    "$VENV_PYTHON" -m streamlit run app/streamlit_app.py \
-        --server.port "$UI_PORT" \
-        --server.headless true \
-        --browser.gatherUsageStats false >"$UI_LOG" 2>&1 &
+    echo "  API base for the browser: $NEXT_PUBLIC_API_BASE_URL"
+    (cd "$WEB_DIR" && npm run dev -- --port "$UI_PORT") >"$UI_LOG" 2>&1 &
     UI_PID=$!
 
     printf "  waiting for the UI "
     ready=0
-    for _ in $(seq 1 30); do
+    # 60 rather than 30: a cold Next.js dev start compiles the route tree first.
+    for _ in $(seq 1 60); do
         if ! kill -0 "$UI_PID" 2>/dev/null; then
             echo ""
-            echo "ERROR: Streamlit exited during startup. Last lines of $UI_LOG:" >&2
+            echo "ERROR: Next.js exited during startup. Last lines of $UI_LOG:" >&2
             tail -n 20 "$UI_LOG" >&2
             exit 1
         fi
-        if curl -fsS "http://localhost:${UI_PORT}" >/dev/null 2>&1; then
+        if curl -fsS "http://localhost:${UI_PORT}/login" >/dev/null 2>&1; then
             ready=1
             break
         fi
@@ -199,7 +217,7 @@ if [ "$START_UI" -eq 1 ]; then
     echo ""
 
     if [ "$ready" -ne 1 ]; then
-        echo "ERROR: the UI did not start within 30s." >&2
+        echo "ERROR: the UI did not start within 60s." >&2
         tail -n 20 "$UI_LOG" >&2
         exit 1
     fi

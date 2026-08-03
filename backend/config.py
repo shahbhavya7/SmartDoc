@@ -32,6 +32,12 @@ def _bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _csv(name: str, default: str) -> list[str]:
+    """Comma-separated list, blanks dropped. Used for the CORS allowlist."""
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
@@ -309,3 +315,15 @@ MAX_QUESTION_CHARS = _int("MAX_QUESTION_CHARS", 4000)
 # Service wiring
 # ---------------------------------------------------------------------------
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
+
+# Browser origins allowed to call the API. An explicit allowlist replaces the
+# Phase-1 ``*``: the wildcard was acceptable only because authorization is a
+# bearer header rather than a cookie, but it also let any page on the machine
+# read a signed-in user's documents by replaying a token it had scraped. Both
+# spellings of localhost are listed because Next.js serves on ``localhost`` while
+# the API's own defaults use ``127.0.0.1``, and the browser treats them as
+# different origins.
+CORS_ALLOW_ORIGINS = _csv(
+    "CORS_ALLOW_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+)

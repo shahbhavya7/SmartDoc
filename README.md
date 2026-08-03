@@ -19,26 +19,42 @@ documents" rather than guessing. Every answer returns structured sources
 | Vector DB | ChromaDB (`PersistentClient`, on disk) |
 | Embeddings | OpenAI `text-embedding-3-small` |
 | Generation | OpenAI `gpt-4o-mini` (low temperature) |
-| Frontend | Streamlit thin client over HTTP |
+| Relational store | SQLite — users, documents, sessions, messages (V2) |
+| Auth | FastAPI-owned: bcrypt + JWT, Google OAuth via authlib (V2) |
+| Frontend | Next.js App Router + TypeScript + Tailwind + shadcn/ui (V2) |
 | Orchestration | LangChain where it helps |
 
 **Layout**
 
 ```
 smartdoc/
-  backend/       # FastAPI app + RAG pipeline modules
-  app/           # Streamlit UI
-  data/          # test PDFs
-  chroma_store/  # persisted vector DB (git-ignored)
-  .env           # real secrets (git-ignored)
-  .env.example   # documents variable names only
+  backend/          # FastAPI app, RAG pipeline, auth, SQLite, scoping
+  web/              # Next.js frontend (V2)
+  app/legacy_v1/    # retired Streamlit UI, kept for reference
+  data/             # test PDFs; data/users/<id>/ for uploads (git-ignored)
+  chroma_store/     # persisted vector DB (git-ignored)
+  smartdoc.db       # SQLite relational store (git-ignored)
+  docs/             # pipeline dossiers
+  eval/ scripts/ tests/
+  .env              # real secrets (git-ignored)
+  .env.example      # documents variable names only
   requirements.txt
-  README.md
+  README.md  DECISIONS.md
 ```
 
-Current status: **RAG pipeline implemented.** The backend includes PDF ingestion,
+Current status: **V2 phases 1–3 complete.** The V1 retrieval stack (PDF ingestion,
 persistent Chroma indexing, intent-aware hybrid retrieval, context assembly,
-grounded generation, structural citations, and grounding verification/repair.
+grounded generation, structural citations, grounding verification/repair) is
+carried over unmodified. V2 adds per-user isolation, FastAPI-owned authentication,
+per-session chat memory, and the Next.js frontend.
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [`docs/v2-pipeline-dossier.md`](docs/v2-pipeline-dossier.md) | **Current.** All 21 stages end to end — identity, scoping, ingestion, the query pipeline, session memory, the API, and the frontend — with the functions that run at each and flow diagrams. |
+| [`docs/v1-pipeline-dossier.md`](docs/v1-pipeline-dossier.md) | The V1 pipeline as closed out. Stages 07–16 of the V2 dossier are this code, unmodified. |
+| [`DECISIONS.md`](DECISIONS.md) | Why each decision was made, including what was measured and rejected. |
 
 ## Setup
 
@@ -140,13 +156,19 @@ From the project root:
 ./run.sh
 ```
 
-This starts the FastAPI backend and the Streamlit UI together, waits for
+This starts the FastAPI backend and the Next.js frontend together, waits for
 `/health` before bringing up the UI, wires the UI to the API, and stops both on
 Ctrl-C. Logs go to `.logs/backend.log` and `.logs/frontend.log`.
 
+First time only, install the frontend's dependencies:
+
+```bash
+(cd web && npm install)
+```
+
 | | |
 |---|---|
-| App | <http://localhost:8501> |
+| App | <http://localhost:3000> |
 | API docs | <http://127.0.0.1:8000/docs> |
 
 Variations:
@@ -154,8 +176,12 @@ Variations:
 ```bash
 ./run.sh --backend-only            # API only, for curl / Swagger work
 ./run.sh --ui-only                 # UI only, against an API already running
-API_PORT=8001 UI_PORT=8503 ./run.sh   # a second instance alongside the first
+API_PORT=8001 UI_PORT=3001 ./run.sh   # a second instance alongside the first
 ```
+
+A non-default `UI_PORT` also needs `CORS_ALLOW_ORIGINS` updated in `.env`: the
+API allows a named list of browser origins, so an unlisted port has every call
+blocked by the browser before it reaches the server.
 
 The sections below cover starting each service by hand.
 
@@ -176,25 +202,57 @@ curl http://127.0.0.1:8000/health
 
 Interactive docs: <http://127.0.0.1:8000/docs>
 
+> Invoke the Python tools as `.venv/bin/python -m <module>` rather than through
+> the venv's `uvicorn` console script. That script hard-codes an absolute
+> interpreter path in its shebang, so it breaks if the project directory is ever
+> moved. `run.sh` already does this.
+
 ## Run frontend
 
-> **V2 note:** the Streamlit client predates authentication and calls `/upload`
-> and `/ask` without a token, so it now receives 401s. It is replaced by the
-> Next.js client in a later phase; until then, drive the API with curl or the
-> Swagger UI at `/docs` (use *Authorize* to paste a bearer token).
-
-In a second terminal, with the virtualenv active and the backend running:
+Next.js (App Router, TypeScript) + Tailwind + shadcn/ui, in `web/`. In a second
+terminal, with the backend running:
 
 ```bash
-.venv/bin/python -m streamlit run app/streamlit_app.py
+cd web
+npm install                      # first time only
+cp .env.example .env.local       # NEXT_PUBLIC_API_BASE_URL -> your API
+npm run dev
 ```
 
-Streamlit opens on <http://localhost:8501> and shows the backend status card.
-It should read **connected**; if it reads *unreachable*, start the backend
-first or point `SMARTDOC_API_URL` (or the legacy `BACKEND_URL`) at the right
-host.
+The app opens on <http://localhost:3000>. Sign in with the seeded development
+account (`dev@smartdoc.local` / `devpassword123`) to reach the adopted corpus, or
+create a new account, which starts empty.
 
-> Invoke the tools as `.venv/bin/python -m <module>` rather than through the
-> venv's `uvicorn` / `streamlit` console scripts. Those scripts hard-code an
-> absolute interpreter path in their shebang, so they break if the project
-> directory is ever moved. `run.sh` already does this.
+```
+web/src/
+  app/            routes: /login, /signup, /auth/callback, /dashboard, /chat
+  components/     auth provider + route guard, app shell, dashboard, chat
+  lib/            api client, wire types, token storage, formatting
+```
+
+The frontend is a client of the API and nothing more. It holds no retrieval
+logic, no prompt, and no authorization decision: identity is the JWT, which only
+FastAPI issues and verifies, and no request it sends names a user. Data isolation
+is therefore a server property — the UI cannot leak across accounts because it
+has no notion of "whose data this is" to get wrong.
+
+### Google sign-in
+
+Optional. With `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` unset, the button
+renders disabled with an explanation and email/password sign-in works normally.
+To enable it, set those two plus:
+
+```bash
+GOOGLE_REDIRECT_URI=http://127.0.0.1:8000/auth/google/callback
+OAUTH_SUCCESS_REDIRECT=http://localhost:3000/auth/callback
+```
+
+`OAUTH_SUCCESS_REDIRECT` must point at the frontend's callback route. Left blank,
+the API returns the token as JSON and the browser shows it as raw text instead of
+signing in.
+
+### Retired Streamlit client
+
+The V1 Streamlit UI is retired and preserved at
+`app/legacy_v1/streamlit_app.py`. It predates authentication and calls `/upload`
+and `/ask` without a token, so it receives 401s; it is kept for reference only.

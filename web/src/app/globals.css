@@ -1,0 +1,327 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* ---------------------------------------------------------------------------
+   SmartDoc design system — "glass on black"
+   ---------------------------------------------------------------------------
+   A near-black base, frosted translucent cards, and the champagne/sand accent
+   carried over from the V1 Streamlit theme (rgb(200 180 140) / #f4e9d0 text).
+
+   The palette is dark-only by design, so it lives in `:root` rather than being
+   duplicated under `.dark`. `<html>` still carries the `dark` class so shadcn
+   components' own `dark:` variants resolve to the same intent.
+
+   `--card` is deliberately TRANSLUCENT. Every shadcn Card, Popover and Dialog
+   reads that token, so the frosted look comes from the theme itself instead of
+   each surface having to remember a one-off utility class.
+--------------------------------------------------------------------------- */
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --radius: 0.875rem;
+
+  /* Base: near-black, with just enough blue in it to keep the V1 lineage. */
+  --background: oklch(0.115 0.008 264);
+  --foreground: oklch(0.962 0.005 264);
+
+  /* Frosted glass. Translucency is the point — these sit over the page glow. */
+  --card: oklch(1 0 0 / 6%);
+  --card-foreground: oklch(0.962 0.005 264);
+  --popover: oklch(0.17 0.01 264 / 92%);
+  --popover-foreground: oklch(0.962 0.005 264);
+
+  /* The champagne/sand accent, carried over from V1. Dark text on top of it. */
+  --primary: oklch(0.815 0.055 86);
+  --primary-foreground: oklch(0.16 0.012 264);
+
+  --secondary: oklch(1 0 0 / 8%);
+  --secondary-foreground: oklch(0.962 0.005 264);
+
+  /* 0.72 lightness clears 4.5:1 against the base and every glass tint. */
+  --muted: oklch(1 0 0 / 5%);
+  --muted-foreground: oklch(0.72 0.012 264);
+
+  --accent: oklch(1 0 0 / 10%);
+  --accent-foreground: oklch(0.962 0.005 264);
+
+  --destructive: oklch(0.68 0.19 22);
+
+  --border: oklch(1 0 0 / 11%);
+  --input: oklch(1 0 0 / 9%);
+  --ring: oklch(0.815 0.055 86 / 55%);
+
+  --chart-1: oklch(0.815 0.055 86);
+  --chart-2: oklch(0.7 0.09 235);
+  --chart-3: oklch(0.75 0.11 165);
+  --chart-4: oklch(0.72 0.13 305);
+  --chart-5: oklch(0.78 0.13 45);
+
+  --sidebar: oklch(0.14 0.009 264 / 72%);
+  --sidebar-foreground: oklch(0.962 0.005 264);
+  --sidebar-primary: oklch(0.815 0.055 86);
+  --sidebar-primary-foreground: oklch(0.16 0.012 264);
+  --sidebar-accent: oklch(1 0 0 / 8%);
+  --sidebar-accent-foreground: oklch(0.962 0.005 264);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.815 0.055 86 / 55%);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  html {
+    @apply font-sans;
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    /* Three fixed layers behind everything: a cool top-left glow that echoes
+       the V1 gradient, a warm accent bloom so the gold reads as lit rather
+       than painted on, and a low bounce. `background-attachment: fixed` keeps
+       them still while panels scroll, which is what makes the glass look like
+       it sits above the page instead of being part of it. */
+    background-image:
+      radial-gradient(
+        58rem 42rem at 12% -8%,
+        oklch(0.34 0.055 262 / 55%) 0%,
+        transparent 68%
+      ),
+      radial-gradient(
+        46rem 34rem at 96% 4%,
+        oklch(0.42 0.05 88 / 20%) 0%,
+        transparent 62%
+      ),
+      radial-gradient(
+        70rem 50rem at 50% 118%,
+        oklch(0.24 0.04 268 / 45%) 0%,
+        transparent 72%
+      );
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+  }
+
+  /* Scrollbars, so a long chat does not reintroduce bright system chrome. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(1 0 0 / 14%) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: oklch(1 0 0 / 12%);
+    border: 3px solid transparent;
+    border-radius: 9999px;
+    background-clip: content-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: oklch(1 0 0 / 20%);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Glass utilities
+   ---------------------------------------------------------------------------
+   Registered with `@utility` so they compose with Tailwind variants
+   (`hover:glass-raised`, `md:glass`) instead of being inert plain classes.
+--------------------------------------------------------------------------- */
+
+/* The standard frosted panel: translucent fill, hairline top highlight to fake
+   a lit edge, and a soft drop shadow to lift it off the base. */
+@utility glass {
+  background-color: oklch(1 0 0 / 5%);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid oklch(1 0 0 / 10%);
+  box-shadow:
+    inset 0 1px 0 0 oklch(1 0 0 / 7%),
+    0 18px 44px -22px oklch(0 0 0 / 85%);
+}
+
+/* For surfaces stacked ON another glass panel, where the standard fill would
+   disappear into it. */
+@utility glass-raised {
+  background-color: oklch(1 0 0 / 9%);
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  border: 1px solid oklch(1 0 0 / 14%);
+  box-shadow:
+    inset 0 1px 0 0 oklch(1 0 0 / 9%),
+    0 22px 50px -24px oklch(0 0 0 / 90%);
+}
+
+/* Chrome that frames content rather than holding it: sidebars, top bars. */
+@utility glass-chrome {
+  background-color: oklch(0.13 0.008 264 / 62%);
+  backdrop-filter: blur(28px) saturate(140%);
+  -webkit-backdrop-filter: blur(28px) saturate(140%);
+}
+
+/* The accent-tinted variant, for the one element that should pull the eye. */
+@utility glass-accent {
+  background-color: oklch(0.815 0.055 86 / 9%);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid oklch(0.815 0.055 86 / 26%);
+  box-shadow:
+    inset 0 1px 0 0 oklch(0.815 0.055 86 / 14%),
+    0 18px 44px -22px oklch(0 0 0 / 85%);
+}
+
+@utility glow-accent {
+  box-shadow:
+    0 0 0 1px oklch(0.815 0.055 86 / 28%),
+    0 14px 40px -16px oklch(0.815 0.055 86 / 30%);
+}
+
+/* Champagne gradient text for the wordmark and headline numbers. */
+@utility text-accent-gradient {
+  background-image: linear-gradient(
+    100deg,
+    oklch(0.95 0.03 90) 0%,
+    oklch(0.815 0.055 86) 48%,
+    oklch(0.72 0.05 74) 100%
+  );
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+}
+
+/* Faint diagonal hatch, carried over from V1's repeating-linear-gradient.
+   Used sparingly — on empty states, so a blank panel is not a flat void. */
+@utility hatch {
+  background-image: repeating-linear-gradient(
+    135deg,
+    oklch(1 0 0 / 2.5%) 0px,
+    oklch(1 0 0 / 2.5%) 1px,
+    transparent 1px,
+    transparent 7px
+  );
+}
+
+/* ---------------------------------------------------------------------------
+   Motion
+--------------------------------------------------------------------------- */
+
+@keyframes smartdoc-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@utility animate-rise {
+  animation: smartdoc-rise 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Sweeping highlight for the "thinking" placeholder. Communicates work in
+   progress without pretending to know how far along it is. */
+@keyframes smartdoc-shimmer {
+  0% {
+    background-position: -180% 0;
+  }
+  100% {
+    background-position: 180% 0;
+  }
+}
+
+@utility shimmer-text {
+  background-image: linear-gradient(
+    100deg,
+    oklch(0.72 0.012 264) 34%,
+    oklch(0.94 0.03 88) 50%,
+    oklch(0.72 0.012 264) 66%
+  );
+  background-size: 220% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: smartdoc-shimmer 1.9s linear infinite;
+}
+
+/* The blinking block that trails an answer while it is still being revealed. */
+@keyframes smartdoc-caret {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  55%,
+  100% {
+    opacity: 0.15;
+  }
+}
+
+@utility caret-blink {
+  animation: smartdoc-caret 1s steps(1, end) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS documents (
     user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     filename   TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    size_bytes INTEGER,
     UNIQUE (user_id, filename)
 );
 
@@ -136,12 +137,21 @@ _SESSION_MIGRATIONS = (
     ("last_document", "TEXT"),
 )
 
+# ``size_bytes`` is nullable rather than ``DEFAULT 0``: a row written before this
+# column existed has an unknown size, and 0 would report it as empty. Callers
+# resolve NULL from the stored file on disk instead (see backend/documents.py).
+_DOCUMENT_MIGRATIONS = (("size_bytes", "INTEGER"),)
+
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
-    for column, ddl in _SESSION_MIGRATIONS:
-        if column not in existing:
-            conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {ddl}")
+    for table, migrations in (
+        ("sessions", _SESSION_MIGRATIONS),
+        ("documents", _DOCUMENT_MIGRATIONS),
+    ):
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, ddl in migrations:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def init_db(force: bool = False) -> None:
@@ -239,12 +249,21 @@ def link_google_sub(user_id: str, google_sub: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def upsert_document(user_id: str, filename: str, document_id: str | None = None) -> dict:
+def upsert_document(
+    user_id: str,
+    filename: str,
+    document_id: str | None = None,
+    size_bytes: int | None = None,
+) -> dict:
     """Get-or-create this user's row for ``filename``, returning it.
 
     Re-uploading a filename must reuse the same ``document_id``: the id is
     stamped into every chunk's metadata, and minting a new one would orphan the
     previous version's vectors from the row that owns them.
+
+    ``size_bytes`` is *updated* on an existing row rather than left alone, since
+    a re-upload replaces the stored bytes -- keeping the first version's size
+    would make the reported storage total drift from what is actually on disk.
     """
     init_db()
     with connect() as conn:
@@ -253,16 +272,24 @@ def upsert_document(user_id: str, filename: str, document_id: str | None = None)
             (user_id, filename),
         ).fetchone()
         if row:
-            return dict(row)
+            existing = dict(row)
+            if size_bytes is not None and existing.get("size_bytes") != size_bytes:
+                conn.execute(
+                    "UPDATE documents SET size_bytes = ? WHERE id = ?",
+                    (size_bytes, existing["id"]),
+                )
+                existing["size_bytes"] = size_bytes
+            return existing
         record = {
             "id": document_id or new_id(),
             "user_id": user_id,
             "filename": filename,
             "created_at": utc_now(),
+            "size_bytes": size_bytes,
         }
         conn.execute(
-            "INSERT INTO documents (id, user_id, filename, created_at)"
-            " VALUES (:id, :user_id, :filename, :created_at)",
+            "INSERT INTO documents (id, user_id, filename, created_at, size_bytes)"
+            " VALUES (:id, :user_id, :filename, :created_at, :size_bytes)",
             record,
         )
     return record
