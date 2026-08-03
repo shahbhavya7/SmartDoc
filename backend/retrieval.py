@@ -42,9 +42,11 @@ from rank_bm25 import BM25Okapi
 
 import backend.config as config
 from backend.query_analysis import (
+    CROSS_DOCUMENT,
     MODE_OUTLINE,
     MODE_PER_ENTITY,
     MODE_SWEEP,
+    MULTI_HOP,
     QueryPlan,
 )
 from backend.routing import (
@@ -711,14 +713,39 @@ def retrieve(
             scores, router_adjustment = refine_scores(
                 plan.question, scores, conversation_focus=conversation_focus
             )
-        routing = select_documents(
-            scores,
-            profile.max_documents,
-            gate=profile.restrict_documents,
-            drop_ratio=profile.doc_gate_ratio,
-        )
-        if routing.gated and routing.selected:
-            allowed = routing.selected
+
+        # Feature 5 (DOC_LOCK_ENABLED, default OFF): a HARD override, distinct
+        # from Feature 1's score nudge above. Skipped for multi_hop and
+        # cross_document -- their evidence lives in a document the user did not
+        # name by definition, and locking to the named document would delete
+        # the bridging passage exactly as ungated routing exists to prevent
+        # (see RetrievalProfile.restrict_documents on those two profiles).
+        locked_source = None
+        if config.DOC_LOCK_ENABLED and plan.query_type not in (MULTI_HOP, CROSS_DOCUMENT):
+            from backend.doc_router import detect_lock
+
+            locked_source = detect_lock(
+                plan.question, scores, conversation_focus=conversation_focus
+            )
+
+        if locked_source:
+            routing = RoutingDecision(
+                selected=[locked_source],
+                scores=scores,
+                excluded=[s.source for s in scores if s.source != locked_source],
+                gated=True,
+                reason=f"locked to '{locked_source}': named or focused, not a comparison",
+            )
+            allowed = [locked_source]
+        else:
+            routing = select_documents(
+                scores,
+                profile.max_documents,
+                gate=profile.restrict_documents,
+                drop_ratio=profile.doc_gate_ratio,
+            )
+            if routing.gated and routing.selected:
+                allowed = routing.selected
 
     where = _source_filter(allowed)
     mode = profile.mode

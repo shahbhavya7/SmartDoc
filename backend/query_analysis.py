@@ -267,6 +267,29 @@ _MULTI_HOP_RE = re.compile(
     re.I,
 )
 
+# Feature 7 (PLANNER_INTENT_EXPANSION_ENABLED) -- naming a whole-document
+# artifact type is treated as asking about the WHOLE document, even without an
+# explicit "summarize"/"overview" cue that _SYNTHESIS_RE requires. "What's in
+# the onboarding guide?" and "walk me through the vendor SOP" both name an
+# artifact rather than a fact, so a plain lookup profile under-retrieves them.
+_ARTIFACT_WIDE_RE = re.compile(
+    r"\b(guide|playbook|checklist|manual|sop|onboarding|policy|journey|"
+    r"timeline)\b",
+    re.I,
+)
+
+# Feature 8 (EXHAUSTIVE_TRIGGER_ENABLED) -- a hard override applied AFTER
+# classification, unlike _EXHAUSTIVE_RE above which only gates the fast
+# heuristic path (skipped whenever the LLM classifier runs, which is most
+# non-trivial questions). "everything" is added as its own alternative: \bevery\b
+# requires a word boundary right after "every", which "everything" does not
+# have, so "everything provided" was previously invisible to this signal.
+_FORCE_EXHAUSTIVE_RE = re.compile(
+    r"\b(all|every|each|everything|list|enumerate|complete list|full list|"
+    r"group all)\b",
+    re.I,
+)
+
 # Rare, high-signal tokens that dense embeddings handle poorly: fault codes,
 # standards, tiers, versions. These are where keyword search wins.
 _RARE_TOKEN_RE = re.compile(
@@ -514,19 +537,70 @@ def _classify_with_llm(question: str) -> dict | None:
     }
 
 
+def _apply_lexical_overrides(plan: QueryPlan) -> QueryPlan:
+    """Apply Features 7/8's post-classification overrides, both OFF by default.
+
+    Runs at every ``analyze()`` return point -- including the fast heuristic
+    path -- rather than living inside ``heuristic_type()``, because that
+    function only gates the fast path and the FALLBACK branch; the common case
+    for any non-trivial question is the LLM classifier, whose result these
+    flags need to override too, not just the heuristic's.
+
+    Order: exhaustive first, since a question can contain both an artifact
+    word and an exhaustiveness marker ("list every SOP requirement"), and
+    completeness is the stronger of the two claims -- upgrading to synthesis
+    afterward would be a downgrade.
+    """
+    question = plan.question
+    if (
+        config.EXHAUSTIVE_TRIGGER_ENABLED
+        # Only upgrades FROM a plain lookup/procedure, exactly like Feature 7
+        # below -- never downgrades a classification that already carries its
+        # own, different retrieval requirement. Measured without this guard:
+        # forcing the exhaustive profile's gated sweep (restrict_documents=True,
+        # max_documents=2) onto a MEASURED, REPRODUCIBLE cross_document question
+        # ("xdoc-leave-across-policies") that needs cross_document's deliberately
+        # UNGATED retrieval broke it outright, and onto a synthesis question
+        # ("syn-leave-overview") that needs outline mode's section breadth
+        # produced a less complete answer. Comparison and multi_hop are excluded
+        # for the identical reason Feature 5's lock excludes them (see
+        # backend.doc_router.detect_lock): their evidence needs a strategy this
+        # override does not provide.
+        and plan.query_type in (FACT_LOOKUP, PROCEDURAL)
+        and _FORCE_EXHAUSTIVE_RE.search(question)
+    ):
+        plan.query_type = EXHAUSTIVE
+        plan.profile = PROFILES[EXHAUSTIVE]
+        plan.classified_by += "+exhaustive_trigger"
+        return plan
+
+    if (
+        config.PLANNER_INTENT_EXPANSION_ENABLED
+        and plan.query_type in (FACT_LOOKUP, PROCEDURAL)
+        and _ARTIFACT_WIDE_RE.search(question)
+    ):
+        plan.query_type = SYNTHESIS
+        plan.profile = PROFILES[SYNTHESIS]
+        plan.classified_by += "+artifact_expansion"
+
+    return plan
+
+
 def analyze(question: str, use_llm: bool | None = None) -> QueryPlan:
     """Analyse ``question`` and return its retrieval plan."""
     question = question.strip()
     lexical_keywords = extract_keywords(question)
 
     if _looks_simple(question):
-        return QueryPlan(
-            question=question,
-            query_type=FACT_LOOKUP,
-            sub_queries=[question],
-            keywords=lexical_keywords,
-            profile=PROFILES[FACT_LOOKUP],
-            classified_by="heuristic",
+        return _apply_lexical_overrides(
+            QueryPlan(
+                question=question,
+                query_type=FACT_LOOKUP,
+                sub_queries=[question],
+                keywords=lexical_keywords,
+                profile=PROFILES[FACT_LOOKUP],
+                classified_by="heuristic",
+            )
         )
 
     allow_llm = config.ENABLE_DECOMPOSITION if use_llm is None else use_llm
@@ -565,23 +639,25 @@ def analyze(question: str, use_llm: bool | None = None) -> QueryPlan:
                 for k in result["keywords"]
                 if k.lower() not in {x.lower() for x in lexical_keywords}
             ]
-            return QueryPlan(
-                question=question,
-                query_type=query_type,
-                sub_queries=queries,
-                keywords=merged,
-                profile=profile,
-                classified_by="llm",
-                subtopics=subtopics,
-                entities=entities,
+            return _apply_lexical_overrides(
+                QueryPlan(
+                    question=question,
+                    query_type=query_type,
+                    sub_queries=queries,
+                    keywords=merged,
+                    profile=profile,
+                    classified_by="llm",
+                    subtopics=subtopics,
+                    entities=entities,
+                )
             )
 
     fallback = heuristic_type(question) or FACT_LOOKUP
-    return QueryPlan(
+    return _apply_lexical_overrides(QueryPlan(
         question=question,
         query_type=fallback,
         sub_queries=[question],
         keywords=lexical_keywords,
         profile=PROFILES[fallback],
         classified_by="fallback",
-    )
+    ))

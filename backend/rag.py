@@ -154,6 +154,12 @@ in the context, do not state a figure.
 citations are attached separately by the system.
 - Answer naturally, without phrases like "the context says".
 
+Conversation memory:
+- You may be given a short summary of this conversation's earlier turns. Use \
+it ONLY to resolve references in the question (pronouns, "that policy", "the \
+same band") -- never as a source of facts. Every factual claim must still come \
+from the context passages below, even if the summary already states it.
+
 How much to answer:
 - If the context fully answers the question, answer it completely.
 - If the context answers PART of the question, answer that part, then add one \
@@ -215,10 +221,24 @@ def _system_prompt(plan: QueryPlan) -> str:
     return f"{_BASE_RULES}\n\n{_TYPE_RULES.get(plan.query_type, '')}".strip()
 
 
-def build_prompt(question: str, context: AssembledContext) -> str:
-    """Assemble the user turn: labelled context, then the question."""
+def build_prompt(
+    question: str, context: AssembledContext, conversation_context: str | None = None
+) -> str:
+    """Assemble the user turn: conversation memory, labelled context, question.
+
+    ``conversation_context`` (a per-session running summary) is placed BEFORE
+    the retrieved context and labelled distinctly from it, so the system
+    prompt's "memory resolves references, never supplies facts" rule has a
+    visibly separate block to point at rather than an ambiguous blend.
+    """
     body = context.text or "(no relevant context retrieved)"
+    memory_block = (
+        f"Conversation memory (for resolving references only):\n{conversation_context}\n\n"
+        if conversation_context
+        else ""
+    )
     return (
+        f"{memory_block}"
         f"Context passages:\n\n{body}\n\n"
         f"Question: {question}\n\n"
         "Answer using only the context above."
@@ -569,6 +589,21 @@ def _repair_is_safe(original: str, repaired: str, context_text: str) -> bool:
     return not lost
 
 
+def _fence_unsupported(answer: str, unsupported: list[str]) -> str:
+    """Append a visibly separate note naming what the answer text does NOT verify.
+
+    The answer's own prose is left untouched -- it still reads as a normal
+    answer -- but a clearly delimited block follows it, so a reader (or a UI
+    that renders `answer` as-is) cannot mistake the unverified claim for a
+    grounded one. This is the fallback for exactly the case where deleting the
+    claim would also delete something supported: fencing keeps the supported
+    majority of the answer AND is explicit about the part that is not verified,
+    rather than choosing silently between the two.
+    """
+    claims = "; ".join(unsupported)
+    return f"{answer.strip()}\n\n[Unverified -- not confirmed by the documents: {claims}]"
+
+
 def enforce_grounding(
     question: str,
     answer: str,
@@ -638,14 +673,21 @@ def enforce_grounding(
         original_answer, pruned, context_text
     ):
         # Even sentence surgery would cost supported information: the unsupported
-        # claim shares a sentence with a supported fact. Returning the original
-        # with the flag visible is more useful than a quieter, less complete
-        # answer -- the caller can see exactly which claim is unverified.
+        # claim shares a sentence with a supported fact. Historically this
+        # returned the ORIGINAL answer unchanged, with the flag visible only in
+        # `grounding.unsupported_claims` -- a caller that renders `answer` alone
+        # (as the Streamlit/Next.js client does) shows the unverified content as
+        # plain, confident prose. Feature 6 fences it in the visible text itself
+        # instead of only in metadata a UI might not surface.
         grounding.note = (
             "Contains an unsupported claim that could not be removed without also "
             "losing supported detail; the flagged claim is listed."
         )
         grounding.repaired = "declined"
+        if config.PARTIAL_ANSWER_FENCING_ENABLED:
+            fenced = _fence_unsupported(original_answer, unsupported)
+            grounding.repaired = "fenced"
+            return fenced, grounding
         return original_answer, grounding
 
     if _is_refusal(pruned):
@@ -684,10 +726,19 @@ def query(
     persist_directory=None,
     embed_fn=None,
     conversation_focus: str | None = None,
+    conversation_context: str | None = None,
     _allow_escalation: bool = True,
     _force_type: str | None = None,
 ) -> RagResponse:
     """Answer ``question`` with adaptive, intent-aware retrieval-augmented generation.
+
+    Args:
+        conversation_focus: filename of the document last discussed in this
+            session, used only by the optional document-routing signals/lock.
+        conversation_context: a per-session running summary (see
+            ``backend.memory``), inserted into the GENERATION prompt only --
+            never into retrieval -- so a follow-up's pronouns resolve without
+            retrieval quality depending on how well summarization went.
 
     Raises:
         InvalidQuestionError: blank or whitespace-only question.
@@ -820,7 +871,10 @@ def query(
                         else _system_prompt(plan)
                     ),
                 },
-                {"role": "user", "content": build_prompt(question, context)},
+                {
+                    "role": "user",
+                    "content": build_prompt(question, context, conversation_context),
+                },
             ],
         )
         answer_text = (completion.choices[0].message.content or "").strip()
@@ -883,6 +937,7 @@ def query(
             persist_directory=persist_directory,
             embed_fn=embed_fn,
             conversation_focus=conversation_focus,
+            conversation_context=conversation_context,
             _allow_escalation=False,
             _force_type=MULTI_HOP,
         )

@@ -522,3 +522,242 @@ unauthenticated and now receives 401s. Expected: the phase brief anticipates
 single-user behaviour breaking, and Streamlit is replaced by the Next.js client
 in a later phase. The eval harness in `scripts/` calls the pipeline in-process
 with no scope bound, so it continues to run against the full corpus.
+
+## Part 6 — Phase 2: conversational memory and orchestration upgrades
+
+The retrieval stack — dense, BM25, RRF, reranking, the adaptive modes,
+grounding — is unchanged again this phase. Everything below either sits
+strictly above it (session memory) or is a bounded, flag-gated override applied
+before or after it (Part B).
+
+### Part A — per-session memory
+
+**E1. The summary replaces the transcript as what feeds the next turn.**
+`sessions.summary` is a single condensed paragraph, rewritten on every turn by
+one `UTILITY_MODEL` call that reads the OLD summary and the LATEST turn and
+returns a new, bounded (`MAX_SUMMARY_CHARS` = 800) summary — not an append.
+Storing and re-sending the raw transcript would grow the prompt without bound
+and dilute it with small talk; asking the model to re-condense every time is
+what keeps the result a fixed, small cost regardless of session length, with no
+separate truncation logic needed.
+
+**E2. Memory resolves references; it does not supply facts.** The summary is
+inserted into the GENERATION prompt only, in a block labelled "Conversation
+memory (for resolving references only)", and the system prompt is told
+explicitly to use it only for pronouns/references and never as a source of
+claims — every factual statement must still come from the retrieved context.
+Without this split, a wrong or stale summary line becomes a fact the model
+repeats, which defeats the whole "answer only from retrieved context"
+guarantee (locked decision, Part 1).
+
+Retrieval itself is NOT given the summary text. Only `conversation_focus` (the
+filename most recently cited) reaches retrieval, through the SAME parameter
+Feature 1 already used — deliberately not a new lever, so a follow-up's
+retrieval quality does not depend on how well summarization went, only on
+which document was last discussed.
+
+**E3. `last_document` is set synchronously; the summary is not.** After an
+answer, `sessions.last_document` is written immediately from
+`response.sources[0].source` — a plain field assignment, no LLM call, so it
+costs nothing on the request path. Only the summary needs an LLM round trip,
+and that is the one thing deferred to the background task.
+
+**E4. NO-LAG is `BackgroundTasks`, not a bespoke thread.** FastAPI's
+`BackgroundTasks` are documented to run only after the response has been sent;
+using it rather than hand-rolling `asyncio.create_task` keeps the guarantee
+attached to a well-tested primitive instead of new concurrency code with its
+own failure modes. Verified two ways:
+
+* Empirically, against a live `uvicorn` server (not the in-process
+  `TestClient`, which awaits background tasks as part of the same call and so
+  cannot distinguish "before" from "after" the response): median latency
+  stateless vs. a session's later turns differed by **+312ms** against a
+  ~3000ms run-to-run noise floor on this corpus — not the several-hundred-ms-to-
+  seconds cost an inline summarization call would add. Script:
+  `scripts/measure_memory_latency.py`.
+* The stored summary was independently confirmed to exist after the request
+  returned, proving the background call genuinely ran rather than merely being
+  scheduled and dropped.
+
+**E5. A background task's exceptions are not swallowed by the framework —
+proven, not assumed.** A test with an unsafe stand-in task showed Starlette
+propagating a background task's exception straight through the request
+(`test_background_task_exception_is_not_swallowed_by_starlette`). The actual
+scheduled function, `backend.memory.summarize_turn_and_store`, therefore wraps
+its own body in `try/except Exception: logger.exception(...)` — the safety net
+has to be the callee's, because nothing upstream provides one. A failed
+summarization degrades to "this turn wasn't remembered", never a 500.
+
+**E6. Sidebar ordering is "last active", not "last created".** `GET /sessions`
+(default `limit=10`) orders by `COALESCE(MAX(messages.created_at),
+sessions.created_at)` — a session replied to five minutes ago outranks one
+created an hour ago with no reply. A dedicated `last_activity` column, updated
+on every message insert, was rejected: at this schema's scale a `LEFT JOIN` +
+`GROUP BY` over the existing `idx_messages_session` index is already fast and
+needs no write-path bookkeeping to keep in sync.
+
+**Bug found and fixed while building this.** `messages` were ordered by
+`(created_at, id)`. `created_at` has second resolution, and a question and its
+own answer are routinely stored within the same second — at which point `id`
+(a random UUID) decided the order, silently reversing a real turn roughly half
+the time. Reordered to `(created_at, rowid)`: SQLite's implicit, monotonically
+increasing insertion-order column, which needed no schema change. Caught by a
+Phase 2 test asserting message order, not by anything in Phase 1, which only
+asserted message *count*.
+
+### Part B — orchestration upgrades (each flag OFF by default)
+
+**E7. Feature 5, document lock, is a new binary decision, not a bigger
+Feature-1 weight.** Feature 1 (`ROUTER_ENABLED`) already nudges a document's
+*score*, bounded by `ROUTER_SIGNAL_WEIGHT` and floor-protected by
+`ROUTER_PROTECT_RATIO` specifically so it can never overturn strong retrieval
+evidence. A genuine lock needs the opposite property on the cases it fires for:
+when the user names one document, or refers to "this document" with a
+conversation focus already established, retrieval should restrict to exactly
+that document regardless of the ratio-based gate — a user's explicit reference
+outranks a similarity score. `backend.doc_router.detect_lock` is therefore a
+separate, conservative decision function, not a tuning of Feature 1's weight:
+
+* Fires only when the question reads as ambiguous-free — exactly one scored
+  document's title/filename terms are a subset of the question's terms, or a
+  bare reference resolves to an existing `conversation_focus`. Naming two
+  documents, or naming none with no focus set, does not lock.
+* Never fires on a question that reads as a comparison (`_COMPARE_INTENT_RE`):
+  locking during "compare X and Y" would silently drop the second side, which
+  is the exact failure the per-entity retrieval mode exists to prevent.
+* Never fires for `multi_hop`/`cross_document` intents, whose evidence lives in
+  a document the user did not name by definition (Part 3, C7's
+  `CROSS_DOC_RESERVE_SLOTS` exists for exactly this reason) — locking there
+  would delete the bridging passage.
+* When it fires, `CROSS_DOC_RESERVE_SLOTS` still runs against the locked
+  document exactly as it does against a routing-gated one, so the same safety
+  valve against misclassification applies.
+
+**E8. Feature 6, partial-answer fencing, targets a real visibility gap, not a
+missing behaviour.** The base prompt already tells the model to answer the
+answerable part and name what's missing (Part 1's graded-refusal design, C12).
+The gap was narrower and one level lower: when `enforce_grounding` finds an
+unsupported claim that shares a sentence with a supported one, pruning would
+cost the supported content, so remediation "declines" and returns the ORIGINAL
+answer — with the unverified claim visible only in
+`grounding.unsupported_claims`, metadata a UI is not guaranteed to render. With
+the flag on, that specific path appends a clearly delimited
+`[Unverified — not confirmed by the documents: ...]` block to the answer TEXT
+itself. The prose is untouched — still a normal-looking answer — but a caller
+that only renders `answer` can no longer mistake the flagged claim for a
+grounded one. Scoped to exactly the "declined" branch: it changes nothing for
+an answer that verifies cleanly or repairs cleanly.
+
+**E9. Feature 7 (planner intent expansion) and Feature 8 (exhaustive trigger)
+are post-classification overrides, not new heuristic-path signals.** The
+existing `heuristic_type()` regexes (`_SYNTHESIS_RE`, `_EXHAUSTIVE_RE`) only
+gate the FAST heuristic path and the fallback — the common case for any
+non-trivial question is the LLM classifier, which never consults them. Adding
+these signals there would have no effect on most real questions. Both
+features are instead applied by `_apply_lexical_overrides`, called at every
+`analyze()` return site (fast path, LLM path, and fallback alike), so they can
+override what the classifier decided:
+
+* Feature 7 upgrades `fact_lookup`/`procedural` to the `synthesis` profile
+  (outline mode) when the question names a whole-document artifact type
+  (guide, playbook, checklist, manual, SOP, onboarding, policy, journey,
+  timeline) — "what's in the onboarding guide?" names an artifact rather than a
+  fact, and a plain-lookup profile under-retrieves it. Never downgrades a type
+  already scored as something more specific (comparison, multi-hop,
+  exhaustive, cross-document, synthesis itself).
+* Feature 8 forces the `exhaustive` profile (a full sweep) on "all X", "every
+  X", or "everything" regardless of classification, and is checked FIRST — a
+  question can trip both regexes ("list every SOP requirement"), and
+  completeness is the stronger of the two claims, so upgrading to synthesis
+  afterward would be a downgrade.
+* Neither feature re-runs LLM decomposition for the upgraded type: `sub_queries`
+  keeps whatever the original classification produced (typically just the bare
+  question), and `retrieve()`'s `plan.sub_queries or [plan.question]` fallback
+  already handles that — the retrieval MODE changes (outline/sweep instead of
+  focused), which is what each feature is actually for, even without the
+  extra decomposed sub-queries a full synthesis/exhaustive classification
+  would have produced.
+
+**Measurement.** `scripts/eval_feature.py` already existed for exactly this
+purpose (flag OFF vs. flag ON over the labelled gold set, regression as a
+non-zero exit code) — no new harness was built. Results for all four Part B
+flags, full 30-question gold set, both passes:
+
+| Feature | Answer correctness | Retrieval precision | Faithfulness | Median latency | Verdict |
+|---|---|---|---|---|---|
+| `DOC_LOCK_ENABLED` | 0.852 → 0.852 (=) | 0.622 → 0.618 (−0.004) | 0.962 → 0.926 (−0.036) | 7719 → 7180ms (−540) | **No regressions** |
+| `PARTIAL_ANSWER_FENCING_ENABLED` | 0.889 → 0.889 (=) | 0.663 → 0.640 (−0.023) | 1.000 → 1.000 (=) | 8992 → 8193ms (−799) | **No regressions** (2nd run) |
+| `PLANNER_INTENT_EXPANSION_ENABLED` | 0.889 → 0.852 (−0.037) | 0.621 → 0.579 (−0.042) | 1.000 → 1.000 (=) | 7866 → 8423ms (+558) | 1 flagged, did not reproduce |
+| `EXHAUSTIVE_TRIGGER_ENABLED` | 0.889 → 0.815 (−0.074)* | 0.613 → 0.577 (−0.036)* | 0.963 → 0.963 (=) | 8919 → 7990ms (−929) | 1 flagged, does not reproduce |
+
+\* First measurement, before a fix described below; see that row's note.
+
+**Every flag was run through `scripts/eval_feature.py` at least twice** (the
+full 30-question gold set, both passes), because the first pass surfaced a
+real methodological problem: this corpus contains at least two questions —
+`hop-northwind-review` and `exh-tier3-vendors` — whose correctness varies
+run-to-run at temperature 0, independent of any flag. Proven by running each
+flagged question several times, flag OFF and flag ON, outside the paired
+harness: `hop-northwind-review` was wrong on an OFF run and right on the
+matching ON run in one probe, then wrong on ON and right on OFF in a *later,
+unrelated* flag's run. A single paired OFF/ON comparison cannot tell that
+apart from a real regression; repeating the comparison can. **This is a gap in
+the harness at n=30 with single-sample passes, not a property of any Part B
+feature** — worth fixing in the harness itself (repeated sampling on
+borderline questions) before trusting a single `eval_feature` run on a
+near-tied result.
+
+**`DOC_LOCK_ENABLED` (Feature 5).** Clean on the first run: zero questions
+flipped from correct to wrong. Faithfulness dipped slightly (0.962→0.926) with
+no matching correctness loss — the questions affected were already answered
+correctly either way; locking changed which passages were read without
+changing the answer. Latency improved (candidates narrow to one document
+instead of running the ratio-gate's document scoring against every
+candidate). **Shippable behind its flag.**
+
+**`PARTIAL_ANSWER_FENCING_ENABLED` (Feature 6).** The first run flagged two
+questions (`hop-northwind-review`, `hop-medical-records-mfa`) flipping from a
+correct answer to the literal refusal string. This did not reproduce on a
+second full run (clean), and does not reproduce in isolation: repeatedly
+calling `evaluate_question` for both, flag OFF and ON, in the same process
+found `hop-medical-records-mfa` correct in both states every time, and
+`hop-northwind-review` failing via `grounding.repaired == "regenerated"` (an
+entirely different code path than this feature touches) on an OFF run. This
+matches the code: `_fence_unsupported` only appends text inside the single
+"declined" branch of `enforce_grounding`, is only reachable when
+`grounding.faithful is False`, and always returns non-refusal text — there is
+no path from this feature to `_is_refusal(answer_text)` becoming true.
+**Shippable behind its flag.**
+
+**`PLANNER_INTENT_EXPANSION_ENABLED` (Feature 7).** Two separate runs each
+flagged exactly one question, and it was a DIFFERENT question each time
+(`exh-tier3-vendors`, then `hop-northwind-review`) — the second of which the
+feature's own guard (`plan.query_type in (FACT_LOOKUP, PROCEDURAL)`) makes
+structurally impossible to affect, since that question classifies as
+`multi_hop`. Both are consistent with corpus noise, not a causal defect. No
+structural mechanism by which this feature could cause either failure was
+found. **Provisionally shippable behind its flag** — re-measure before
+enabling by default in any environment, given the corpus's noise floor.
+
+**`EXHAUSTIVE_TRIGGER_ENABLED` (Feature 8) — a real bug, found and fixed.**
+Unlike the other three, the first run's regressions had a clear, reproducible,
+structural cause: the override had no type guard, so it forced the exhaustive
+profile's GATED sweep (`restrict_documents=True, max_documents=2`) onto
+`syn-leave-overview` (needs `synthesis`'s outline breadth) and
+`xdoc-leave-across-policies` (needs `cross_document`'s deliberately UNGATED
+retrieval — the same reason Feature 5's lock excludes it, see E7 above). Both
+regressed identically on a second, independent run — reproducible, not noise.
+**Fixed** by adding the same guard Feature 7 already had:
+`plan.query_type in (FACT_LOOKUP, PROCEDURAL)`, so the override can no longer
+touch a question already classified as something needing a different
+strategy. Re-measured after the fix: both structural regressions are gone; the
+sole remaining flagged question (`exh-tier3-vendors`) is one of the two
+identified noisy questions above, and shows wrong under BOTH flag states in
+isolation testing (not a flip caused by this feature). **Shippable behind its
+flag, with the guard.**
+
+No flag's default changed as a result of any of this: Part B's rule is OFF by
+default regardless of measurement, since the point of the flag is to keep the
+system revertible to known-good, not to promote a feature once it measures
+clean. Raw output for every run: `eval/phase2/*.log` and `*.json`
+(git-ignored, like the rest of `eval/`).

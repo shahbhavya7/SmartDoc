@@ -262,3 +262,66 @@ def refine_scores(
         s for s, _ in adjustment.after
     ]
     return refined, adjustment
+
+
+# ---------------------------------------------------------------------------
+# Feature 5 -- hard document lock (DOC_LOCK_ENABLED)
+# ---------------------------------------------------------------------------
+
+# Comparison intent always wins over a lock: locking to one document during a
+# comparison would silently drop the second side, which is the exact failure
+# the per-entity retrieval mode exists to prevent.
+_COMPARE_INTENT_RE = re.compile(
+    r"\b(compar\w*|differ\w*|versus|vs\.?|difference between|both (?:documents|"
+    r"policies|handbooks)|reconcile|across (?:all|our|the) (?:documents|"
+    r"policies))\b",
+    re.I,
+)
+
+
+def detect_lock(
+    question: str,
+    scores: list[DocumentScore],
+    conversation_focus: str | None = None,
+) -> str | None:
+    """Return the one document retrieval must restrict to, or None.
+
+    Unlike :func:`refine_scores`, which only nudges a document's score, this
+    makes a binary decision to gate retrieval to exactly one document -- so it
+    is deliberately conservative about when it fires:
+
+    * Never when the question reads as a comparison (``_COMPARE_INTENT_RE``):
+      the user asking to compare two things is the one case where narrowing to
+      a single document is certainly wrong.
+    * Only when EXACTLY ONE scored document's title/filename terms are a
+      subset of the question's terms -- naming two documents, or naming none,
+      must not lock, since a lock is only justified by lack of ambiguity.
+    * A bare reference ("this document", "the policy above") with no name in
+      the question locks only onto an existing ``conversation_focus`` --
+      resolving "this" to a document neither named nor previously discussed
+      would be a guess, not a lock.
+
+    Returns the document's source filename, so the caller can build a
+    ``RoutingDecision`` that overrides the ratio-based gate entirely -- a lock
+    is not "kept because it scored well", it is kept because the user pointed
+    at it.
+    """
+    if not scores or _COMPARE_INTENT_RE.search(question):
+        return None
+
+    question_terms = _terms(question)
+    named = [
+        doc.source
+        for doc in scores
+        if (title_terms := _terms(doc.doc_title) | _filename_terms(doc.source))
+        and title_terms <= question_terms
+    ]
+    if len(named) == 1:
+        return named[0]
+    if named:
+        return None  # more than one document named: ambiguous, do not lock
+
+    if conversation_focus and _EXPLICIT_REFERENCE_RE.search(question):
+        if any(doc.source == conversation_focus for doc in scores):
+            return conversation_focus
+    return None

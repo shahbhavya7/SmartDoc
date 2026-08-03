@@ -50,7 +50,7 @@ from typing import Literal
 
 import openai
 import uvicorn
-from fastapi import Depends, FastAPI, File, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -68,6 +68,7 @@ from backend.auth import (
 )
 from backend.config import MAX_QUESTION_CHARS, MAX_UPLOAD_MB, PROJECT_ROOT
 from backend.ingestion import PDFReadError
+from backend.memory import summarize_turn_and_store
 from backend.rag import GenerationError, InvalidQuestionError, RagError, query
 from backend.user_scope import ScopeError, user_scope
 from backend.vectorstore import VectorStoreError, collection_stats, get_chunks_where
@@ -170,6 +171,16 @@ class AskRequest(BaseModel):
         ),
         examples=["How many days of annual leave do I get?"],
     )
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "A chat session owned by the caller (see POST /sessions). When set, "
+            "the question and answer are stored as that session's next turn, the "
+            "session's running summary is used to resolve references in the "
+            "question, and the summary is updated afterward in the background. "
+            "Omit for a stateless, un-remembered question."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -220,6 +231,9 @@ class AskResponse(BaseModel):
     grounding: GroundingModel | None = None
     diagnostics: dict | None = Field(
         default=None, description="Routing, retrieval, and latency diagnostics."
+    )
+    session_id: str | None = Field(
+        default=None, description="Echoed back when the request named a session."
     )
 
     model_config = {
@@ -347,6 +361,12 @@ class SessionModel(BaseModel):
     id: str
     title: str
     created_at: str
+    summary: str = Field(
+        default="", description="Running conversation summary (see backend/memory.py)."
+    )
+    last_document: str | None = Field(
+        default=None, description="Filename last discussed in this session, if any."
+    )
 
 
 class MessageCreateRequest(BaseModel):
@@ -796,24 +816,74 @@ async def upload(
         "`sources` list instead of guessing. Answers whose claims fail "
         "verification are repaired or withdrawn, never returned as-is. "
         f"Questions over {MAX_QUESTION_CHARS} characters are rejected. "
-        "Retrieval covers ONLY the signed-in user's documents."
+        "Retrieval covers ONLY the signed-in user's documents.\n\n"
+        "Passing `session_id` turns this into a remembered turn: the question "
+        "and answer are stored in that session, the session's running summary "
+        "is used to resolve references (\"that policy\", \"the same band\"), and "
+        "the summary is updated by a background task AFTER this response is "
+        "sent -- summarization never adds to this call's latency."
     ),
+    responses={404: {"model": ErrorResponse}},
 )
-def ask(payload: AskRequest, user_id: str = Depends(get_current_user_id)) -> AskResponse:
-    """Answer ``payload.question`` over this user's documents only."""
+def ask(
+    payload: AskRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+) -> AskResponse | JSONResponse:
+    """Answer ``payload.question``, optionally as a turn in ``payload.session_id``."""
     question = payload.question
     if len(question) > MAX_QUESTION_CHARS:
         raise QuestionTooLongError(
             f"Question is {len(question)} characters, which exceeds the "
             f"{MAX_QUESTION_CHARS}-character limit. Please shorten it."
         )
+
+    session = None
+    if payload.session_id is not None:
+        session = db.get_session(user_id, payload.session_id)
+        if session is None:
+            return JSONResponse(
+                status_code=404, content=_error_body("not_found", "No such session.")
+            )
+        # Stored before generation runs: a session's memory must include the
+        # user's own question even if generation then fails.
+        db.add_message(user_id, session["id"], "user", question)
+
     # The scope is bound around the whole pipeline rather than passed into it:
     # retrieval is final code and takes no user argument, and binding here means
     # every store read it makes -- dense, BM25, routing, neighbour and parent
     # expansion -- is filtered without any of those modules being modified.
     with user_scope(user_id):
         # Blank questions raise InvalidQuestionError inside query() itself.
-        return AskResponse(**query(question).to_dict())
+        response = query(
+            question,
+            conversation_context=session["summary"] if session else None,
+            conversation_focus=session["last_document"] if session else None,
+        )
+
+    if session is not None:
+        db.add_message(user_id, session["id"], "assistant", response.answer)
+        if response.sources:
+            # Synchronous and free of any LLM call, so it costs nothing on the
+            # request's critical path; only the summary text needs the
+            # background round-trip to an LLM.
+            db.update_session_memory(
+                user_id, session["id"], last_document=response.sources[0].source
+            )
+        # Scheduled via BackgroundTasks, which Starlette runs only AFTER the
+        # response has been sent -- this is the NO-LAG gate. See
+        # backend/memory.py's module docstring and
+        # scripts/measure_memory_latency.py for the empirical check.
+        background_tasks.add_task(
+            summarize_turn_and_store,
+            user_id,
+            session["id"],
+            session["summary"],
+            question,
+            response.answer,
+        )
+
+    return AskResponse(**response.to_dict(), session_id=session["id"] if session else None)
 
 
 # --------------------------------------------------------------------------
@@ -888,8 +958,10 @@ def delete_document(
 # --------------------------------------------------------------------------
 # Chat sessions and messages
 #
-# Phase 1 delivers the storage and its isolation; the chat flow that uses them
-# lands in a later phase.
+# Memory is strictly per-session: a new session's `summary` starts '' and its
+# `last_document` starts unset, so a fresh chat window has no memory of any
+# other session. POST /ask (above) is where a session actually accrues memory;
+# these endpoints create, list, and read what it accrued.
 # --------------------------------------------------------------------------
 
 
@@ -901,10 +973,21 @@ def create_session(
     return SessionModel(**db.create_session(user_id, payload.title))
 
 
-@app.get("/sessions", response_model=list[SessionModel],
-         summary="List the signed-in user's chat sessions")
-def list_sessions(user_id: str = Depends(get_current_user_id)) -> list[SessionModel]:
-    return [SessionModel(**row) for row in db.list_sessions(user_id)]
+@app.get(
+    "/sessions",
+    response_model=list[SessionModel],
+    summary="The signed-in user's most recently active chat sessions",
+    description=(
+        "For the sidebar: the last `limit` sessions (default 10), most recently "
+        "ACTIVE first -- a session's newest message time, falling back to its "
+        "creation time if it has none yet. One indexed SQLite query; no vector "
+        "store access."
+    ),
+)
+def list_sessions(
+    limit: int = 10, user_id: str = Depends(get_current_user_id)
+) -> list[SessionModel]:
+    return [SessionModel(**row) for row in db.list_sessions(user_id, limit=limit)]
 
 
 @app.delete("/sessions/{session_id}", summary="Delete a session and its messages")

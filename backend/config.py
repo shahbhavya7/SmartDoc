@@ -225,6 +225,33 @@ PLANNER_ENABLED = _bool("PLANNER_ENABLED", False)
 OUTLINE_SYNTHESIS_ENABLED = _bool("OUTLINE_SYNTHESIS_ENABLED", False)
 
 # ---------------------------------------------------------------------------
+# Phase 2, Part B -- further orchestration features. Same rule as above: OFF by
+# default, measured flag-ON vs flag-OFF on the gold set before being trusted.
+# ---------------------------------------------------------------------------
+
+# Feature 5: hard-lock retrieval to a single named/focused document instead of
+# merely biasing toward it (Feature 1/ROUTER_ENABLED). Never applied to
+# multi_hop or cross_document questions -- see backend/doc_router.detect_lock.
+DOC_LOCK_ENABLED = _bool("DOC_LOCK_ENABLED", False)
+
+# Feature 6: when a grounding failure can't be safely repaired without losing
+# supported content, visibly fence the unverified part in the answer text
+# itself instead of returning the flagged answer unmarked to the reader.
+PARTIAL_ANSWER_FENCING_ENABLED = _bool("PARTIAL_ANSWER_FENCING_ENABLED", False)
+
+# Feature 7: a question naming a whole-document artifact (guide, playbook,
+# checklist, manual, SOP, onboarding, policy, journey, timeline) is upgraded to
+# the synthesis profile (outline mode) even when otherwise classified as a
+# plain lookup or procedure.
+PLANNER_INTENT_EXPANSION_ENABLED = _bool("PLANNER_INTENT_EXPANSION_ENABLED", False)
+
+# Feature 8: "every X", "all X", or "everything" upgrades a fact_lookup/
+# procedural classification to the exhaustive profile (a full sweep). Does NOT
+# override comparison, multi_hop, synthesis, or cross_document -- measured to
+# regress both a synthesis and a cross_document question when it did.
+EXHAUSTIVE_TRIGGER_ENABLED = _bool("EXHAUSTIVE_TRIGGER_ENABLED", False)
+
+# ---------------------------------------------------------------------------
 # V2 -- relational store, authentication, and per-user isolation
 #
 # SQLite owns every relational entity (users, documents, sessions, messages);

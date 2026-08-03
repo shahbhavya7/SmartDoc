@@ -82,6 +82,44 @@ Use the returned `access_token` as `Authorization: Bearer <token>` on `/upload`,
 `/auth/google/login` once `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` are set;
 without them, only those two routes are disabled.
 
+## Chat sessions and memory (V2 Phase 2)
+
+`POST /ask` is stateless unless you pass a `session_id` from `POST /sessions`:
+
+```bash
+TOKEN=...  # from /auth/login
+SESSION=$(curl -s -X POST localhost:8000/sessions \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"title":"leave questions"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+curl -s -X POST localhost:8000/ask -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"question\":\"How many days of annual leave do Standard band employees get?\",\"session_id\":\"$SESSION\"}"
+
+# a follow-up in the SAME session resolves the reference via the running summary
+curl -s -X POST localhost:8000/ask -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"question\":\"And the Executive band?\",\"session_id\":\"$SESSION\"}"
+```
+
+`GET /sessions` (default `limit=10`) returns the sidebar list, most recently
+*active* session first. The running summary is rewritten by a background task
+after each answer is sent — it never adds to `/ask`'s response time; see
+`scripts/measure_memory_latency.py` and DECISIONS.md Part 6 for the empirical
+check.
+
+## Orchestration feature flags (V2 Phase 2, Part B)
+
+Four additional retrieval/answer behaviors exist behind flags, each OFF by
+default: `DOC_LOCK_ENABLED`, `PARTIAL_ANSWER_FENCING_ENABLED`,
+`PLANNER_INTENT_EXPANSION_ENABLED`, `EXHAUSTIVE_TRIGGER_ENABLED` (see
+`.env.example` for what each does). Measure any one against the gold set
+before trusting it:
+
+```bash
+.venv/bin/python -m scripts.eval_feature --flag DOC_LOCK_ENABLED
+```
+
 Set a real `JWT_SECRET` before exposing the API — the default placeholder is a
 published signing key, and anyone holding it can mint a token for any account.
 

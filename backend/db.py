@@ -56,10 +56,12 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title      TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    id            TEXT PRIMARY KEY,
+    user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title         TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    summary       TEXT NOT NULL DEFAULT '',
+    last_document TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -126,6 +128,22 @@ def connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+# Columns added after the table's first release. ``CREATE TABLE IF NOT EXISTS``
+# does not retrofit a table that already exists, so a database created under
+# Phase 1 (before `summary`/`last_document` existed) needs an explicit ALTER.
+_SESSION_MIGRATIONS = (
+    ("summary", "TEXT NOT NULL DEFAULT ''"),
+    ("last_document", "TEXT"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+    for column, ddl in _SESSION_MIGRATIONS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {ddl}")
+
+
 def init_db(force: bool = False) -> None:
     """Create the schema if absent. Cheap and idempotent; safe at import time."""
     path = str(_db_path())
@@ -134,6 +152,7 @@ def init_db(force: bool = False) -> None:
             return
         with connect() as conn:
             conn.executescript(SCHEMA)
+            _migrate(conn)
         _initialised.add(path)
 
 
@@ -298,6 +317,8 @@ def create_session(user_id: str, title: str = "") -> dict:
         "user_id": user_id,
         "title": title,
         "created_at": utc_now(),
+        "summary": "",
+        "last_document": None,
     }
     with connect() as conn:
         conn.execute(
@@ -308,12 +329,29 @@ def create_session(user_id: str, title: str = "") -> dict:
     return record
 
 
-def list_sessions(user_id: str) -> list[dict]:
+def list_sessions(user_id: str, limit: int = 10) -> list[dict]:
+    """This user's sessions, most recently ACTIVE first, for the chat sidebar.
+
+    "Active" is the newest message time, not creation time -- a session started
+    yesterday with a message five minutes ago belongs above one created an hour
+    ago with no reply yet. Sessions with no messages fall back to their own
+    ``created_at`` via ``COALESCE`` so a brand-new empty session still sorts
+    sensibly (at the top, since it was just created).
+
+    The join runs over ``idx_messages_session`` and groups by session id, which
+    stays fast at this schema's scale without a dedicated "last activity" column
+    to keep in sync on every message insert.
+    """
     init_db()
     with connect() as conn:
         rows = conn.execute(
-            "SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at DESC",
-            (user_id,),
+            "SELECT s.*, COALESCE(MAX(m.created_at), s.created_at) AS last_activity "
+            "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+            "WHERE s.user_id = ? "
+            "GROUP BY s.id "
+            "ORDER BY last_activity DESC "
+            "LIMIT ?",
+            (user_id, limit),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -325,6 +363,39 @@ def get_session(user_id: str, session_id: str) -> dict | None:
             "SELECT * FROM sessions WHERE id = ? AND user_id = ?", (session_id, user_id)
         ).fetchone()
     return dict(row) if row else None
+
+
+def update_session_memory(
+    user_id: str,
+    session_id: str,
+    summary: str | None = None,
+    last_document: str | None = None,
+) -> bool:
+    """Update a session's running summary and/or last-discussed document.
+
+    Ownership-checked like every other session write. ``summary`` replaces the
+    stored value rather than appending -- the summariser is responsible for
+    producing an already-condensed running summary, so storage does not also
+    need append/truncate logic here.
+    """
+    if get_session(user_id, session_id) is None:
+        return False
+    sets, params = [], []
+    if summary is not None:
+        sets.append("summary = ?")
+        params.append(summary)
+    if last_document is not None:
+        sets.append("last_document = ?")
+        params.append(last_document)
+    if not sets:
+        return True
+    params.extend([session_id, user_id])
+    with connect() as conn:
+        conn.execute(
+            f"UPDATE sessions SET {', '.join(sets)} WHERE id = ? AND user_id = ?",
+            params,
+        )
+    return True
 
 
 def delete_session(user_id: str, session_id: str) -> bool:
@@ -378,7 +449,13 @@ def list_messages(user_id: str, session_id: str) -> list[dict] | None:
             "SELECT m.* FROM messages m"
             " JOIN sessions s ON s.id = m.session_id"
             " WHERE m.session_id = ? AND s.user_id = ?"
-            " ORDER BY m.created_at, m.id",
+            # Tie-broken by rowid (SQLite's implicit, monotonically increasing
+            # insertion-order column), not m.id: two messages stored within the
+            # same wall-clock SECOND -- e.g. a question and its answer, which
+            # `created_at`'s second-resolution timestamp cannot tell apart --
+            # would otherwise sort by UUID, which is effectively random and
+            # silently reversed a real turn's order.
+            " ORDER BY m.created_at, m.rowid",
             (session_id, user_id),
         ).fetchall()
     return [dict(r) for r in rows]
