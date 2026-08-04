@@ -136,13 +136,36 @@ before trusting it:
 .venv/bin/python -m scripts.eval_feature --flag DOC_LOCK_ENABLED
 ```
 
+## Answer voice and structure (V2 Phase 4, Part A)
+
+Two flags, both **ON** by default, both prompt-side only:
+
+| Flag | Effect |
+|---|---|
+| `ANSWER_VOICE_ENABLED` | A warm, plain, human register. Wording only it may not add a fact, a reassurance or a caveat, and may not decorate or soften the fixed refusal sentence. |
+| `ANSWER_FORMAT_ENABLED` | The model shapes each answer to its content: a **table** for comparisons and repeated-attribute lists, **bullets** (numbered when order matters) for sets and steps, **prose** for explanations and single facts. |
+
+They default ON rather than OFF because the phase's acceptance gate is that the
+behaviour is *active*. Set either `false` to revert to Phase 3 answer text; with
+both off the system prompt is byte-for-byte what it was.
+
+Nothing reformats the model's output, so neither flag can move a figure or a
+citation. The client renders the markdown into shadcn table/list components
+(`web/src/components/chat/answer-text.tsx`, `web/src/components/ui/table.tsx`).
+
 Set a real `JWT_SECRET` before exposing the API the default placeholder is a
 published signing key, and anyone holding it can mint a token for any account.
+Note that `.env` shipping the key **present but blank** resolves to that same
+placeholder; `ALLOW_INSECURE_JWT_SECRET=false` makes startup refuse instead of
+warn.
 
-Verify the isolation guarantees:
+Verify the security and formatting guarantees:
 
 ```bash
-python -m pytest tests/ -q
+python -m pytest tests/ -q                 # offline: prompts, refusal, pruning, citations
+./run.sh --backend-only                    # then, in another shell:
+python scripts/verify_phase4.py            # 60 live checks; writes eval/phase4/
+python scripts/render_check.py             # renders AnswerText and asserts on the HTML
 ```
 
 Relational data (users, documents, sessions, messages) lives in `smartdoc.db`;

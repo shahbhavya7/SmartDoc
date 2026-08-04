@@ -19,9 +19,18 @@
  * The rate is length-aware a one-line refusal should not crawl, and a
  * three-paragraph synthesis should not take ten seconds so total reveal time
  * is bounded to roughly `MAX_MS` regardless of size.
+ *
+ * What gets revealed is a BLOCK-SAFE prefix, not a raw character slice. Answers
+ * are now formatted to their content (Phase 4, Part A), and a raw prefix of a
+ * markdown table is invalid markdown: it renders as a paragraph of literal pipe
+ * characters that snaps into a table a few frames later. `blockSafeSlice`
+ * clamps back to the last point where the markdown still parses, so a table
+ * appears row by row and never as debris. See `lib/markdown-reveal.ts`.
  */
 
 import { useEffect, useState } from "react";
+
+import { blockSafeSlice } from "@/lib/markdown-reveal";
 
 const MIN_CHARS_PER_SECOND = 420;
 const MAX_MS = 1600;
@@ -80,7 +89,10 @@ export function useProgressiveText(
 
   const revealed = progress.text === text ? progress.revealed : 0;
   return {
-    visible: revealed >= text.length ? text : text.slice(0, revealed),
+    // `done` stays keyed to the character count, not to the clamped string: a
+    // table held back for one more frame is still mid-reveal, and citations
+    // must not attach until the answer is whole.
+    visible: blockSafeSlice(text, revealed),
     done: revealed >= text.length,
   };
 }

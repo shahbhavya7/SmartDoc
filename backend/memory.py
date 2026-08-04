@@ -167,6 +167,17 @@ say so plainly instead of guessing.
 - This is about the CONVERSATION, not the documents -- do not refuse just because the \
 documents don't cover it. The transcript itself is the source of truth here."""
 
+# Phase 4, Part A. The same warm register the document answers use, because a
+# recall answer sits in the same chat bubble and a register that changes between
+# the two reads as two different assistants. Kept local rather than imported
+# from `backend.rag`: this prompt has no context passages, no citations and no
+# grounding pass, so it needs the tone half and none of the structure half.
+_VOICE_ADDENDUM = """
+- Write like a helpful colleague: warm, plain, direct, contractions welcome. No \
+filler openers ("Great question!"), no sign-offs, and no offers to help further.
+- Warmth is wording only -- never add a turn, a detail, or a reassurance the \
+transcript does not contain."""
+
 
 def answer_meta_question(transcript: list[dict], question: str) -> str:
     """Answer a question about the conversation itself, from the real transcript.
@@ -182,12 +193,15 @@ def answer_meta_question(transcript: list[dict], question: str) -> str:
         return "This is the start of our conversation -- there's nothing earlier to recall yet."
 
     lines = [f"{m['role']}: {m['content']}" for m in transcript]
+    system_prompt = _META_ANSWER_PROMPT + (
+        _VOICE_ADDENDUM if config.ANSWER_VOICE_ENABLED else ""
+    )
     try:
         completion = _shared_openai().chat.completions.create(
             model=config.UTILITY_MODEL,
             temperature=0.0,
             messages=[
-                {"role": "system", "content": _META_ANSWER_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": (

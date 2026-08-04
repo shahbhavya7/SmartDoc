@@ -27,6 +27,17 @@ only "nothing answerable" emits the fixed refusal string.
 returning it anyway defeats the purpose of detecting it: verification failures
 are regenerated, pruned, or withdrawn -- subject to guards that stop remediation
 from doing net harm.
+
+**Voice and structure are prompt-side, and cannot move a value.** Phase 4 asks
+for a warm human register and for an answer's shape to match its content -- a
+table for a comparison, a list for steps, prose for an explanation. Both are
+instructions to the answer model (``_VOICE_RULES``, ``_FORMAT_RULES``); no code
+here parses, rewrites, or re-flows the model's output, so formatting cannot
+change a figure or a citation. The two places where it *could* have changed an
+answer's meaning are handled explicitly: refusal detection ignores markdown
+decoration (``_normalise_answer``), and grounding remediation prunes whole
+block lines rather than sentences (``_split_units``), so a table row is dropped
+as a row instead of being flattened into prose.
 """
 
 from __future__ import annotations
@@ -215,10 +226,79 @@ explicitly as a difference (or a conflict) rather than choosing one.
 silent rather than treating silence as agreement.""",
 }
 
+# Phase 4, Part A. Tone. Gated by ANSWER_VOICE_ENABLED.
+#
+# The register is the only thing being asked for here, and the last two bullets
+# are the load-bearing ones: a friendly instruction is exactly the kind of thing
+# that invites a model to add a reassurance the documents do not support, or to
+# wrap the fixed refusal sentence in an apology -- which would break
+# ``_is_refusal`` and hand citations to an answer that refused.
+_VOICE_RULES = f"""Voice -- how the answer should read:
+- Write like a helpful colleague explaining something to a co-worker: warm, \
+plain, and direct. Contractions are welcome ("you'll", "it's", "there's").
+- Say "you" when the answer is about the reader. Lead with the answer itself, \
+never with a preamble.
+- No corporate register ("please be advised", "the aforementioned"), no filler \
+openers ("Great question!", "Certainly!"), no sign-offs, and no offers to help \
+further.
+- Warmth is a matter of WORDING ONLY. Never add a fact, a reassurance, a \
+recommendation, or a caveat the context does not state, and never soften or \
+hedge a value the context gives plainly.
+- One exception, absolute: when the context does not answer the question at \
+all, return the refusal sentence EXACTLY as written above -- \
+"{REFUSAL_MESSAGE}" -- with no apology before it, no offer after it, and no \
+bold, quotes, or bullet around it."""
+
+# Phase 4, Part A. Structure. Gated by ANSWER_FORMAT_ENABLED.
+#
+# The model chooses the shape; nothing downstream imposes one. The second block
+# exists because a tidy table is a strong pull toward rounding a value,
+# inventing a missing cell, or reordering rows -- each of which would be
+# formatting altering correctness, which this phase forbids outright.
+_FORMAT_RULES = """Structure -- match the shape of the answer to its content:
+- TABLE: use a markdown table when the answer compares two or more things, or \
+lists items that each carry the same two or more attributes (an entity and its \
+tier, a fault code and its meaning, a band and its entitlement). One column per \
+attribute, a header row, one row per item.
+- BULLETS: use a bulleted list for a set of separate points, and a NUMBERED \
+list when order matters (steps, a sequence, a procedure). One point per item; \
+do not nest more than one level.
+- PROSE: use short paragraphs for an explanation, a definition, a single fact, \
+or a statement about what the documents do and do not cover. A one-sentence \
+answer is a sentence, not a one-item list.
+- Add a short bold lead-in or a short heading only when the answer has more \
+than one distinct part. Do not decorate a short answer.
+- Where an instruction above already names a structure for this question type, \
+that instruction wins; these rules only decide the shape when it does not.
+
+Structure rules that protect correctness -- these override every preference \
+above:
+- Formatting NEVER changes a value. Copy each number, date, code, and name \
+exactly as the context gives it. Do not round, convert units, re-order, or \
+normalise anything to make a table tidy.
+- If the context gives no value for a cell, write "Not specified". Never fill a \
+gap to complete a row.
+- Never put page numbers or filename citations in a table or a list; the system \
+attaches exact sources separately.
+- If the content will not fit a table honestly (one side is missing, the values \
+are not comparable), say that in prose rather than forcing the table.
+- The refusal sentence, and the one short sentence naming what the documents do \
+not cover, are always plain prose."""
+
 
 def _system_prompt(plan: QueryPlan) -> str:
-    """Base grounding rules plus the instructions for this query type."""
-    return f"{_BASE_RULES}\n\n{_TYPE_RULES.get(plan.query_type, '')}".strip()
+    """Base grounding rules, this query type's instructions, then voice/format.
+
+    Voice and structure come LAST so the grounding and type rules are what the
+    model reads first, and so each Phase 4 block is a clean textual addition --
+    with both flags off, this returns byte-for-byte what Phase 3 returned.
+    """
+    parts = [_BASE_RULES, _TYPE_RULES.get(plan.query_type, "")]
+    if config.ANSWER_VOICE_ENABLED:
+        parts.append(_VOICE_RULES)
+    if config.ANSWER_FORMAT_ENABLED:
+        parts.append(_FORMAT_RULES)
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 def build_prompt(
@@ -262,11 +342,41 @@ _INCOMPLETE_RE = re.compile(
 )
 
 
+# Markdown that can wrap or lead a line without changing a single word of it.
+# Stripped before refusal comparison: once the model is told to format answers,
+# a refusal comes back as "**I don't know based on the available documents.**"
+# or as a lone bullet often enough to matter, and an undetected refusal is the
+# expensive kind of miss -- `query()` would skip escalation and then attach
+# citations to an answer that claims nothing.
+_MD_LEAD_RE = re.compile(r"^(?:\s*(?:>|#{1,6}|[-*+]|\d+[.)])\s+)+")
+_MD_WRAPPERS = ("***", "**", "*", "___", "__", "_", "`")
+
+
 def _normalise_answer(text: str) -> str:
-    """Normalise for refusal comparison: whitespace, quotes, case."""
+    """Normalise for refusal comparison: whitespace, markdown, quotes, case.
+
+    Only DECORATION is removed -- markers and quotes, never words -- so this
+    cannot turn a substantive answer into the refusal string: the remaining
+    text still has to match the refusal sentence word for word.
+    """
     collapsed = re.sub(r"\s+", " ", (text or "").strip())
-    while len(collapsed) > 1 and collapsed[0] in _QUOTES and collapsed[-1] in _QUOTES:
-        collapsed = collapsed[1:-1].strip()
+    changed = True
+    while changed and collapsed:
+        changed = False
+        lead_stripped = _MD_LEAD_RE.sub("", collapsed).strip()
+        if lead_stripped != collapsed:
+            collapsed, changed = lead_stripped, True
+        for wrapper in _MD_WRAPPERS:
+            if (
+                len(collapsed) > 2 * len(wrapper)
+                and collapsed.startswith(wrapper)
+                and collapsed.endswith(wrapper)
+            ):
+                collapsed = collapsed[len(wrapper) : -len(wrapper)].strip()
+                changed = True
+                break
+        if len(collapsed) > 1 and collapsed[0] in _QUOTES and collapsed[-1] in _QUOTES:
+            collapsed, changed = collapsed[1:-1].strip(), True
     return collapsed.casefold()
 
 
@@ -346,8 +456,11 @@ def _structural_claim_check(answer: str, context_text: str) -> list[str]:
     """
     # Strip list numbering ("1.", "2)") first: an enumerated answer is
     # formatting, not assertion, and counting its markers as unsupported figures
-    # buries real hallucinations in noise.
-    answer = re.sub(r"(?m)^\s*\d+[.)]\s+", "", answer)
+    # buries real hallucinations in noise. The optional bullet/heading prefix
+    # covers the markdown a formatted answer actually produces -- "- 1. ..." and
+    # "### 2. ..." both carry a marker the old pattern missed because it required
+    # the digit at the start of the line.
+    answer = re.sub(r"(?m)^\s*(?:[-*+]\s+|#{1,6}\s+)?\d+[.)]\s+", "", answer)
 
     context_numbers = {
         n.replace(",", "").rstrip(".") for n in _NUMERIC_CLAIM_RE.findall(context_text)
@@ -463,6 +576,112 @@ Return only the corrected answer text."""
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
+# A markdown block line: a table row, a list item, a heading, or a quote.
+#
+# Such a line is pruned as ONE unit. Splitting a table row on sentence
+# boundaries and rejoining the survivors with spaces turns a table into a
+# paragraph of stray pipe characters, and dropping half a row leaves a row with
+# the wrong number of cells. Both are formatting altering the answer, which is
+# the one thing Part A forbids outright -- so remediation operates on blocks
+# once answers contain blocks.
+_BLOCK_LINE_RE = re.compile(r"^\s*(?:\|.*\|\s*$|[-*+]\s+|\d+[.)]\s+|#{1,6}\s+|>\s+)")
+
+_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
+_TABLE_DIVIDER_RE = re.compile(r"^\s*\|[\s:\-|]+\|\s*$")
+
+
+def _split_units(text: str) -> list[list[str]]:
+    """Split ``text`` into lines, each line into independently prunable units.
+
+    One list per output line: a block line yields exactly one unit (the whole
+    line), a run of prose lines yields the sentences of the joined run, and a
+    blank line yields an empty list so paragraph breaks survive the round trip
+    through :func:`_join_units`.
+
+    Consecutive prose lines are joined BEFORE sentence-splitting, which keeps
+    parity with the pre-Phase-4 behaviour: the old splitter ran over the whole
+    answer, and its ``\\s+`` matched a newline, so a hard-wrapped sentence stayed
+    one sentence. Splitting strictly per line would cut such a sentence in two
+    and let remediation delete half of it.
+    """
+    lines: list[list[str]] = []
+    prose: list[str] = []
+
+    def flush_prose() -> None:
+        if prose:
+            joined = " ".join(prose)
+            lines.append(
+                [s.strip() for s in _SENTENCE_SPLIT_RE.split(joined) if s.strip()]
+            )
+            prose.clear()
+
+    for line in text.split("\n"):
+        if not line.strip():
+            flush_prose()
+            lines.append([])
+        elif _BLOCK_LINE_RE.match(line):
+            flush_prose()
+            lines.append([line.rstrip()])
+        else:
+            prose.append(line.strip())
+    flush_prose()
+    return lines
+
+
+def _value_tokens(text: str) -> set[str]:
+    """Figures and identifier-shaped tokens in ``text``, for claim matching.
+
+    A table row states a value with almost no prose around it -- ``| Senior |
+    28 days |`` -- so the "does this unit restate most of the claim?" test that
+    works on a sentence never fires on a row: two content words out of a
+    judge's ten-word paraphrase is 20% overlap, not 60%. Matching a row instead
+    by *containment* would then delete the header too, since a header's words
+    ("Band", "Annual leave") are also a subset of the claim. Requiring a shared
+    figure or code separates the two: the flagged row carries the value, the
+    header does not.
+    """
+    return {
+        t.replace(",", "").rstrip(".").upper()
+        for t in _NUMERIC_CLAIM_RE.findall(text) + _IDENT_CLAIM_RE.findall(text)
+        if t.replace(",", "").rstrip(".")
+    }
+
+
+def _drop_headerless_tables(lines: list[str]) -> list[str]:
+    """Drop a table left with a header row and no data rows.
+
+    Pruning can legitimately remove every data row of a table -- each row
+    carried an unsupported claim. What survives is a header promising columns
+    with nothing underneath, which reads as a rendering fault rather than as a
+    deliberate removal. The divider row is not counted as data: it has no words,
+    so no claim can ever match it.
+    """
+    kept: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if len([r for r in run if not _TABLE_DIVIDER_RE.match(r)]) > 1:
+            kept.extend(run)
+        run.clear()
+
+    for line in lines:
+        if _TABLE_ROW_RE.match(line):
+            run.append(line)
+            continue
+        flush()
+        kept.append(line)
+    flush()
+    return kept
+
+
+def _join_units(lines: list[list[str]]) -> str:
+    """Rebuild text from :func:`_split_units` output with its structure intact."""
+    rendered = _drop_headerless_tables(
+        [" ".join(units) if units else "" for units in lines]
+    )
+    # A fully-emptied block leaves a run of blank lines behind it.
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(rendered)).strip()
+
 
 def _regenerate_without(
     question: str,
@@ -500,34 +719,58 @@ def _regenerate_without(
 
 
 def _prune_sentences(answer: str, unsupported: list[str]) -> tuple[str, list[str]]:
-    """Excise sentences carrying an unsupported claim.
+    """Excise the units carrying an unsupported claim, keeping the structure.
 
     The deterministic fallback when regeneration fails. Crude, but unlike another
     generation attempt it cannot introduce a NEW unsupported claim, so it is the
     safe terminal step. Matching is by content-word overlap because the judge
     paraphrases the claims it reports.
+
+    A unit is a sentence in prose and a whole line inside a markdown block (see
+    :func:`_split_units`), so removing one bad row from a table leaves a table
+    with one fewer row rather than a paragraph of loose pipe characters.
     """
-    sentences = [s for s in _SENTENCE_SPLIT_RE.split(answer.strip()) if s.strip()]
-    if not sentences:
+    lines = _split_units(answer)
+    if not any(lines):
         return answer, []
 
     def words(text: str) -> set[str]:
         return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 3}
 
+    claims = [(words(c), _value_tokens(c)) for c in unsupported]
     removed: list[str] = []
-    kept: list[str] = []
-    claim_words = [words(c) for c in unsupported]
-    for sentence in sentences:
-        sentence_words = words(sentence)
-        drop = any(
-            claim and len(sentence_words & claim) / max(1, len(claim)) >= 0.6
-            for claim in claim_words
-        )
-        (removed if drop else kept).append(sentence.strip())
+    kept_lines: list[list[str]] = []
+    for units in lines:
+        kept_units: list[str] = []
+        for unit in units:
+            unit_words = words(unit)
+            is_block = bool(_BLOCK_LINE_RE.match(unit))
+            drop = any(
+                claim_words
+                and (
+                    # The claim is mostly restated by this unit -- the original
+                    # rule, and the one that fits prose.
+                    len(unit_words & claim_words) / len(claim_words) >= 0.6
+                    # Or this unit is a terse block line whose words the claim
+                    # covers, AND the two share the actual flagged value.
+                    or (
+                        is_block
+                        and unit_words
+                        and len(unit_words & claim_words) / len(unit_words) >= 0.6
+                        and bool(_value_tokens(unit) & claim_tokens)
+                    )
+                )
+                for claim_words, claim_tokens in claims
+            )
+            (removed if drop else kept_units).append(unit)
+        kept_lines.append(kept_units)
 
-    if not kept:
+    # `_join_units` can empty the result even when a unit survived -- a table
+    # divider row matches no claim and is always kept, but is not content.
+    pruned = _join_units(kept_lines)
+    if not pruned:
         return REFUSAL_MESSAGE, removed
-    return " ".join(kept).strip(), removed
+    return pruned, removed
 
 
 def _strip_embedded_refusal(text: str) -> str:
@@ -543,11 +786,15 @@ def _strip_embedded_refusal(text: str) -> str:
     """
     if _is_refusal(text):
         return text
-    sentences = [s for s in _SENTENCE_SPLIT_RE.split(text.strip()) if s.strip()]
-    kept = [s for s in sentences if not _is_refusal(s)]
-    if len(kept) == len(sentences):
+    lines = _split_units(text)
+    total = sum(len(units) for units in lines)
+    kept = [[u for u in units if not _is_refusal(u)] for units in lines]
+    if sum(len(units) for units in kept) == total:
         return text
-    return " ".join(kept).strip()
+    # Structure-preserving rejoin, for the same reason `_prune_sentences` uses
+    # it: a formatted answer must not be flattened on its way through repair.
+    # An answer made up of nothing but the refusal sentence IS a refusal.
+    return _join_units(kept) or REFUSAL_MESSAGE
 
 
 def _repairable_claims(claims: list[str]) -> list[str]:

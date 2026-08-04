@@ -258,6 +258,37 @@ PLANNER_INTENT_EXPANSION_ENABLED = _bool("PLANNER_INTENT_EXPANSION_ENABLED", Fal
 EXHAUSTIVE_TRIGGER_ENABLED = _bool("EXHAUSTIVE_TRIGGER_ENABLED", False)
 
 # ---------------------------------------------------------------------------
+# Phase 4, Part A -- answer voice and answer formatting
+#
+# Both are PROMPT-SIDE ONLY: they add instructions to the answer model's system
+# prompt and change nothing about retrieval, ranking, or how citations are
+# built. Nothing in the codebase reformats or re-flows the model's output, so a
+# formatting change cannot move a figure.
+#
+# Two flags rather than one because their risk profiles differ. Voice cannot
+# change an answer's structure; formatting produces markdown blocks (tables,
+# lists) that grounding remediation and the client's progressive reveal both
+# have to handle -- so the riskier half is revertible without losing the
+# harmless one.
+#
+# Both default ON, which is the D9 exception rather than the standing OFF rule:
+# this phase's acceptance gate is that answers READ warm and are shaped to
+# their content, and a flag defaulting OFF would ship a system that passes
+# review by not doing the thing. Setting either false is the documented revert
+# to Phase 3 answer text.
+# ---------------------------------------------------------------------------
+
+# Warm, human register (contractions, direct address, no corporate stock
+# phrases). Wording only: it may not add a fact, a reassurance, or a caveat,
+# and it may not soften the fixed refusal sentence.
+ANSWER_VOICE_ENABLED = _bool("ANSWER_VOICE_ENABLED", True)
+
+# Let the model pick the structure that fits the content: a table for
+# comparisons and repeated-attribute lists, bullets for steps and
+# enumerations, prose for explanations.
+ANSWER_FORMAT_ENABLED = _bool("ANSWER_FORMAT_ENABLED", True)
+
+# ---------------------------------------------------------------------------
 # V2 -- relational store, authentication, and per-user isolation
 #
 # SQLite owns every relational entity (users, documents, sessions, messages);
