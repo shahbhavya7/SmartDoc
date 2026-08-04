@@ -32,7 +32,8 @@ from pathlib import Path
 
 import backend.config as config
 from backend import db
-from backend.ingestion import _pdfs_in, build_chunks, extract_document
+from backend.ingestion import _pdfs_in, build_chunks
+from backend.markdown_ingestion import extract_document_auto
 from backend.user_scope import user_scope
 from backend.vectorstore import (
     collection_stats,
@@ -100,7 +101,11 @@ def main() -> None:
     print(f"Embedding model: {config.EMBED_MODEL}")
     print(
         f"Chunking       : child {config.CHILD_CHUNK_SIZE}/"
-        f"{config.CHILD_CHUNK_OVERLAP} tokens, parent {config.PARENT_CHUNK_SIZE}\n"
+        f"{config.CHILD_CHUNK_OVERLAP} tokens, parent {config.PARENT_CHUNK_SIZE}"
+    )
+    print(
+        f"Markdown ingest: {'ON' if config.MARKDOWN_INGESTION_ENABLED else 'OFF'}"
+        f" (MARKDOWN_INGESTION_ENABLED)\n"
     )
 
     # Bind the scope around the whole run, so the content-hash check, the
@@ -122,8 +127,14 @@ def _run(args, owner: dict | None) -> None:
     skipped = 0
     start = time.time()
 
+    owner_id = owner["id"] if owner else None
+    modes: dict[str, int] = {}
+
     for pdf_path in _pdfs_in(args.data_dir):
-        parsed = extract_document(pdf_path)
+        # V3.1: markdown-first when MARKDOWN_INGESTION_ENABLED is on, with the
+        # plain-text path as the permanent fallback.
+        parsed = extract_document_auto(pdf_path, user_id=owner_id)
+        modes[parsed.extraction_mode] = modes.get(parsed.extraction_mode, 0) + 1
 
         if not args.force and known.get(parsed.source) == parsed.content_hash:
             print(f"  {parsed.source:48} unchanged, skipped")
@@ -140,6 +151,10 @@ def _run(args, owner: dict | None) -> None:
         document_id = (
             db.upsert_document(owner["id"], parsed.source)["id"] if owner else ""
         )
+        if document_id:
+            db.set_document_extraction(
+                owner["id"], document_id, parsed.extraction_mode, parsed.markdown_path
+            )
         indexed = ingest_documents(
             children, parents=parents, document_id=document_id
         )
@@ -147,7 +162,8 @@ def _run(args, owner: dict | None) -> None:
         total_parents += len(parents)
         print(
             f"  {parsed.source:48} {parsed.page_count:3}p  "
-            f"{len(parents):3} parents  {indexed:4} chunks"
+            f"{len(parents):3} parents  {indexed:4} chunks  "
+            f"[{parsed.extraction_mode}]"
         )
 
     elapsed = time.time() - start
@@ -155,6 +171,14 @@ def _run(args, owner: dict | None) -> None:
         f"\nIndexed {total_children} chunks ({total_parents} parents) in "
         f"{elapsed:.1f}s; {skipped} document(s) unchanged."
     )
+    if modes:
+        # A document reported as "text" while the flag is ON took the fallback --
+        # scanned or image-only. Printing the split makes that visible in the run
+        # output instead of only in the database.
+        print(
+            "Extraction modes : "
+            + ", ".join(f"{mode}={count}" for mode, count in sorted(modes.items()))
+        )
     print(f"Collection stats: {collection_stats()}")
 
 

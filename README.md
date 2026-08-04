@@ -171,6 +171,34 @@ python scripts/render_check.py             # renders AnswerText and asserts on t
 Relational data (users, documents, sessions, messages) lives in `smartdoc.db`;
 Chroma holds only vectors and metadata. Both are git-ignored.
 
+## Markdown ingestion and semantic splitting (V3.1)
+
+One flag, **OFF** by default: `MARKDOWN_INGESTION_ENABLED`. With it off,
+ingestion is the V2 plain-text pipeline block-for-block and hash-for-hash.
+
+With it on, each PDF is converted to markdown (`pymupdf4llm`) before chunking and
+split in two stages `MarkdownHeaderTextSplitter` on `#`/`##`/`###` first, then
+the existing `RecursiveCharacterTextSplitter` only for sections still over the
+locked ~800/120 budget. Every chunk gains `heading_path`
+("Employee Handbook > 3. Annual Leave Entitlement") and `section_title`, and
+citations can show the section a fact came from.
+
+The plain-text path is permanent, not deprecated: it is also the fallback when
+markdown conversion fails, returns near-empty text (a scanned / image-only PDF),
+or recovers materially less text than the plain-text extractor. Documents that
+fall back are marked `extraction_mode = "text"` on the `documents` row and in the
+upload response, so a degraded document stays identifiable.
+
+Generated markdown is cached under `data/markdown/<user_id>/` namespaced per
+owner, because two users may both have uploaded `handbook.pdf`.
+
+```bash
+# structural checks only, no API calls
+python scripts/verify_v3_1.py --structural
+# plus the known-answer before/after table (ingests twice, into a throwaway store)
+python scripts/verify_v3_1.py
+```
+
 ## Run everything
 
 From the project root:

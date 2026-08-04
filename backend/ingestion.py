@@ -81,12 +81,19 @@ class PageText:
 
 @dataclass
 class Block:
-    """One structural unit of a document, in reading order."""
+    """One structural unit of a document, in reading order.
+
+    ``heading_path`` is populated only by the V3.1 markdown path, where the
+    document's real heading hierarchy is known ("Leave Policy > Sick Leave >
+    Eligibility"). The plain-text path leaves it empty, which is what keeps every
+    downstream behaviour identical when MARKDOWN_INGESTION_ENABLED is off.
+    """
 
     kind: str  # "heading" | "paragraph" | "table"
     text: str
     page: int
     section: str = ""
+    heading_path: str = ""
 
 
 @dataclass
@@ -99,6 +106,14 @@ class ParsedDocument:
     pages: list[PageText] = field(default_factory=list)
     blocks: list[Block] = field(default_factory=list)
     content_hash: str = ""
+
+    # "text" for the V2 plain-text path, "markdown" when markdown conversion
+    # succeeded. Stored on the document row as well, so a PDF that degraded to
+    # the fallback path stays identifiable long after ingest.
+    extraction_mode: str = "text"
+
+    # Path to the cached markdown, relative to PROJECT_ROOT; "" on the text path.
+    markdown_path: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +447,21 @@ def _splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSpli
     )
 
 
-def _breadcrumb(title: str, section: str) -> str:
-    """Build the topical prefix prepended to a chunk before embedding."""
+def _breadcrumb(title: str, section: str, heading_path: str = "") -> str:
+    """Build the topical prefix prepended to a chunk before embedding.
+
+    With a real heading hierarchy available (V3.1 markdown path) the whole path is
+    used, not just the leaf: a chunk under "Leave Policy > Sick Leave >
+    Eligibility" should carry "sick leave" even though its own heading says only
+    "Eligibility". The document title is dropped when the path already opens with
+    it, which markdown H1s usually do -- repeating it wastes tokens and dilutes
+    the embedding.
+    """
+    if heading_path:
+        parts = [p.strip() for p in heading_path.split(">") if p.strip()]
+        if parts and title and parts[0].casefold() == title.casefold():
+            parts = parts[1:]
+        return " > ".join([p for p in (title,) if p] + parts)
     return " > ".join(p for p in (title, section) if p)
 
 
@@ -452,21 +480,34 @@ class Chunk:
     section: str
     has_table: bool
     blocks: list[Block] = field(default_factory=list)
+    heading_path: str = ""
+
+
+def _group_key(block: Block) -> str:
+    """The identity a section run is grouped by.
+
+    The full heading path, when one is known, rather than the leaf title: two
+    different sections can both be titled "Eligibility", and grouping by leaf
+    title alone would silently merge them into one parent chunk. On the plain-text
+    path ``heading_path`` is empty and this is exactly the old ``block.section``.
+    """
+    return block.heading_path or block.section
 
 
 def _group_sections(blocks: list[Block]) -> list[list[Block]]:
     """Group the block stream into runs sharing an enclosing section."""
     groups: list[list[Block]] = []
     current: list[Block] = []
-    current_section: str | None = None
+    current_key: str | None = None
     for block in blocks:
-        if current_section is None or block.section == current_section:
+        key = _group_key(block)
+        if current_key is None or key == current_key:
             current.append(block)
-            current_section = block.section
+            current_key = key
             continue
         groups.append(current)
         current = [block]
-        current_section = block.section
+        current_key = key
     if current:
         groups.append(current)
     return groups
@@ -499,6 +540,7 @@ def _chunk_blocks(
                     section=buffer[0].section,
                     has_table=any(b.kind == "table" for b in buffer),
                     blocks=list(buffer),
+                    heading_path=buffer[0].heading_path,
                 )
             )
         buffer = []
@@ -517,6 +559,7 @@ def _chunk_blocks(
                     section=block.section,
                     has_table=True,
                     blocks=[block],
+                    heading_path=block.heading_path,
                 )
             )
             continue
@@ -534,6 +577,7 @@ def _chunk_blocks(
                             section=block.section,
                             has_table=False,
                             blocks=[block],
+                            heading_path=block.heading_path,
                         )
                     )
             continue
@@ -589,6 +633,8 @@ def build_chunks(
                         "page_end": parent_chunk.page_end,
                         "parent_index": parent_index,
                         "has_table": parent_chunk.has_table,
+                        "heading_path": parent_chunk.heading_path,
+                        "section_title": parent_chunk.section,
                     },
                 )
             )
@@ -605,7 +651,9 @@ def build_chunks(
                 )
 
             for child in child_chunks:
-                breadcrumb = _breadcrumb(parsed.title, child.section)
+                breadcrumb = _breadcrumb(
+                    parsed.title, child.section, child.heading_path
+                )
                 text = f"{breadcrumb}\n\n{child.text}" if breadcrumb else child.text
                 children.append(
                     Document(
@@ -621,6 +669,13 @@ def build_chunks(
                             "has_table": child.has_table,
                             "token_count": count_tokens(text),
                             "content_hash": parsed.content_hash,
+                            # V3.1. Both are "" on the plain-text path, so a
+                            # flag-OFF chunk's metadata is unchanged in value.
+                            # Delimited string, not a list: Chroma stores
+                            # scalars only.
+                            "heading_path": child.heading_path,
+                            "section_title": child.section,
+                            "extraction_mode": parsed.extraction_mode,
                         },
                     )
                 )

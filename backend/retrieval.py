@@ -359,15 +359,26 @@ def llm_rerank(question: str, units: list[RetrievedUnit]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def expand_to_parents(units: list[RetrievedUnit]) -> list[RetrievedUnit]:
+def expand_to_parents(
+    units: list[RetrievedUnit], persist_directory=None
+) -> list[RetrievedUnit]:
     """Replace children by their parents, deduplicating shared parents.
 
     Several retrieved children frequently belong to one section. Emitting the
     parent once instead of three overlapping children both restores the full
     section and removes duplicated overlap text.
+
+    ``persist_directory`` must be threaded through: parents live in a JSON sidecar
+    inside the store directory, and defaulting it silently read the DEFAULT
+    store's sidecar while the children came from the caller's store. Parent ids
+    are ``"<source>#p<n>"`` and therefore collide across stores, so the mismatch
+    did not error -- it substituted a DIFFERENT document's section as the answer
+    context. Found while measuring V3.1 against an isolated store: the same
+    corpus answered 21/22 known-answer questions when the two stores happened to
+    agree and 5/22 when they did not.
     """
     parent_ids = [u.metadata.get("parent_id") for u in units if u.metadata.get("parent_id")]
-    records = get_parents(dict.fromkeys(parent_ids))
+    records = get_parents(dict.fromkeys(parent_ids), persist_directory=persist_directory)
 
     out: list[RetrievedUnit] = []
     seen_parents: set[str] = set()
@@ -384,6 +395,12 @@ def expand_to_parents(units: list[RetrievedUnit]) -> list[RetrievedUnit]:
         metadata["page"] = record.get("page", unit.metadata.get("page"))
         metadata["page_end"] = record.get("page_end", metadata.get("page_end"))
         metadata["section"] = record.get("section", metadata.get("section", ""))
+        # V3.1: the parent's own heading path, for the same reason its section and
+        # page range are taken from the record -- the substituted text is the
+        # parent's, so the citation must describe the parent, not the child.
+        metadata["heading_path"] = record.get(
+            "heading_path", metadata.get("heading_path", "")
+        )
         out.append(
             RetrievedUnit(
                 id=parent_id,
@@ -835,7 +852,7 @@ def retrieve(
     if profile.expand_neighbours:
         selected = expand_neighbours(selected, collection_name, persist_directory)
     if config.ENABLE_PARENT_EXPANSION:
-        selected = expand_to_parents(selected)
+        selected = expand_to_parents(selected, persist_directory=persist_directory)
 
     return RetrievalResult(
         units=selected,

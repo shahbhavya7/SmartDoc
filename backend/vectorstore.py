@@ -274,6 +274,9 @@ def save_parents(
             "section": doc.metadata.get("section", ""),
             "page": doc.metadata.get("page"),
             "page_end": doc.metadata.get("page_end"),
+            # V3.1. "" on the plain-text path, so a flag-OFF parent record is
+            # unchanged in value.
+            "heading_path": doc.metadata.get("heading_path", ""),
         }
         if scope:
             record["user_id"] = scope

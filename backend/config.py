@@ -90,6 +90,47 @@ CHUNK_OVERLAP = _int("CHUNK_OVERLAP", 120)
 HEADER_FOOTER_MIN_PAGE_RATIO = _float("HEADER_FOOTER_MIN_PAGE_RATIO", 0.6)
 
 # ---------------------------------------------------------------------------
+# V3.1 -- markdown ingestion and semantic (heading-aware) splitting
+#
+# OFF by default. With this flag off, ingestion runs the V2 plain-text path
+# byte-for-byte: the same PyMuPDF block extractor, the same cleaner, the same
+# chunker, and no new metadata keys with non-empty values.
+#
+# When ON, a PDF is first converted to markdown (``pymupdf4llm``), then split in
+# two stages -- headings first, character splitter only for sections still over
+# budget -- so a chunk boundary lands on a real section break instead of an
+# arbitrary character count. The plain-text path stays permanently available and
+# is also the automatic fallback for a scanned / image-only PDF.
+# ---------------------------------------------------------------------------
+MARKDOWN_INGESTION_ENABLED = _bool("MARKDOWN_INGESTION_ENABLED", False)
+
+# Heading levels the first splitting stage cuts on. #### and deeper stay inside
+# their parent section: past three levels a "section" is usually a single
+# sentence, and a one-sentence chunk retrieves worse than the paragraph holding
+# it.
+MARKDOWN_HEADER_LEVELS = _int("MARKDOWN_HEADER_LEVELS", 3)
+
+# A section longer than this is handed to the existing RecursiveCharacterText-
+# Splitter; a section at or under it is kept whole regardless of how short. This
+# is the LOCKED ~800/120 chunk budget (CHUNK_SIZE / CHUNK_OVERLAP below), not a
+# new tunable -- named separately only so the two-stage splitter's threshold is
+# readable at the call site.
+MARKDOWN_SECTION_MAX_TOKENS = _int("MARKDOWN_SECTION_MAX_TOKENS", 0)  # 0 -> CHUNK_SIZE
+
+# Below this many characters of markdown, conversion is treated as failed and the
+# plain-text path takes over. A scanned PDF yields a handful of stray glyphs, not
+# nothing, so "empty" has to mean "near-empty" to catch it. Also compared against
+# the plain-text extraction: markdown is rejected if it recovers less than
+# MARKDOWN_MIN_TEXT_RATIO of what the text path found.
+MARKDOWN_MIN_CHARS = _int("MARKDOWN_MIN_CHARS", 200)
+MARKDOWN_MIN_TEXT_RATIO = _float("MARKDOWN_MIN_TEXT_RATIO", 0.5)
+
+# Where generated markdown is cached, so re-chunking experiments and table
+# inspection do not re-parse the PDF. Namespaced per owner: two users may both
+# have uploaded ``handbook.pdf`` and one must never read the other's text.
+MARKDOWN_DIR = PROJECT_ROOT / os.getenv("MARKDOWN_DIR", "data/markdown")
+
+# ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
 CHROMA_DIR = PROJECT_ROOT / os.getenv("CHROMA_DIR", "chroma_store")

@@ -48,11 +48,13 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS documents (
-    id         TEXT PRIMARY KEY,
-    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    filename   TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    size_bytes INTEGER,
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    filename        TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    size_bytes      INTEGER,
+    extraction_mode TEXT NOT NULL DEFAULT 'text',
+    markdown_path   TEXT,
     UNIQUE (user_id, filename)
 );
 
@@ -140,7 +142,16 @@ _SESSION_MIGRATIONS = (
 # ``size_bytes`` is nullable rather than ``DEFAULT 0``: a row written before this
 # column existed has an unknown size, and 0 would report it as empty. Callers
 # resolve NULL from the stored file on disk instead (see backend/documents.py).
-_DOCUMENT_MIGRATIONS = (("size_bytes", "INTEGER"),)
+#
+# V3.1 adds two more. ``extraction_mode`` defaults to 'text' rather than being
+# nullable: every row that predates the column WAS ingested by the plain-text
+# path, so 'text' is the true value, not a placeholder. ``markdown_path`` is
+# nullable -- an absent markdown cache is genuinely unknown, not "".
+_DOCUMENT_MIGRATIONS = (
+    ("size_bytes", "INTEGER"),
+    ("extraction_mode", "TEXT NOT NULL DEFAULT 'text'"),
+    ("markdown_path", "TEXT"),
+)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -247,6 +258,26 @@ def link_google_sub(user_id: str, google_sub: str) -> None:
 # ---------------------------------------------------------------------------
 # Documents
 # ---------------------------------------------------------------------------
+
+
+def set_document_extraction(
+    user_id: str, document_id: str, extraction_mode: str, markdown_path: str = ""
+) -> None:
+    """Record how a document was extracted (V3.1).
+
+    Written after parsing rather than at row creation, because which path a PDF
+    took is only known once conversion has been attempted -- and a scanned PDF
+    that fell back must end up marked ``"text"``, not left at whatever the flag
+    said it would be. Scoped by ``user_id`` so the update cannot touch another
+    account's row even if a document id were guessed.
+    """
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            "UPDATE documents SET extraction_mode = ?, markdown_path = ?"
+            " WHERE id = ? AND user_id = ?",
+            (extraction_mode or "text", markdown_path or None, document_id, user_id),
+        )
 
 
 def upsert_document(

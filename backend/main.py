@@ -291,6 +291,14 @@ class UploadFileResult(BaseModel):
     pages_parsed: int | None = None
     chunks_created: int | None = None
     chunks_indexed: int | None = None
+    extraction_mode: str | None = Field(
+        default=None,
+        description=(
+            "V3.1: 'markdown', or 'text' when the plain-text path was used -- "
+            "either because MARKDOWN_INGESTION_ENABLED is off or because "
+            "conversion fell back (a scanned / image-only PDF)."
+        ),
+    )
     error: str | None = None
 
 
@@ -359,6 +367,15 @@ class DocumentModel(BaseModel):
             "Size of the stored PDF. None when the size is genuinely unknown "
             "(a pre-V2 row whose file is no longer on disk) -- not zero, which "
             "would misreport it as empty."
+        ),
+    )
+    extraction_mode: str = Field(
+        default="text",
+        description=(
+            "V3.1: 'markdown' when the document was converted to markdown and "
+            "split on heading boundaries, 'text' for the plain-text path -- "
+            "including a scanned PDF that fell back to it. 'text' is also the "
+            "correct value for every row that predates the column."
         ),
     )
 
@@ -756,6 +773,7 @@ def _ingest_one_file(user_id: str, filename: str, content: bytes) -> UploadFileR
         pages_parsed=result["pages_parsed"],
         chunks_created=result["chunks_created"],
         chunks_indexed=result["chunks_indexed"],
+        extraction_mode=result["extraction_mode"],
     )
 
 

@@ -5,6 +5,12 @@ langchain==0.3.14
 chromadb==0.5.23
 openai==1.59.7
 pymupdf==1.25.1
+# V3.1 -- PDF -> markdown at ingest. Pinned to the last release that accepts
+# PyMuPDF 1.25.x: every later pymupdf4llm requires PyMuPDF >= 1.26.3, and
+# upgrading PyMuPDF would change the LOCKED plain-text extraction path (its
+# table finder and block extractor) as a side effect of adding a flag that
+# defaults OFF.
+pymupdf4llm==0.0.17
 python-dotenv==1.0.1
 requests==2.32.3
 tiktoken==0.8.0

@@ -104,6 +104,12 @@ class Source:
     section: str = ""
     page_end: int | None = None
 
+    # V3.1: the full heading hierarchy ("Leave Policy > Sick Leave > Eligibility")
+    # when the document was ingested as markdown, "" otherwise. Additive -- the
+    # existing ``section`` field is unchanged, so a client that ignores this key
+    # renders exactly what it rendered before.
+    heading_path: str = ""
+
 
 @dataclass
 class Grounding:
@@ -438,6 +444,7 @@ def build_sources(context: AssembledContext) -> list[Source]:
                 snippet=_snippet(unit.matched_text or unit.text),
                 section=section,
                 page_end=page_end if page_end > unit.page else None,
+                heading_path=str(unit.metadata.get("heading_path", "") or ""),
             )
         )
     return sources

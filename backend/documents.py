@@ -24,7 +24,8 @@ from pathlib import Path
 
 import backend.config as config
 from backend import db
-from backend.ingestion import PDFReadError, build_chunks, extract_document
+from backend.ingestion import PDFReadError, build_chunks
+from backend.markdown_ingestion import extract_document_auto
 from backend.user_scope import user_scope
 from backend.vectorstore import delete_document_chunks, ingest_documents
 
@@ -55,7 +56,7 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
 
     Returns:
         ``{"document_id", "filename", "pages_parsed", "chunks_created",
-        "chunks_indexed"}``.
+        "chunks_indexed", "extraction_mode"}``.
     """
     dest = stored_path(user_id, filename)
     dest.write_bytes(content)
@@ -64,13 +65,20 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
         user_id=user_id, filename=filename, size_bytes=len(content)
     )
 
-    parsed = extract_document(dest)
+    # V3.1: markdown-first when the flag is on, plain text otherwise and as the
+    # fallback. ``user_id`` is passed so the generated markdown is cached under
+    # this owner and never in a location another account reads.
+    parsed = extract_document_auto(dest, user_id=user_id)
     parents, children = build_chunks(parsed)
     if not children:
         raise PDFReadError(
             f"No extractable text in '{filename}'. Scanned PDFs need OCR before "
             "they can be indexed."
         )
+
+    db.set_document_extraction(
+        user_id, record["id"], parsed.extraction_mode, parsed.markdown_path
+    )
 
     # The scope is set here as well as by the request dependency: ingestion also
     # runs from scripts, and the write path must never be able to land chunks
@@ -86,6 +94,9 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
         "pages_parsed": parsed.page_count,
         "chunks_created": len(children),
         "chunks_indexed": indexed,
+        # Surfaced so a document that degraded to the fallback path is visible at
+        # upload time, not only by inspecting the row later.
+        "extraction_mode": parsed.extraction_mode,
     }
 
 
