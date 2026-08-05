@@ -102,6 +102,13 @@ _SQL_TIMEOUT_SECONDS = 2.0
 # policy and manual Q&A.
 _NUMERIC_CLAIM_RE = re.compile(r"\b\d[\d,.]*\b")
 _IDENT_CLAIM_RE = re.compile(r"\b[A-Z]{1,4}-\d{1,4}\b|\bAES-?\d{3}\b|\bTLS\s?\d\.\d\b")
+# V4: a grouped-JSON table chunk's cell values (grades, salary bands, IDs -- an
+# alnum code with both a letter and a digit, e.g. "G4", "B5", "MP0075") don't
+# match either pattern above and don't get a hyphen, so the LLM faithfulness
+# judge is the only thing that can vouch for them -- and it occasionally
+# misjudges one as unsupported when it's one row among many in a JSON blob.
+_JSON_ARRAY_RE = re.compile(r"\[\s*\{.*?\}\s*\]", re.DOTALL)
+_CODE_TOKEN_RE = re.compile(r"\b[A-Za-z]{1,6}\d{1,6}\b|\b\d{1,6}[A-Za-z]{1,6}\b")
 
 
 class RagError(Exception):
@@ -591,6 +598,52 @@ def _structural_claim_check(answer: str, context_text: str) -> list[str]:
     return list(dict.fromkeys(unsupported))
 
 
+def _json_table_values(context_text: str) -> set[str]:
+    """Flatten every cell value out of embedded grouped-JSON table blobs.
+
+    V4 table chunks render as ``f"{description}\\n{json.dumps(group.rows)}"``
+    (``tables.build_table_documents_grouped_json``) -- a JSON array of
+    ``{column: value}`` row objects. This gives the grounding check a literal
+    fallback for those values, since the LLM entailment judge treats the whole
+    chunk as opaque text and can misread a code buried in a multi-row blob.
+    """
+    values: set[str] = set()
+    for match in _JSON_ARRAY_RE.finditer(context_text):
+        try:
+            rows = json.loads(match.group(0))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for value in row.values():
+                if isinstance(value, (str, int, float)):
+                    values.add(str(value).strip().casefold())
+    return values
+
+
+def _drop_json_supported_claims(claims: list[str], context_text: str) -> list[str]:
+    """Remove claims the LLM flagged that are literally a JSON table cell value.
+
+    A claim like "Employee 33's grade is G4" gets flagged unsupported by the
+    LLM judge even though "G4" is right there as a value in the retrieved
+    row -- so a claim carrying at least one code token that matches an actual
+    cell value in context is treated as grounded rather than pruned.
+    """
+    json_values = _json_table_values(context_text)
+    if not json_values:
+        return claims
+    return [
+        claim
+        for claim in claims
+        if not any(
+            token.casefold() in json_values for token in _CODE_TOKEN_RE.findall(claim)
+        )
+    ]
+
+
 _FAITHFULNESS_PROMPT = """You verify whether an answer is fully supported by the \
 provided context. Reply with JSON only.
 
@@ -651,6 +704,16 @@ def verify_grounding(
         if faithful is None:
             note = "LLM faithfulness check unavailable; structural check only."
             faithful = not unverified_numbers
+        elif unsupported:
+            survivors = _drop_json_supported_claims(unsupported, context_text)
+            if len(survivors) != len(unsupported):
+                note = (
+                    "Dropped claim(s) the LLM flagged that are literally present "
+                    "as a table cell value in context."
+                )
+                if not survivors:
+                    faithful = True
+            unsupported = survivors
     else:
         note = "Structural check only (LLM grounding check disabled)."
         faithful = not unverified_numbers
