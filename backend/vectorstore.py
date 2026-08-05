@@ -52,6 +52,7 @@ from langchain.docstore.document import Document
 from openai import OpenAI
 
 import backend.config as config
+from backend.chunk_schema import apply_defaults, validate
 from backend.user_scope import (
     belongs_to_scope,
     current_user_id,
@@ -462,9 +463,17 @@ def upsert_documents(
         raw_id = chunk_id(doc.metadata["source"], doc.metadata["chunk_index"])
         ids.append(scoped_id(raw_id))
         texts.append(doc.page_content)
-        metadatas.append(
+        # V3.3: the schema contract is enforced HERE -- after ownership has been
+        # stamped and immediately before the chunk reaches Chroma. This is the only
+        # point that can guarantee the invariant, because `user_id` does not exist
+        # until scope_metadata has run. apply_defaults fills anything absent so a
+        # violation cannot produce an unindexable chunk; validate() reports it, and
+        # raises when CHUNK_SCHEMA_STRICT is on (tests and the verifier).
+        stamped = apply_defaults(
             _clean_metadata(scope_metadata(doc.metadata, document_id=document_id))
         )
+        validate(stamped, where=f"{stamped.get('source')}#{stamped.get('chunk_index')}")
+        metadatas.append(stamped)
 
     vectors = embed(texts)
     if len(vectors) != len(texts):

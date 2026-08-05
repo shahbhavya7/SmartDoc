@@ -75,9 +75,50 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at TEXT NOT NULL
 );
 
+-- V3.3 Layer C. One manifest row per document: the heading tree and the
+-- aggregated topic/entity lists, both JSON because they are read whole. The
+-- ITEMS below are a real table because enumeration routing queries them
+-- structurally -- which is exactly the split the Chroma-stores-scalars rule forces.
+CREATE TABLE IF NOT EXISTS document_manifests (
+    document_id  TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    user_id      TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    heading_tree TEXT NOT NULL DEFAULT '[]',
+    topics       TEXT NOT NULL DEFAULT '[]',
+    entities     TEXT NOT NULL DEFAULT '[]',
+    chunk_count  INTEGER NOT NULL DEFAULT 0,
+    table_count  INTEGER NOT NULL DEFAULT 0,
+    item_count   INTEGER NOT NULL DEFAULT 0,
+    built_at     TEXT NOT NULL
+);
+
+-- One row per enumerable thing the document exactly contains: a section, a table
+-- row label, or a list item. This is what makes "there are 7" a fact rather than
+-- a hope, and what an enumeration answer is checked against.
+CREATE TABLE IF NOT EXISTS manifest_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id   TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    user_id       TEXT NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN ('section', 'table_row', 'list_item')),
+    group_label   TEXT NOT NULL DEFAULT '',
+    -- Extra text a group can be NAMED by, beyond its label: a table's column
+    -- headers. "list all record types" must find the group whose first column is
+    -- "Record type" even though its section is called "Classification Tiers".
+    group_context TEXT NOT NULL DEFAULT '',
+    item          TEXT NOT NULL,
+    item_norm     TEXT NOT NULL,
+    heading_path  TEXT NOT NULL DEFAULT '',
+    page          INTEGER,
+    chunk_index   INTEGER,
+    table_id      TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user  ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_manifests_user ON document_manifests(user_id);
+CREATE INDEX IF NOT EXISTS idx_manifest_items_user ON manifest_items(user_id, item_norm);
+CREATE INDEX IF NOT EXISTS idx_manifest_items_doc ON manifest_items(document_id);
 """
 
 _init_lock = threading.Lock()
@@ -258,6 +299,142 @@ def link_google_sub(user_id: str, google_sub: str) -> None:
 # ---------------------------------------------------------------------------
 # Documents
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# V3.3 Layer C -- the document manifest
+# ---------------------------------------------------------------------------
+
+
+def replace_manifest(
+    user_id: str,
+    document_id: str,
+    source: str,
+    heading_tree_json: str,
+    topics_json: str,
+    entities_json: str,
+    items: list[dict],
+    table_count: int = 0,
+    chunk_count: int = 0,
+) -> int:
+    """Replace this document's manifest and items in one transaction.
+
+    Replace, not upsert: a re-ingested document whose headings changed must not
+    keep the old ones alongside the new. That is DECISIONS.md B1 one level up --
+    surplus rows from a previous version surviving a shorter revision, and then
+    being reported as present by the very component whose job is to say what
+    exists.
+    """
+    init_db()
+    with connect() as conn:
+        conn.execute("DELETE FROM manifest_items WHERE document_id = ?", (document_id,))
+        conn.execute("DELETE FROM document_manifests WHERE document_id = ?", (document_id,))
+        conn.execute(
+            "INSERT INTO document_manifests (document_id, user_id, source,"
+            " heading_tree, topics, entities, chunk_count, table_count, item_count,"
+            " built_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                document_id, user_id, source, heading_tree_json, topics_json,
+                entities_json, chunk_count, table_count, len(items), utc_now(),
+            ),
+        )
+        conn.executemany(
+            "INSERT INTO manifest_items (document_id, user_id, kind, group_label,"
+            " group_context, item, item_norm, heading_path, page, chunk_index,"
+            " table_id) VALUES (:document_id, :user_id, :kind, :group_label,"
+            " :group_context, :item, :item_norm, :heading_path, :page,"
+            " :chunk_index, :table_id)",
+            [{**row, "document_id": document_id, "user_id": user_id} for row in items],
+        )
+    return len(items)
+
+
+def get_manifest(user_id: str, document_id: str) -> dict | None:
+    """One document's manifest row, or None. Scoped by owner."""
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM document_manifests WHERE document_id = ? AND user_id = ?",
+            (document_id, user_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_manifests(user_id: str) -> list[dict]:
+    """Every manifest this user owns."""
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM document_manifests WHERE user_id = ? ORDER BY source",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def all_heading_paths(user_id: str) -> list[dict]:
+    """Every distinct heading path this user's corpus contains.
+
+    Used by the heading filter to decide, before any search runs, whether a
+    question names a section that actually exists.
+    """
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT heading_path, document_id FROM manifest_items"
+            " WHERE user_id = ? AND heading_path <> ''",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_manifest_items(
+    user_id: str,
+    term: str,
+    kinds: tuple[str, ...] = ("section", "table_row", "list_item"),
+    limit: int = 300,
+) -> list[dict]:
+    """Manifest items whose item, group label, or group context contains ``term``.
+
+    Ownership is in the WHERE clause, not a later filter -- the rule every other
+    read in this system follows, and the reason an enumeration cannot accidentally
+    enumerate another account's document.
+
+    ``LIKE`` with an escaped pattern rather than FTS: these corpora are tens of
+    documents, the index on ``(user_id, item_norm)`` covers the common case, and a
+    full-text index would be one more thing to keep in step with re-ingestion.
+    Word-boundary matching is applied by the caller, in one place.
+    """
+    if not term.strip():
+        return []
+    init_db()
+    pattern = "%" + term.strip().lower().replace("%", r"\%").replace("_", r"\_") + "%"
+    placeholders = ",".join("?" for _ in kinds)
+    sql = (
+        "SELECT * FROM manifest_items WHERE user_id = ?"
+        f" AND kind IN ({placeholders})"
+        r" AND (item_norm LIKE ? ESCAPE '\' OR lower(group_label) LIKE ? ESCAPE '\'"
+        r" OR lower(group_context) LIKE ? ESCAPE '\')"
+        " ORDER BY document_id, page, id LIMIT ?"
+    )
+    with connect() as conn:
+        rows = conn.execute(
+            sql, [user_id, *kinds, pattern, pattern, pattern, limit]
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def manifest_group_items(
+    user_id: str, document_id: str, group_label: str, kind: str
+) -> list[dict]:
+    """Every item in one group -- the authoritative "there are N of these" list."""
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM manifest_items WHERE user_id = ? AND document_id = ?"
+            " AND group_label = ? AND kind = ? ORDER BY page, id",
+            (user_id, document_id, group_label, kind),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def set_document_extraction(

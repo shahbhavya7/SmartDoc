@@ -131,6 +131,99 @@ MARKDOWN_MIN_TEXT_RATIO = _float("MARKDOWN_MIN_TEXT_RATIO", 0.5)
 MARKDOWN_DIR = PROJECT_ROOT / os.getenv("MARKDOWN_DIR", "data/markdown")
 
 # ---------------------------------------------------------------------------
+# V3.2 -- table-aware ingestion and sibling expansion
+#
+# OFF by default. With this flag off, tables are handled exactly as V2 does:
+# PyMuPDF's table finder renders each table as a pipe-delimited block that is
+# kept whole inside the normal chunk stream, and a table spanning a page break is
+# two unrelated chunks, the second of which has no header row.
+#
+# When ON, tables leave the text stream entirely: they are extracted as
+# structured objects, stitched across page breaks into one logical table, chunked
+# on ROW boundaries with the column headers repeated in every part, and given a
+# shared ``table_id``. Retrieval then reassembles the whole table from a hit on
+# any single part -- by metadata fetch, not a second similarity search.
+# ---------------------------------------------------------------------------
+TABLE_AWARE_INGESTION_ENABLED = _bool("TABLE_AWARE_INGESTION_ENABLED", False)
+
+# Token budget per table part. 0 means "use CHUNK_SIZE" -- the LOCKED ~800/120
+# budget. There is no overlap setting: overlap is meaningless for rows, and
+# repeating the header block in every part is what a row fragment actually needs.
+TABLE_CHUNK_MAX_TOKENS = _int("TABLE_CHUNK_MAX_TOKENS", 0)  # 0 -> CHUNK_SIZE
+
+# Ceilings on sibling expansion. A hit on one part of a 40-part table must not
+# push 40 parts into the prompt and evict every other document. Past either cap,
+# the prompt gets the header block, the generated one-line summary, and the parts
+# that actually matched -- see backend/tables.py.
+TABLE_SIBLING_MAX_PARTS = _int("TABLE_SIBLING_MAX_PARTS", 6)
+TABLE_SIBLING_MAX_TOKENS = _int("TABLE_SIBLING_MAX_TOKENS", 3000)
+
+# Row labels (first-column values) listed in a table's summary chunk. Labels are
+# what a natural-language question names ("what does E-04 mean", "the anti-bribery
+# deadline"), so they are what makes a table findable. Cell VALUES are never put
+# in a summary: a summary is generated text, and an answer must never be able to
+# take a figure from it.
+TABLE_SUMMARY_MAX_LABELS = _int("TABLE_SUMMARY_MAX_LABELS", 12)
+
+# ---------------------------------------------------------------------------
+# V3.3 -- the universal metadata layer
+#
+# Metadata is a headline feature of V3, not an optional add-on, so unlike every
+# other V3 flag these ship **ON**. The flags remain so each layer can still be
+# measured against itself (flag-OFF vs flag-ON on the known-answer set), which is
+# how "it actually helped" stays a measurement rather than an assertion -- but the
+# default is the shipped state, not the reverted one.
+#
+# Every chunk carries the complete schema in backend/chunk_schema.py regardless of
+# these flags. What a flag changes is how much of it is POPULATED:
+#   * Layer A off is not possible -- it is free and structural.
+#   * Layer B off leaves content_type="other" and the three text fields empty.
+#   * Layer C off leaves the manifest unread (it is still built).
+# ---------------------------------------------------------------------------
+
+# Layer B: one batched gpt-4o-mini call per group of chunks at INGEST, filling
+# content_type / topics / entities / answers_questions. Query time is untouched.
+SEMANTIC_METADATA_ENABLED = _bool("SEMANTIC_METADATA_ENABLED", True)
+
+# Chunks per extraction call. Larger batches are cheaper per chunk but degrade:
+# the model starts describing the batch instead of each passage.
+SEMANTIC_METADATA_BATCH_SIZE = _int("SEMANTIC_METADATA_BATCH_SIZE", 8)
+
+# Characters of each chunk sent for labelling. A chunk's opening states its topic;
+# paying to send the tail buys little.
+SEMANTIC_METADATA_CHARS = _int("SEMANTIC_METADATA_CHARS", 1200)
+
+# Layer C: read the manifest to drive enumeration questions and heading filters.
+MANIFEST_ROUTING_ENABLED = _bool("MANIFEST_ROUTING_ENABLED", True)
+
+# An enumeration needs at least this many manifest items before the manifest
+# overrides ordinary retrieval. One item is not a set.
+MANIFEST_MIN_ITEMS = _int("MANIFEST_MIN_ITEMS", 2)
+
+# Ceiling on items one enumeration may drive retrieval for. Past this the answer
+# reports how many of how many it is covering rather than silently truncating.
+MANIFEST_MAX_ITEMS = _int("MANIFEST_MAX_ITEMS", 25)
+
+# When an answer covers fewer manifest items than exist, regenerate ONCE naming
+# what it missed. This is the anti-silent-incompleteness step: an exhaustive answer
+# returning 3 of 7 reads exactly like one returning 7.
+MANIFEST_COVERAGE_REPAIR = _bool("MANIFEST_COVERAGE_REPAIR", True)
+
+# Use 2: narrow the candidate pool by heading_path BEFORE searching when a question
+# names a section ("what does the eligibility section say?").
+HEADING_FILTER_ENABLED = _bool("HEADING_FILTER_ENABLED", True)
+
+# A heading filter that matches almost everything has not narrowed anything and
+# only risks excluding a relevant chunk, so it is dropped above this fraction of
+# the user's corpus.
+HEADING_FILTER_MAX_SHARE = _float("HEADING_FILTER_MAX_SHARE", 0.5)
+
+# Raise on a chunk that violates the metadata contract instead of logging. Off in
+# production -- refusing to index a chunk over a missing optional label trades a
+# complete index for a tidy one -- and ON in tests and the verification script.
+CHUNK_SCHEMA_STRICT = _bool("CHUNK_SCHEMA_STRICT", False)
+
+# ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
 CHROMA_DIR = PROJECT_ROOT / os.getenv("CHROMA_DIR", "chroma_store")

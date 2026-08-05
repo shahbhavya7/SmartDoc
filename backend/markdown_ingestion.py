@@ -488,6 +488,12 @@ def sections_to_blocks(
 
         for kind, run in _table_runs(section):
             if kind == "table":
+                if config.TABLE_AWARE_INGESTION_ENABLED:
+                    # V3.2 owns tables: they are extracted structurally with
+                    # PyMuPDF, stitched across page breaks, and chunked by row.
+                    # Emitting the markdown rows here as well would index every
+                    # table twice, with only one copy stitched and headered.
+                    continue
                 emit(
                     "table",
                     "\n".join(line for line, _ in run if line),
@@ -593,6 +599,14 @@ def extract_document_markdown(
             # filling it in would assert a structure the document does not have.
             block.heading_path = title
 
+    # V3.2: tables come from PyMuPDF's structured finder in BOTH ingestion modes,
+    # so a table is stitched and headered identically whichever text path is on.
+    structured_tables = []
+    if config.TABLE_AWARE_INGESTION_ENABLED:
+        from backend.tables import extract_tables, tables_hash
+
+        structured_tables = extract_tables(path, path.name)
+
     cached = save_markdown(path.name, full, user_id)
     return ParsedDocument(
         source=path.name,
@@ -604,11 +618,19 @@ def extract_document_markdown(
         # the chunk stream, so it MUST invalidate the "unchanged, skipped" check.
         # A hash that ignored extraction mode would leave a corpus indexed under
         # the old path and silently report success.
+        # V3.2 folds the tables in for the same reason: with table-aware ingestion
+        # on, the same markdown yields a different chunk stream. Only when the
+        # document has tables -- a table-free one is byte-identical either way.
         content_hash=hashlib.sha256(
-            ("markdown\n" + full).encode("utf-8")
+            (
+                "markdown\n"
+                + (f"tables\n{tables_hash(structured_tables)}\n" if structured_tables else "")
+                + full
+            ).encode("utf-8")
         ).hexdigest(),
         extraction_mode="markdown",
         markdown_path=cached,
+        tables=structured_tables,
     )
 
 

@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 import backend.config as config
-from backend import db
+from backend import db, manifest, semantic
 from backend.ingestion import _pdfs_in, build_chunks
 from backend.markdown_ingestion import extract_document_auto
 from backend.user_scope import user_scope
@@ -105,7 +105,16 @@ def main() -> None:
     )
     print(
         f"Markdown ingest: {'ON' if config.MARKDOWN_INGESTION_ENABLED else 'OFF'}"
-        f" (MARKDOWN_INGESTION_ENABLED)\n"
+        f" (MARKDOWN_INGESTION_ENABLED)"
+    )
+    print(
+        f"Table-aware    : {'ON' if config.TABLE_AWARE_INGESTION_ENABLED else 'OFF'}"
+        f" (TABLE_AWARE_INGESTION_ENABLED)"
+    )
+    print(
+        f"Metadata       : semantic "
+        f"{'ON' if config.SEMANTIC_METADATA_ENABLED else 'OFF'} | manifest routing "
+        f"{'ON' if config.MANIFEST_ROUTING_ENABLED else 'OFF'}\n"
     )
 
     # Bind the scope around the whole run, so the content-hash check, the
@@ -124,6 +133,9 @@ def _run(args, owner: dict | None) -> None:
 
     total_children = 0
     total_parents = 0
+    total_tables = 0
+    total_stitched = 0
+    total_items = 0
     skipped = 0
     start = time.time()
 
@@ -142,6 +154,8 @@ def _run(args, owner: dict | None) -> None:
             continue
 
         parents, children = build_chunks(parsed)
+        total_tables += len(parsed.tables)
+        total_stitched += sum(1 for t in parsed.tables if t.fragments > 1)
         if not children:
             # A PDF with no extractable text layer (e.g. a pure scan) yields
             # nothing; say so rather than reporting a silent success.
@@ -155,6 +169,14 @@ def _run(args, owner: dict | None) -> None:
             db.set_document_extraction(
                 owner["id"], document_id, parsed.extraction_mode, parsed.markdown_path
             )
+        # V3.3 Layer B then Layer C, before indexing so the semantic fields are
+        # written with the chunk rather than needing a second pass.
+        semantic.annotate(children)
+        if document_id:
+            total_items += manifest.store_manifest(
+                owner["id"], document_id, manifest.build_manifest(parsed, children)
+            )
+
         indexed = ingest_documents(
             children, parents=parents, document_id=document_id
         )
@@ -164,6 +186,7 @@ def _run(args, owner: dict | None) -> None:
             f"  {parsed.source:48} {parsed.page_count:3}p  "
             f"{len(parents):3} parents  {indexed:4} chunks  "
             f"[{parsed.extraction_mode}]"
+            + (f"  {len(parsed.tables)} tables" if parsed.tables else "")
         )
 
     elapsed = time.time() - start
@@ -171,6 +194,21 @@ def _run(args, owner: dict | None) -> None:
         f"\nIndexed {total_children} chunks ({total_parents} parents) in "
         f"{elapsed:.1f}s; {skipped} document(s) unchanged."
     )
+    if total_items:
+        print(f"Manifest       : {total_items} enumerable item(s) recorded")
+    elif config.MANIFEST_ROUTING_ENABLED:
+        print(
+            "Manifest       : none written -- an unscoped run has no documents row "
+            "to attach one to. Pass --user to build manifests."
+        )
+    if total_tables:
+        # A stitched table is one that crossed a page break and was reassembled
+        # at ingest; reporting the count is how that shows up in a run log rather
+        # than only in the index.
+        print(
+            f"Tables         : {total_tables} logical, {total_stitched} stitched "
+            "across a page break"
+        )
     if modes:
         # A document reported as "text" while the flag is ON took the fallback --
         # scanned or image-only. Printing the split makes that visible in the run

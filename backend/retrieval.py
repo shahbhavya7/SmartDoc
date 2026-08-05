@@ -49,6 +49,7 @@ from backend.query_analysis import (
     MULTI_HOP,
     QueryPlan,
 )
+from backend.chunk_schema import apply_defaults
 from backend.routing import (
     RoutingDecision,
     document_chunks,
@@ -56,10 +57,12 @@ from backend.routing import (
     score_documents,
     select_documents,
 )
+from backend.semantic import keyword_side_channel
 from backend.user_scope import current_user_id
 from backend.vectorstore import (
     all_chunks,
     get_chunks_by_ids,
+    get_chunks_where,
     get_collection,
     get_parents,
     openai_embed_fn,
@@ -128,6 +131,11 @@ class RetrievalResult:
     outline: list[dict] = field(default_factory=list)
     stages: dict = field(default_factory=dict)
 
+    # V3.3 Layer C. The authoritative list the manifest supplied for an
+    # enumeration, or None. Carried to the answer stage so completeness can be
+    # checked against a real count rather than the model's sense of being finished.
+    enumeration: object | None = None
+
 
 # ---------------------------------------------------------------------------
 # Keyword index
@@ -173,7 +181,16 @@ def _keyword_index(collection_name: str | None = None, persist_directory=None):
         chunks = all_chunks(collection)
         if not chunks:
             return None
-        index = BM25Okapi([_tokenize(c["document"]) for c in chunks])
+        # V3.3 Layer B: the semantic labels join the KEYWORD index only, so a chunk
+        # can be FOUND by a question phrased in words it does not contain while the
+        # prompt still receives real chunk text. The tokens come from metadata,
+        # never from `document`, which is what the prompt is built from.
+        index = BM25Okapi(
+            [
+                _tokenize(c["document"] + " " + keyword_side_channel(c["metadata"]))
+                for c in chunks
+            ]
+        )
         # Evict only indexes built against a stale corpus version; other users'
         # current indexes stay warm, so one upload does not force every signed-in
         # user to rebuild on their next query.
@@ -186,7 +203,20 @@ def _keyword_index(collection_name: str | None = None, persist_directory=None):
 def keyword_search(
     query: str, k: int, collection_name: str | None = None, persist_directory=None
 ) -> list[dict]:
-    """Return the top-``k`` BM25 matches for ``query``."""
+    """Return the top-``k`` BM25 matches for ``query``, with FULL metadata.
+
+    ``rank_bm25`` indexes plain text and returns **positions**, not objects. It
+    knows nothing about ids or metadata, so a keyword hit is a row number and
+    nothing else. The parallel ``chunks`` list built alongside the index is what
+    turns that number back into a chunk -- position ``i`` in the token corpus is
+    position ``i`` here, by construction, and both are built from one pass over
+    ``all_chunks`` inside the same cache entry so they cannot drift apart.
+
+    Getting that wrong is not a visible failure: a keyword-only hit would carry a
+    *different* chunk's source and page, and the citation would point at the wrong
+    document while the answer text was right. So the metadata is copied through
+    here explicitly and defaulted, and the invariant is asserted in the tests.
+    """
     built = _keyword_index(collection_name, persist_directory)
     if not built:
         return []
@@ -205,7 +235,10 @@ def keyword_search(
             {
                 "id": chunk["id"],
                 "document": chunk["document"],
-                "metadata": chunk["metadata"],
+                # Defaulted, not passed through raw: a chunk indexed before the
+                # contract existed would otherwise re-enter the pipeline with keys
+                # missing, and every downstream filter would under-return.
+                "metadata": apply_defaults(chunk["metadata"]),
                 "score": float(scores[position]),
             }
         )
@@ -411,6 +444,159 @@ def expand_to_parents(
                 dense_rank=unit.dense_rank,
                 keyword_rank=unit.keyword_rank,
                 expanded_from="parent",
+                matched_text=unit.matched_text or unit.text,
+            )
+        )
+    return out
+
+
+def fetch_manifest_targets(
+    plan,
+    collection_name: str | None = None,
+    persist_directory=None,
+) -> list[RetrievedUnit]:
+    """V3.3 Use 1. Fetch the chunk for every item the manifest says must be covered.
+
+    This is the "drive retrieval from the authoritative list" step. For each item,
+    the chunk holding it is fetched **by metadata** -- ``table_id``, ``chunk_index``
+    or ``heading_path``, whichever the manifest recorded when the item was found.
+
+    Not a similarity search, for the same reason sibling expansion is not one: an
+    enumeration fails precisely when a real item ranks below the cut, so asking the
+    ranker again would reproduce the omission. A metadata fetch cannot miss an item
+    the manifest knows about.
+
+    Returned unscored. The caller merges them as guaranteed slots ahead of the
+    ranked candidates, so a low-similarity seventh item cannot be ranked out of the
+    answer it belongs in.
+    """
+    collection = get_collection(
+        collection_name=collection_name, persist_directory=persist_directory
+    )
+    seen: set[str] = set()
+    units: list[RetrievedUnit] = []
+    for row in plan.items:
+        table_id = str(row.get("table_id") or "")
+        heading_path = str(row.get("heading_path") or "")
+        chunk_index = row.get("chunk_index")
+
+        records: list[dict] = []
+        if table_id:
+            records = [
+                r
+                for r in get_chunks_where({"table_id": table_id}, collection=collection)
+                if not r["metadata"].get("is_table_summary")
+            ]
+        elif chunk_index is not None:
+            records = get_chunks_where({"chunk_index": int(chunk_index)}, collection=collection)
+        elif heading_path:
+            records = get_chunks_where({"heading_path": heading_path}, collection=collection)
+
+        for record in records:
+            if record["id"] in seen:
+                continue
+            seen.add(record["id"])
+            units.append(
+                RetrievedUnit(
+                    id=record["id"],
+                    text=record["document"] or "",
+                    metadata=apply_defaults(record["metadata"]),
+                    expanded_from="manifest",
+                )
+            )
+    return units
+
+
+def expand_table_siblings(
+    units: list[RetrievedUnit],
+    collection_name: str | None = None,
+    persist_directory=None,
+) -> list[RetrievedUnit]:
+    """V3.2. Replace any table hit with the reassembled whole table.
+
+    A hit on part 2 of 3 is a hit on a third of a table, and the answer usually
+    needs a row in one of the other two. So when any surviving unit carries a
+    ``table_id``, every chunk sharing that id is fetched and the table is rebuilt
+    with its header block once and its rows in order.
+
+    This is a **metadata fetch, not a search**: one ``collection.get`` with a
+    ``where`` clause per table, ANDed with the active user's scope by
+    ``get_chunks_where``. No embedding call, no second similarity pass, and no
+    dependence on whether the sibling parts would have ranked. That is both the
+    speed requirement and the correctness one -- ranking is exactly what failed to
+    surface the sibling in the first place.
+
+    A summary chunk that survives retrieval is consumed here rather than passed
+    on: it is generated text, and an answer must come from real chunk text. Its
+    value is that it made the table findable; the rows are what answer.
+    """
+    if not any(u.metadata.get("table_id") for u in units):
+        return units
+
+    from backend.tables import SUMMARY_FLAG, assemble
+
+    collection = get_collection(
+        collection_name=collection_name, persist_directory=persist_directory
+    )
+
+    matched: dict[str, set[int]] = {}
+    for unit in units:
+        table_id = unit.metadata.get("table_id")
+        if table_id:
+            part = int(unit.metadata.get("table_part") or 0)
+            matched.setdefault(str(table_id), set()).add(part)
+
+    siblings: dict[str, list[dict]] = {}
+    for table_id in matched:
+        siblings[table_id] = get_chunks_where(
+            {"table_id": table_id}, collection=collection
+        )
+
+    out: list[RetrievedUnit] = []
+    emitted: set[str] = set()
+    for unit in units:
+        table_id = unit.metadata.get("table_id")
+        if not table_id:
+            out.append(unit)
+            continue
+        table_id = str(table_id)
+        if table_id in emitted:
+            continue  # the whole table has already been emitted once
+
+        records = siblings.get(table_id) or []
+        table = assemble(records, matched[table_id]) if records else None
+        if table is None:
+            # No siblings readable. A summary chunk alone must not reach the
+            # prompt, so it is dropped; a real part stands on its own.
+            if not unit.metadata.get(SUMMARY_FLAG):
+                out.append(unit)
+                emitted.add(table_id)
+            continue
+
+        emitted.add(table_id)
+        metadata = dict(unit.metadata)
+        metadata.update(
+            {
+                "page": table.page_start,
+                "page_end": table.page_end,
+                "table_part": 0,
+                "table_parts_included": table.parts_included,
+                "table_total_parts": table.parts_total,
+                "table_complete": table.complete,
+                SUMMARY_FLAG: False,
+                "has_table": True,
+            }
+        )
+        out.append(
+            RetrievedUnit(
+                id=f"{table_id}#assembled",
+                text=table.text,
+                metadata=metadata,
+                fused_score=unit.fused_score,
+                rerank_score=unit.rerank_score,
+                dense_rank=unit.dense_rank,
+                keyword_rank=unit.keyword_rank,
+                expanded_from="table_siblings",
                 matched_text=unit.matched_text or unit.text,
             )
         )
@@ -765,6 +951,23 @@ def retrieve(
                 allowed = routing.selected
 
     where = _source_filter(allowed)
+
+    # ---------------- 1b. heading-path pre-filter (V3.3 Use 2) ----------------
+    # A question that NAMES a section is an exact structural constraint, so it is
+    # applied as a metadata filter before any similarity is computed. That both
+    # shrinks the candidate pool and removes the chance of the ranker preferring a
+    # similarly-worded section elsewhere. Returns [] unless the named section
+    # really exists -- a filter built from a guess would silently exclude the
+    # answer and look like the corpus not containing it.
+    heading_paths: list[str] = []
+    if config.MANIFEST_ROUTING_ENABLED:
+        from backend.manifest import heading_filter
+
+        heading_paths = heading_filter(current_user_id() or "", plan.question)
+        if heading_paths:
+            clause = {"heading_path": {"$in": heading_paths}}
+            where = clause if not where else {"$and": [where, clause]}
+
     mode = profile.mode
     outline: list[dict] = []
     truncated_sweep = False
@@ -795,6 +998,23 @@ def retrieve(
 
     candidates_considered = len(pool)
 
+    # ---------------- 2b. manifest-driven guaranteed slots (V3.3 Use 1) --------
+    # Read the authoritative list FIRST, then fetch the chunk for each listed item
+    # by metadata. Prepended and unscored: the point is that an item the ranker
+    # would have dropped cannot be dropped.
+    enumeration = None
+    manifest_units: list[RetrievedUnit] = []
+    if config.MANIFEST_ROUTING_ENABLED:
+        from backend.manifest import plan_enumeration
+
+        enumeration = plan_enumeration(current_user_id() or "", plan.question)
+        if enumeration is not None:
+            manifest_units = fetch_manifest_targets(
+                enumeration, collection_name, persist_directory
+            )
+            for unit in manifest_units:
+                pool.setdefault(unit.id, unit)
+
     if mode == MODE_OUTLINE and allowed:
         for source in allowed:
             outline.extend(document_outline(source, collection_name, persist_directory))
@@ -813,6 +1033,14 @@ def retrieve(
         candidates = ordered
     else:
         candidates = apply_diversity(ordered, profile.max_per_source)
+
+    # Manifest targets bypass the diversity cap and (below) the rerank floor. A cap
+    # of 3 per source would delete four of a seven-item enumeration, and a reranker
+    # scoring one row of a list as "might contribute" would delete it too -- both
+    # are precision heuristics, and an enumeration is a completeness question.
+    if manifest_units:
+        guaranteed = {u.id for u in manifest_units}
+        candidates = manifest_units + [u for u in candidates if u.id not in guaranteed]
 
     # ---------------- 4. reranking ----------------
     if mode == MODE_SWEEP:
@@ -845,6 +1073,9 @@ def retrieve(
                 reverse=True,
             )
             selected = survivors[: profile.final_k] or window[: profile.final_k]
+            if manifest_units:
+                chosen = {u.id for u in selected}
+                selected = [u for u in manifest_units if u.id not in chosen] + selected
     else:
         selected = window[: profile.final_k]
 
@@ -853,10 +1084,19 @@ def retrieve(
         selected = expand_neighbours(selected, collection_name, persist_directory)
     if config.ENABLE_PARENT_EXPANSION:
         selected = expand_to_parents(selected, persist_directory=persist_directory)
+    # V3.2, LAST: table parts have no parent (nothing to substitute) and are not
+    # helped by their prose neighbours, so sibling expansion runs after both. It
+    # also has to run after them, not before: parent substitution would otherwise
+    # replace an assembled table with the surrounding paragraphs.
+    if config.TABLE_AWARE_INGESTION_ENABLED:
+        selected = expand_table_siblings(
+            selected, collection_name=collection_name, persist_directory=persist_directory
+        )
 
     return RetrievalResult(
         units=selected,
         plan=plan,
+        enumeration=enumeration,
         candidates_considered=candidates_considered,
         reranked=reranked,
         hybrid=config.ENABLE_HYBRID,
@@ -870,6 +1110,9 @@ def retrieve(
             "after_selection": len(candidates),
             "rerank_window": len(window),
             "selected": len(selected),
+            "heading_filter": heading_paths,
+            "manifest_expected": getattr(enumeration, "expected", 0) if enumeration else 0,
+            "manifest_units": len(manifest_units),
             "documents_selected": allowed or "unrestricted",
             "documents_excluded": routing.excluded if routing else [],
             "sweep_truncated": truncated_sweep,

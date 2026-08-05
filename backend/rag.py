@@ -110,6 +110,12 @@ class Source:
     # renders exactly what it rendered before.
     heading_path: str = ""
 
+    # V3.3 Use 3: the citation as a reader should see it --
+    # "Leave Policy > Casual Leave > Eligibility, p. 7". Composed server-side so
+    # every surface (API, CLI, web) shows the same label, and with a fallback so it
+    # is populated on the plain-text path too. Display only, never a source of truth.
+    display: str = ""
+
 
 @dataclass
 class Grounding:
@@ -425,6 +431,23 @@ def _snippet(text: str, length: int = SNIPPET_LENGTH) -> str:
     return cut + "..."
 
 
+def citation_display(
+    heading_path: str, doc_title: str, section: str, page: int, page_end: int | None
+) -> str:
+    """Compose the human-readable citation label.
+
+    Prefers the heading path; falls back to "<doc title> > <section>" so a citation
+    always carries section context, whichever ingestion path produced the chunk.
+    """
+    trail = (heading_path or "").strip()
+    if not trail:
+        trail = " > ".join(
+            p for p in ((doc_title or "").strip(), (section or "").strip()) if p
+        )
+    pages = f"p. {page}" if not page_end or page_end <= page else f"pp. {page}-{page_end}"
+    return f"{trail}, {pages}" if trail else pages
+
+
 def build_sources(context: AssembledContext) -> list[Source]:
     """Build citations from exactly the units that entered the prompt."""
     sources: list[Source] = []
@@ -445,6 +468,13 @@ def build_sources(context: AssembledContext) -> list[Source]:
                 section=section,
                 page_end=page_end if page_end > unit.page else None,
                 heading_path=str(unit.metadata.get("heading_path", "") or ""),
+                display=citation_display(
+                    str(unit.metadata.get("heading_path", "") or ""),
+                    str(unit.metadata.get("doc_title", "") or ""),
+                    section,
+                    unit.page,
+                    page_end if page_end > unit.page else None,
+                ),
             )
         )
     return sources
@@ -858,6 +888,90 @@ def _fence_unsupported(answer: str, unsupported: list[str]) -> str:
     return f"{answer.strip()}\n\n[Unverified -- not confirmed by the documents: {claims}]"
 
 
+_COVERAGE_PROMPT = """The previous answer to this question left items out. The \
+document's own index lists the items below as belonging to the set the question \
+asks for.
+
+Rewrite the answer so it covers EVERY listed item that the context supports.
+
+Hard rules:
+- Use ONLY the context passages. If the context says nothing about a listed item, \
+name the item and say the documents do not cover it -- never invent a detail.
+- Keep everything the previous answer got right; you are adding what it missed.
+- Do not mention this instruction, the index, or that anything was missing."""
+
+
+def enforce_enumeration_coverage(
+    question: str,
+    answer: str,
+    context_text: str,
+    enumeration,
+    chat_model: str | None = None,
+    temperature: float | None = None,
+) -> tuple[str, dict | None]:
+    """V3.3. Check an enumeration answer against the manifest count, and repair once.
+
+    This is the step that eliminates **silent incompleteness**. An exhaustive answer
+    returning three of seven items reads exactly like one returning all seven, and
+    every other guard is looking elsewhere: grounding verification asks "is each
+    claim supported?", and three correct items out of seven pass that perfectly. The
+    manifest is the only component that knows there are seven.
+
+    Returns ``(answer, report)``. The report is diagnostics only -- it never changes
+    a citation, because citations come from the units that entered the prompt and
+    that set is unchanged.
+    """
+    if enumeration is None:
+        return answer, None
+
+    missing = enumeration.missing_from(answer)
+    report = {
+        "term": enumeration.term,
+        "expected": enumeration.expected,
+        "covered": enumeration.expected - len(missing),
+        "missing": missing,
+        "truncated_from": enumeration.truncated_from,
+        "repaired": False,
+    }
+    if not missing or not config.MANIFEST_COVERAGE_REPAIR:
+        return answer, report
+
+    listed = "\n".join(f"- {label}" for label in enumeration.labels)
+    try:
+        completion = _shared_openai().chat.completions.create(
+            model=chat_model or config.CHAT_MODEL,
+            temperature=temperature if temperature is not None else config.CHAT_TEMPERATURE,
+            messages=[
+                {"role": "system", "content": _COVERAGE_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n\nItems in this set:\n{listed}\n\n"
+                        f"Previous answer:\n{answer}\n\nContext:\n{context_text}"
+                    ),
+                },
+            ],
+        )
+        rewritten = (completion.choices[0].message.content or "").strip()
+    except (openai.OpenAIError, IndexError) as exc:
+        logger.warning("Enumeration coverage repair failed: %s", exc)
+        return answer, report
+
+    # Guarded like grounding remediation: a repair may only improve the answer.
+    # A rewrite that withdrew it, or covered no more than before, is discarded --
+    # trading a partly-right answer for a reworded one is not a repair.
+    if not rewritten or _is_refusal(rewritten):
+        return answer, report
+    after = enumeration.missing_from(rewritten)
+    if len(after) >= len(missing):
+        return answer, report
+
+    report.update(
+        {"repaired": True, "covered": enumeration.expected - len(after), "missing": after}
+    )
+    return rewritten, report
+
+
 def enforce_grounding(
     question: str,
     answer: str,
@@ -1216,6 +1330,21 @@ def query(
             grounding=Grounding(checked=False, note="Refusal: nothing to verify."),
             diagnostics=diagnostics,
         )
+
+    # V3.3: completeness before faithfulness. The coverage repair can only ADD
+    # items the context supports, so the grounding check that follows still runs
+    # over the final text -- whereas checking coverage after grounding would leave
+    # a repaired answer unverified.
+    answer_text, coverage = enforce_enumeration_coverage(
+        question,
+        answer_text,
+        context.text,
+        getattr(retrieval, "enumeration", None),
+        chat_model,
+        temperature,
+    )
+    if coverage:
+        diagnostics["enumeration"] = coverage
 
     grounding = verify_grounding(answer_text, context.text)
     answer_text, grounding = enforce_grounding(

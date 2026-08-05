@@ -199,6 +199,75 @@ python scripts/verify_v3_1.py --structural
 python scripts/verify_v3_1.py
 ```
 
+## Tables (V3.2)
+
+One flag, **OFF** by default: `TABLE_AWARE_INGESTION_ENABLED`. With it off, tables
+behave exactly as in V2 one pipe-delimited block per detected table, inside the
+normal chunk stream.
+
+Overlap cannot fix a table. What a table fragment is missing is not the previous
+120 characters, it is the **header row** which may be an entire page away. Both
+multi-page tables in this corpus break that way: the WidgetX fault codes continue
+from page 7 to page 8 and the page-8 fragment has no header row at all.
+
+With the flag on:
+
+| Stage | What happens |
+|---|---|
+| Extract | `find_tables()` yields rows + column headers + page, before text chunking. Table regions stay excluded from prose. |
+| Stitch | Consecutive-page fragments merge into one logical table at **ingest**, so it is never a cross-page problem at query time. |
+| Chunk | Split on **row** boundaries, never mid-row, with the header block repeated in every part. |
+| Tag | Every part carries `table_id`, `table_part`, `table_total_parts`, `page_range`, `table_headers`. |
+| Summarise | A one-line description per table (`"Table: 3. Diagnostic Fault Codes; columns: Code, Meaning, Required action; rows: E-01, ..."`) is embedded as its own small chunk with the same `table_id`. |
+| Expand | A hit on any part fetches every sibling **by metadata, not by search** (~1ms), and the whole table reaches the model. |
+
+Past `TABLE_SIBLING_MAX_PARTS` / `TABLE_SIBLING_MAX_TOKENS`, expansion degrades to
+the header block, the summary, and the parts that matched rather than evicting
+every other document from the context window.
+
+```bash
+python scripts/verify_v3_2.py --structural   # 40 checks, no API calls
+python scripts/verify_v3_2.py                # plus the known-answer before/after
+```
+
+## Universal metadata (V3.3)
+
+Every chunk in the index carries the **same 15 fields** text chunks, table parts,
+table summaries and plain-text fallback chunks alike. A field may be empty; it may
+never be absent, because a Chroma `where` clause on a key that only some chunks
+carry silently returns fewer results instead of erroring.
+
+| Group | Fields |
+|---|---|
+| Provenance (Layer A, exact) | `source` `page` `chunk_index` `user_id` `heading_path` `section_title` |
+| Semantics (Layer B, LLM at ingest) | `content_type` `topics` `entities` `answers_questions` |
+| Tables (V3.2) | `table_id` `table_part` `table_total_parts` `table_headers` |
+| Ingestion | `extraction_mode` |
+
+Validated **at write time**, after ownership is stamped and immediately before the
+chunk reaches Chroma set `CHUNK_SCHEMA_STRICT=true` to make a violation raise
+rather than log.
+
+**Split by consumer, so metadata is not a token tax.** Only `source`, `page`,
+`heading_path` and `content_type` reach the prompt. The other eleven including
+every LLM-generated label are read by code for filtering and routing, and never
+shown to the answer model. That is also what makes "a wrong auto-tag can never
+corrupt an answer" structural rather than a promise.
+
+**What the metadata buys**
+
+| Use | Effect |
+|---|---|
+| Completeness | The per-document manifest (SQLite) knows a document has 7 trainings, so an answer listing 3 is caught and regenerated instead of looking finished. |
+| Precision filtering | "what does the sick leave section say?" filters by `heading_path` before searching: **396 chunks 9**. |
+| Richer citations | `Employee Handbook > 4. Sick Leave, p. 12` rather than a bare page number. |
+| Type-aware answers | `content_type` tells the model whether it is reading steps, a rule, a table or a definition. |
+
+```bash
+python scripts/verify_v3_3.py --structural   # 25 checks, no API calls
+python scripts/verify_v3_3.py                # plus each layer measured independently
+```
+
 ## Run everything
 
 From the project root:

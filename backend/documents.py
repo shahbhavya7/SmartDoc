@@ -23,7 +23,7 @@ import logging
 from pathlib import Path
 
 import backend.config as config
-from backend import db
+from backend import db, manifest, semantic
 from backend.ingestion import PDFReadError, build_chunks
 from backend.markdown_ingestion import extract_document_auto
 from backend.user_scope import user_scope
@@ -80,6 +80,13 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
         user_id, record["id"], parsed.extraction_mode, parsed.markdown_path
     )
 
+    # V3.3 Layer B, then Layer C. Order matters: the manifest aggregates the topic
+    # and entity lists Layer B produces, so labelling has to finish first.
+    semantic.annotate(children)
+    manifest_items = manifest.store_manifest(
+        user_id, record["id"], manifest.build_manifest(parsed, children)
+    )
+
     # The scope is set here as well as by the request dependency: ingestion also
     # runs from scripts, and the write path must never be able to land chunks
     # with no owner.
@@ -97,6 +104,8 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
         # Surfaced so a document that degraded to the fallback path is visible at
         # upload time, not only by inspecting the row later.
         "extraction_mode": parsed.extraction_mode,
+        # V3.3: how many enumerable items this document is now known to contain.
+        "manifest_items": manifest_items,
     }
 
 

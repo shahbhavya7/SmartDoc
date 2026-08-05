@@ -49,6 +49,7 @@ from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 import backend.config as config
+from backend.chunk_schema import apply_defaults
 
 PDF_SUFFIX = ".pdf"
 
@@ -114,6 +115,12 @@ class ParsedDocument:
 
     # Path to the cached markdown, relative to PROJECT_ROOT; "" on the text path.
     markdown_path: str = ""
+
+    # V3.2: tables lifted out of the text stream as structured objects, already
+    # stitched across page breaks. Empty unless TABLE_AWARE_INGESTION_ENABLED --
+    # with the flag off, tables stay inline in ``blocks`` exactly as in V2.
+    # Typed loosely to keep ``backend.tables`` from importing this module and back.
+    tables: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -286,13 +293,21 @@ def _covered_by_table(rect: fitz.Rect, table_rects: list[fitz.Rect]) -> bool:
     return False
 
 
-def _extract_page_items(page: fitz.Page) -> list[tuple[str, str]]:
+def _extract_page_items(
+    page: fitz.Page, emit_tables: bool = True
+) -> list[tuple[str, str]]:
     """Extract one page as ordered ``(kind, text)`` items.
 
     Tables are extracted first and their bounding boxes recorded; prose blocks
     overlapping a table region are then skipped, so table cells are not emitted
     twice. Blocks are ordered top-to-bottom, approximating reading order for
     single- and multi-column layouts alike.
+
+    ``emit_tables=False`` (V3.2, TABLE_AWARE_INGESTION_ENABLED) still detects
+    tables and still excludes their regions from the prose -- what changes is that
+    the rendered table is NOT put into the text chunk stream, because
+    ``backend.tables`` owns it from that point on. Detection cannot be skipped:
+    without the bounding boxes, table cells reappear as scrambled prose.
     """
     items: list[tuple[float, str, str]] = []
 
@@ -301,6 +316,8 @@ def _extract_page_items(page: fitz.Page) -> list[tuple[str, str]]:
         for table in page.find_tables().tables:
             rect = fitz.Rect(table.bbox)
             table_rects.append(rect)
+            if not emit_tables:
+                continue
             rendered = _table_to_text(table.extract())
             if rendered:
                 items.append((rect.y0, "table", rendered))
@@ -325,6 +342,11 @@ def _extract_page_items(page: fitz.Page) -> list[tuple[str, str]]:
 def extract_document(pdf_path: str | Path) -> ParsedDocument:
     """Parse a PDF into a page-numbered stream of structural blocks.
 
+    V3.2: when ``TABLE_AWARE_INGESTION_ENABLED`` is on, tables are lifted out of
+    the block stream into ``ParsedDocument.tables`` as structured, page-stitched
+    objects. Their regions are still excluded from the prose, so nothing is
+    double-processed. With the flag off this function is unchanged.
+
     Raises:
         PDFReadError: for a missing file, a non-PDF, an encrypted PDF that will
             not open with a blank password, or an unreadable file.
@@ -340,9 +362,12 @@ def extract_document(pdf_path: str | Path) -> ParsedDocument:
         if doc.is_encrypted and not doc.authenticate(""):
             raise PDFReadError(f"PDF {path.name} is encrypted and could not be opened.")
 
+        table_aware = config.TABLE_AWARE_INGESTION_ENABLED
         raw_pages: list[list[tuple[str, str]]] = []
         for index in range(doc.page_count):
-            raw_pages.append(_extract_page_items(doc.load_page(index)))
+            raw_pages.append(
+                _extract_page_items(doc.load_page(index), emit_tables=not table_aware)
+            )
 
         page_lines = [
             [
@@ -415,14 +440,38 @@ def extract_document(pdf_path: str | Path) -> ParsedDocument:
             if page_text:
                 pages.append(PageText(page=page_no, text=page_text))
 
+        source = path.name
+        if table_aware:
+            # Imported here, not at module scope: backend.tables depends on this
+            # module's cleaner and heading test, so a top-level import would be
+            # circular.
+            from backend.tables import extract_tables, tables_hash
+
+            structured_tables = extract_tables(path, source)
+        else:
+            structured_tables = []
+
+        # The digest covers the tables as well as the prose. Turning the flag on
+        # moves table text from the block stream into its own chunks, so the hash
+        # MUST change -- otherwise "unchanged, skipped" leaves the corpus indexed
+        # under the old path while the run reports success.
+        #
+        # Salted only when the document actually HAS tables. A table-free document
+        # produces a byte-identical chunk stream either way, so salting it
+        # regardless would re-embed nine of this corpus's thirteen documents to
+        # arrive at exactly what was already indexed.
         full_text = "\n".join(b.text for b in blocks)
+        if structured_tables:
+            full_text = f"tables\n{tables_hash(structured_tables)}\n{full_text}"
+
         return ParsedDocument(
-            source=path.name,
+            source=source,
             title=title or path.stem.replace("_", " ").title(),
             page_count=doc.page_count,
             pages=pages,
             blocks=blocks,
             content_hash=hashlib.sha256(full_text.encode("utf-8")).hexdigest(),
+            tables=structured_tables,
         )
     except PDFReadError:
         raise
@@ -445,6 +494,27 @@ def _splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTextSpli
         chunk_overlap=chunk_overlap,
         separators=SEPARATORS,
     )
+
+
+def _fallback_heading(title: str, section: str) -> str:
+    """A heading path composed from the V1 flat section, for the text path.
+
+    V3.3 makes ``heading_path`` a contract field every chunk carries, and a filter
+    is only useful if it is populated. The plain-text path has no hierarchy, but it
+    does know the document title and the nearest heading -- the same information
+    the V1 extractor already had -- so composing them gives a real, if shallow,
+    path instead of an empty string.
+
+    This deliberately supersedes one V3.1 guarantee: flag-OFF chunk METADATA is no
+    longer byte-identical to V2. Chunk text, boundaries and counts are unchanged;
+    only this field gains a value it can be filtered and cited by.
+    """
+    parts = [p for p in ((title or "").strip(), (section or "").strip()) if p]
+    # The first chunk's section is often the title itself, and
+    # "Handbook > Handbook" is a worse label than "Handbook".
+    if len(parts) == 2 and parts[0].casefold() == parts[1].casefold():
+        parts = parts[:1]
+    return " > ".join(parts)
 
 
 def _breadcrumb(title: str, section: str, heading_path: str = "") -> str:
@@ -591,6 +661,66 @@ def _chunk_blocks(
     return chunks
 
 
+def _splice_by_page(
+    children: list[Document], table_documents: list[Document]
+) -> list[Document]:
+    """Insert table chunks into the text stream at their page position.
+
+    Insertion, not a re-sort of everything: the text children are already in
+    reading order, and re-sorting them by page would reorder a chunk that legally
+    spans a page break (its ``page`` is the range's START, so it can sort ahead of
+    a chunk that begins later on the previous page).
+
+    Each table's chunks stay contiguous and in part order, placed after every text
+    chunk that starts on the table's first page or earlier. A page number cannot
+    order two chunks *within* a page, so "after everything on page 7" is the
+    finest placement available -- and it is the right one for the corpus's real
+    cases, where a table that breaks across a page sits at the bottom of the first
+    one. Inserting before the page's prose instead made chunk_index disagree with
+    page order, which is what ``backend.context`` sorts a document's units by.
+    """
+    if not table_documents:
+        return children
+
+    groups: dict[str, list[Document]] = {}
+    for document in table_documents:
+        groups.setdefault(document.metadata["table_id"], []).append(document)
+
+    def page_of(document: Document) -> int:
+        return int(document.metadata.get("page") or 0)
+
+    pending = sorted(groups.values(), key=lambda group: page_of(group[0]))
+    out: list[Document] = []
+    for child in children:
+        while pending and page_of(pending[0][0]) < page_of(child):
+            out.extend(pending.pop(0))
+        out.append(child)
+    for group in pending:
+        out.extend(group)
+    return out
+
+
+def _table_heading_paths(parsed: ParsedDocument) -> dict[int, str]:
+    """Map each table's ordinal to a V3.1 heading path, when one is known.
+
+    Tables are found by PyMuPDF and know only their nearest heading, so the full
+    hierarchy is recovered by matching that heading against the markdown sections
+    already parsed for this document. Empty on the plain-text path, which has no
+    hierarchy to offer -- the same V2-neutral value every other V3.1 key takes.
+    """
+    if parsed.extraction_mode != "markdown":
+        return {}
+    by_title: dict[str, str] = {}
+    for block in parsed.blocks:
+        if block.section and block.heading_path:
+            by_title.setdefault(block.section, block.heading_path)
+    return {
+        table.index: by_title.get(table.section, "")
+        for table in parsed.tables
+        if table.section
+    }
+
+
 def build_chunks(
     parsed: ParsedDocument,
     child_size: int | None = None,
@@ -658,7 +788,12 @@ def build_chunks(
                 children.append(
                     Document(
                         page_content=text,
-                        metadata={
+                        # V3.3: apply_defaults guarantees the FULL contract on
+                        # every chunk -- the table_* and Layer B fields included,
+                        # at their defaults for a prose chunk. A field may be
+                        # empty; it may never be absent, or a `where` clause on it
+                        # silently under-returns instead of erroring.
+                        metadata=apply_defaults({
                             "source": parsed.source,
                             "doc_title": parsed.title,
                             "section": child.section,
@@ -673,14 +808,39 @@ def build_chunks(
                             # flag-OFF chunk's metadata is unchanged in value.
                             # Delimited string, not a list: Chroma stores
                             # scalars only.
-                            "heading_path": child.heading_path,
+                            "heading_path": child.heading_path
+                            or _fallback_heading(parsed.title, child.section),
                             "section_title": child.section,
                             "extraction_mode": parsed.extraction_mode,
-                        },
+                        }),
                     )
                 )
                 child_index += 1
             parent_index += 1
+
+    # V3.2: table chunks are their own stream, spliced back into reading order by
+    # page. They deliberately have no ``parent_id``: a table part is already a
+    # complete unit (its header block is repeated in every part), and substituting
+    # a prose parent for it would replace the rows with the surrounding text.
+    # Completeness comes from sibling expansion instead.
+    if parsed.tables:
+        from backend.tables import build_table_documents
+
+        children = _splice_by_page(
+            children,
+            build_table_documents(
+                parsed.tables,
+                doc_title=parsed.title,
+                content_hash=parsed.content_hash,
+                heading_paths=_table_heading_paths(parsed),
+            ),
+        )
+        # chunk_index is reassigned over the merged stream: it is what
+        # backend.context sorts a document's units by to restore reading order,
+        # so a table appearing at index 400 in a document that ends at page 8
+        # would put the table after every paragraph in the assembled prompt.
+        for position, child in enumerate(children):
+            child.metadata["chunk_index"] = position
 
     # Neighbour links, assigned after all children exist so ordering is
     # document-global rather than per-parent.

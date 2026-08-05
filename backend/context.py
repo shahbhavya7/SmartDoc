@@ -39,6 +39,15 @@ class ContextBlock:
     text: str
     units: list[RetrievedUnit] = field(default_factory=list)
 
+    # V3.3: the PROMPT-VISIBLE half of the metadata contract. Four fields, chosen
+    # so the model can cite precisely and pick an output shape. The filter-only
+    # fields (topics, entities, answers_questions, table_part, extraction_mode)
+    # are deliberately absent -- they are read by code, and putting generated
+    # labels in front of the answer model is both a token tax and the one way a
+    # wrong auto-tag could reach an answer.
+    heading_path: str = ""
+    content_type: str = ""
+
     @property
     def page_label(self) -> str:
         """Human-readable page or page range."""
@@ -193,6 +202,18 @@ def _merge_adjacent(units: list[RetrievedUnit]) -> tuple[list[RetrievedUnit], in
     return merged, merges
 
 
+def _common(units: list[RetrievedUnit], key: str) -> str:
+    """The value all units in a block agree on, or "" when they differ.
+
+    A block spanning two sections has no single heading path, and labelling it
+    with the first one would tell the model -- and the reader following the
+    citation -- that a passage came from a section it did not.
+    """
+    values = {str(u.metadata.get(key, "") or "") for u in units}
+    values.discard("")
+    return values.pop() if len(values) == 1 else ""
+
+
 def _group_by_document(units: list[RetrievedUnit]) -> list[ContextBlock]:
     """Group units by source, ordered by page within each group."""
     grouped: dict[str, list[RetrievedUnit]] = {}
@@ -217,6 +238,8 @@ def _group_by_document(units: list[RetrievedUnit]) -> list[ContextBlock]:
                 ),
                 text="\n\n".join(u.text.strip() for u in group),
                 units=group,
+                heading_path=_common(group, "heading_path"),
+                content_type=_common(group, "content_type"),
             )
         )
     return blocks
@@ -256,6 +279,8 @@ def _document_order_blocks(units: list[RetrievedUnit]) -> list[ContextBlock]:
                     ),
                     text="\n\n".join(u.text.strip() for u in run),
                     units=list(run),
+                    heading_path=_common(run, "heading_path"),
+                    content_type=_common(run, "content_type"),
                 )
             )
             run = []
@@ -346,6 +371,8 @@ def assemble(
                     page_end=int(u.metadata.get("page_end", u.page) or u.page),
                     text=u.text,
                     units=[u],
+                    heading_path=str(u.metadata.get("heading_path", "") or ""),
+                    content_type=str(u.metadata.get("content_type", "") or ""),
                 )
                 for u in selected
             ]
@@ -366,8 +393,16 @@ def assemble(
 
     for index, block in enumerate(ordered, start=1):
         label = f"[{index}] {block.source}, {block.page_label}"
-        if block.section:
-            label += f", section: {block.section}"
+        # heading_path supersedes the flat section when present: it is the same
+        # field the citation shows, so the model reads the label the reader sees.
+        trail = block.heading_path or block.section
+        if trail:
+            label += f", section: {trail}"
+        # content_type is the one semantic field the model DOES see -- it costs
+        # one word and tells it whether it is looking at steps, a rule, a table or
+        # a definition, which is what shapes the answer.
+        if block.content_type and block.content_type != "other":
+            label += f" [{block.content_type}]"
         parts.append(f"{label}\n{block.text.strip()}")
 
     text = "\n\n---\n\n".join(parts)
