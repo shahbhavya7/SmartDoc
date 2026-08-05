@@ -224,6 +224,47 @@ HEADING_FILTER_MAX_SHARE = _float("HEADING_FILTER_MAX_SHARE", 0.5)
 CHUNK_SCHEMA_STRICT = _bool("CHUNK_SCHEMA_STRICT", False)
 
 # ---------------------------------------------------------------------------
+# Addendum 2 -- parallel SQL + vector table retrieval
+#
+# OFF by default. When ON, every table's cells are ALSO stored relationally in
+# SQLite at ingest, and a query that looks like it names a table cell fires an
+# indexed SQL lookup **alongside** the full hybrid pipeline rather than instead of
+# it. Vector retrieval always runs; SQL is speculative and is used only when it is
+# confidently correct.
+#
+# The asymmetry between the two decisions is the whole design:
+#   * Decision 1 (fire?) is PERMISSIVE -- a local indexed read costs ~1ms and no
+#     API call, and a wrong guess is free because retrieval runs regardless.
+#   * Decision 2 (trust?) is STRICT -- a wrong exact value stated authoritatively
+#     is worse than no exact value at all.
+# ---------------------------------------------------------------------------
+PARALLEL_SQL_LOOKUP_ENABLED = _bool("PARALLEL_SQL_LOOKUP_ENABLED", False)
+
+# Decision 1's fuzzy floor: how closely a query n-gram must resemble a known
+# column name or row entity before SQL is worth firing. Deliberately below the
+# trust threshold -- this gate decides whether to SPEND 1ms, not whether to
+# believe an answer.
+PARALLEL_SQL_FIRE_THRESHOLD = _int("PARALLEL_SQL_FIRE_THRESHOLD", 78)
+
+# Decision 2's floor, applied to BOTH the entity and the column match. The brief
+# fixes this at 85; it is exposed so the strictness can be measured, not tuned by
+# feel.
+PARALLEL_SQL_TRUST_THRESHOLD = _int("PARALLEL_SQL_TRUST_THRESHOLD", 85)
+
+# Extension: MAX/MIN/COUNT and simple numeric filters, which vector search is
+# genuinely poor at ("who scored highest in Math"). Same Decision 2 discipline.
+PARALLEL_SQL_AGGREGATES_ENABLED = _bool("PARALLEL_SQL_AGGREGATES_ENABLED", True)
+
+# A filter aggregate ("who scored above 80") legitimately returns a SET, so the
+# single-value rule cannot apply to it. This cap replaces it: past this many rows
+# the result is a report, not a fact, and is discarded in favour of the passages.
+PARALLEL_SQL_MAX_FILTER_ROWS = _int("PARALLEL_SQL_MAX_FILTER_ROWS", 20)
+
+# Cells stored per document. A pathological 10k-cell table would otherwise make
+# every ingest and every cache warm slower for a lookup nobody asks.
+PARALLEL_SQL_MAX_CELLS_PER_DOC = _int("PARALLEL_SQL_MAX_CELLS_PER_DOC", 20000)
+
+# ---------------------------------------------------------------------------
 # Storage
 # ---------------------------------------------------------------------------
 CHROMA_DIR = PROJECT_ROOT / os.getenv("CHROMA_DIR", "chroma_store")

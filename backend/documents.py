@@ -23,7 +23,7 @@ import logging
 from pathlib import Path
 
 import backend.config as config
-from backend import db, manifest, semantic
+from backend import db, manifest, semantic, table_store
 from backend.ingestion import PDFReadError, build_chunks
 from backend.markdown_ingestion import extract_document_auto
 from backend.user_scope import user_scope
@@ -87,6 +87,14 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
         user_id, record["id"], manifest.build_manifest(parsed, children)
     )
 
+    # Addendum 2: the same structured tables, flattened into the relational cell
+    # store so an exact value can be looked up rather than searched for. No-op
+    # with PARALLEL_SQL_LOOKUP_ENABLED off; invalidates this owner's cached
+    # vocabulary so a just-uploaded table is queryable on the very next question.
+    stored_cells = table_store.store_document_tables(
+        user_id, record["id"], parsed.tables, doc_title=parsed.title
+    )
+
     # The scope is set here as well as by the request dependency: ingestion also
     # runs from scripts, and the write path must never be able to land chunks
     # with no owner.
@@ -106,6 +114,9 @@ def ingest_pdf_for_user(user_id: str, filename: str, content: bytes) -> dict:
         "extraction_mode": parsed.extraction_mode,
         # V3.3: how many enumerable items this document is now known to contain.
         "manifest_items": manifest_items,
+        # Addendum 2: how many table cells are now exactly lookup-able. 0 both
+        # when the flag is off and when the document has no tables.
+        "table_cells": stored_cells,
     }
 
 

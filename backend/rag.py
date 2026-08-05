@@ -46,6 +46,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 
 import openai
@@ -67,6 +68,7 @@ from backend.query_analysis import (
 from backend.intent import COMBINATION, DOCUMENT_WIDE
 from backend.intent import classify as intent_of
 from backend.retrieval import RetrievalResult, retrieve
+from backend.user_scope import current_user_id
 from backend.vectorstore import VectorStoreError, _shared_openai  # noqa: F401
 
 logger = logging.getLogger("smartdoc.rag")
@@ -74,6 +76,26 @@ logger = logging.getLogger("smartdoc.rag")
 REFUSAL_MESSAGE = "I don't know based on the available documents."
 
 SNIPPET_LENGTH = 260
+
+# Addendum 2. A small, long-lived pool that runs the speculative SQL lookup
+# CONCURRENTLY with the hybrid pipeline, so total latency is max(the two) rather
+# than their sum.
+#
+# Threads rather than asyncio: ``query`` and ``retrieve`` are synchronous and are
+# called from sync FastAPI handlers, scripts, and tests, so making this branch
+# async would mean colouring the whole call graph to save nothing -- the SQL side
+# is one blocking sqlite3 call, which releases the GIL for its duration, and the
+# vector side is blocking HTTP. Two threads is the shortest path to real overlap.
+#
+# Two workers, not one: a single worker would serialise two concurrent requests'
+# lookups behind each other, and not many, because each task is a ~1ms indexed
+# read and a deep pool would only add idle threads.
+_SQL_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="smartdoc-sql")
+
+# Ceiling on how long the answer path will wait for a lookup that should take a
+# millisecond. If SQLite is locked behind a long write, the passages answer alone
+# -- which is the flag-off behaviour, so the timeout degrades rather than fails.
+_SQL_TIMEOUT_SECONDS = 2.0
 
 # Numbers and identifier-shaped tokens are the claims most worth verifying: a
 # wrong entitlement figure or fault code is the failure mode that matters in
@@ -314,14 +336,23 @@ def _system_prompt(plan: QueryPlan) -> str:
 
 
 def build_prompt(
-    question: str, context: AssembledContext, conversation_context: str | None = None
+    question: str,
+    context: AssembledContext,
+    conversation_context: str | None = None,
+    exact_facts: str = "",
 ) -> str:
-    """Assemble the user turn: conversation memory, labelled context, question.
+    """Assemble the user turn: conversation memory, exact facts, context, question.
 
     ``conversation_context`` (a per-session running summary) is placed BEFORE
     the retrieved context and labelled distinctly from it, so the system
     prompt's "memory resolves references, never supplies facts" rule has a
     visibly separate block to point at rather than an ambiguous blend.
+
+    ``exact_facts`` (Addendum 2) is the confidently-resolved table cell, rendered
+    by ``table_store.render_facts``. It sits ABOVE the passages, labelled
+    authoritative, so the model knows which of the two wins for a value while
+    still having the passages for everything around it. Empty string -- the
+    normal case -- reproduces the previous prompt byte for byte.
     """
     body = context.text or "(no relevant context retrieved)"
     memory_block = (
@@ -329,11 +360,18 @@ def build_prompt(
         if conversation_context
         else ""
     )
+    facts_block = f"{exact_facts}\n\n" if exact_facts else ""
+    closing = (
+        "Answer using only the exact facts and the context above."
+        if exact_facts
+        else "Answer using only the context above."
+    )
     return (
         f"{memory_block}"
+        f"{facts_block}"
         f"Context passages:\n\n{body}\n\n"
         f"Question: {question}\n\n"
-        "Answer using only the context above."
+        f"{closing}"
     )
 
 
@@ -478,6 +516,42 @@ def build_sources(context: AssembledContext) -> list[Source]:
             )
         )
     return sources
+
+
+def add_sql_sources(sources: list[Source], facts: list) -> list[Source]:
+    """Append a citation for each confident SQL fact, deduped against passages.
+
+    A SQL-path answer without a citation is a failure -- the reader gets an exact
+    number with nothing to check it against, which is strictly worse than the
+    hedged answer they would otherwise have had. The cell carries its own
+    filename, page, and table title, so no second lookup is needed.
+
+    Deduped by (source, page, table title) so a fact whose table was ALSO
+    retrieved as a passage does not produce two entries for one place.
+    """
+    if not facts:
+        return sources
+    existing = {(s.source, s.page, s.section) for s in sources}
+    out = list(sources)
+    for fact in facts:
+        key = (fact.source, fact.page, fact.table_title)
+        if key in existing:
+            continue
+        existing.add(key)
+        trail = " > ".join(p for p in (fact.table_title, fact.column) if p)
+        out.append(
+            Source(
+                source=fact.source,
+                page=fact.page,
+                # The snippet is the cell verbatim, not a rendering of it: this
+                # is the one citation whose supporting text is a single value.
+                snippet=f"{fact.entity} - {fact.column}: {fact.value}",
+                section=fact.table_title,
+                heading_path=trail,
+                display=citation_display(trail, "", fact.table_title, fact.page, None),
+            )
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1140,6 +1214,24 @@ def query(
             candidate_k=max(plan.profile.candidate_k, top_k * 4),
         )
 
+    # ---- Addendum 2: fire the speculative SQL lookup BEFORE retrieval --------
+    # Decision 1 runs here, on this thread, against the in-memory vocabulary
+    # only -- no database access -- so a question that does not fire adds
+    # nothing measurable. When it does fire, the work is handed to the pool
+    # BEFORE the pipeline starts, which is what makes the two overlap.
+    sql_probe = None
+    sql_future = None
+    if config.PARALLEL_SQL_LOOKUP_ENABLED:
+        from backend import table_store
+
+        sql_probe = table_store.prepare(current_user_id() or "", question)
+        if sql_probe.fire:
+            sql_future = _SQL_POOL.submit(table_store.execute, sql_probe)
+
+    # Marks the start of the span the two are meant to share, so the overlap
+    # below is a measurement rather than an assumption.
+    parallel_started = time.perf_counter()
+
     retrieval: RetrievalResult = retrieve(
         plan,
         collection_name=collection_name,
@@ -1148,6 +1240,22 @@ def query(
         conversation_focus=conversation_focus,
     )
     retrieved_at = time.perf_counter()
+
+    # ---- collect the SQL side, then Decision 2 ------------------------------
+    sql_result = None
+    exact_facts = ""
+    if sql_future is not None:
+        from backend.table_store import SqlResult, render_facts
+
+        try:
+            sql_result = sql_future.result(timeout=_SQL_TIMEOUT_SECONDS)
+        except Exception as exc:
+            # Includes TimeoutError. The passages answer alone, which is exactly
+            # the flag-off path -- a lookup that could not finish must never turn
+            # an answerable question into an error.
+            logger.warning("Parallel SQL lookup abandoned: %s", exc)
+            sql_result = SqlResult(verdict="skipped", reason=f"abandoned: {exc}")
+        exact_facts = render_facts(sql_result)
 
     # ---- orchestration layer (all flags default OFF) --------------------
     # Everything below consumes retrieval's output. With every flag off,
@@ -1241,7 +1349,9 @@ def query(
                 },
                 {
                     "role": "user",
-                    "content": build_prompt(question, context, conversation_context),
+                    "content": build_prompt(
+                        question, context, conversation_context, exact_facts
+                    ),
                 },
             ],
         )
@@ -1275,6 +1385,47 @@ def query(
             "generation": round((answered_at - retrieved_at) * 1000),
         },
     }
+
+    # Addendum 2 diagnostics. Reported even when the SQL result was DISCARDED:
+    # the interesting failure is a correct lookup rejected by Decision 2, and
+    # that is invisible unless the rejection and its reason are recorded.
+    if sql_probe is not None:
+        vector_ms = (retrieved_at - parallel_started) * 1000.0
+        sql_ms = sql_result.elapsed_ms if sql_result else 0.0
+        overlap_ms = 0.0
+        if sql_result and sql_result.finished_at:
+            overlap_ms = max(
+                0.0,
+                (
+                    min(sql_result.finished_at, retrieved_at)
+                    - max(sql_result.started_at, parallel_started)
+                )
+                * 1000.0,
+            )
+        diagnostics["sql_lookup"] = {
+            "fired": bool(sql_future),
+            "decision_1": sql_probe.reason,
+            "entity": sql_probe.entity.resolved,
+            "entity_score": round(sql_probe.entity.score, 1),
+            "column": sql_probe.column.resolved,
+            "column_score": round(sql_probe.column.score, 1),
+            "aggregate": sql_probe.aggregate,
+            "verdict": sql_result.verdict if sql_result else "not fired",
+            "decision_2": sql_result.reason if sql_result else sql_probe.reason,
+            "rows_returned": sql_result.rows_returned if sql_result else 0,
+            "facts_used": len(sql_result.facts) if sql_result and sql_result.confident else 0,
+            "timing_ms": {
+                "sql": round(sql_ms, 2),
+                "vector": round(vector_ms, 2),
+                # The concurrency proof. Serial execution would give
+                # wall == sql + vector; concurrent gives wall == max(the two),
+                # and `overlap` is how much of the SQL work happened while the
+                # pipeline was running.
+                "wall": round((retrieved_at - parallel_started) * 1000, 2),
+                "serial_would_be": round(sql_ms + vector_ms, 2),
+                "overlap": round(overlap_ms, 2),
+            },
+        }
 
     # ESCALATION. A refusal from a cheap single-query plan is ambiguous: the
     # corpus may genuinely lack the answer, or the plan may have been too
@@ -1335,10 +1486,21 @@ def query(
     # items the context supports, so the grounding check that follows still runs
     # over the final text -- whereas checking coverage after grounding would leave
     # a repaired answer unverified.
+    # Addendum 2: the exact fact is part of what the answer is allowed to say, so
+    # it is part of what verification checks against. Without this the verifier
+    # sees "78" in the answer and not in the passages, calls it an unsupported
+    # number, and strips out the very value the lookup was for. The fact is not
+    # generated text -- it is a cell extracted verbatim from the document, cited
+    # with its own page -- so admitting it here widens the evidence, not the
+    # licence to invent.
+    verification_context = (
+        f"{context.text}\n\n{exact_facts}" if exact_facts else context.text
+    )
+
     answer_text, coverage = enforce_enumeration_coverage(
         question,
         answer_text,
-        context.text,
+        verification_context,
         getattr(retrieval, "enumeration", None),
         chat_model,
         temperature,
@@ -1346,9 +1508,9 @@ def query(
     if coverage:
         diagnostics["enumeration"] = coverage
 
-    grounding = verify_grounding(answer_text, context.text)
+    grounding = verify_grounding(answer_text, verification_context)
     answer_text, grounding = enforce_grounding(
-        question, answer_text, context.text, grounding, chat_model, temperature
+        question, answer_text, verification_context, grounding, chat_model, temperature
     )
 
     diagnostics["latency_ms"]["verification"] = round(
@@ -1367,9 +1529,13 @@ def query(
             diagnostics=diagnostics,
         )
 
+    sources = build_sources(context)
+    if sql_result is not None and sql_result.confident:
+        sources = add_sql_sources(sources, sql_result.facts)
+
     return RagResponse(
         answer=answer_text,
-        sources=build_sources(context),
+        sources=sources,
         query_type=plan.query_type,
         grounding=grounding,
         diagnostics=diagnostics,

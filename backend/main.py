@@ -124,6 +124,15 @@ def _startup() -> None:
     """Create the SQLite schema and refuse an obviously unsafe signing key."""
     db.init_db()
     auth.assert_signing_key_usable()
+    # Addendum 2: preload every owner's table vocabulary, so the first question
+    # after a restart pays no more than the millionth. Lazy building covers
+    # anything this misses (a user created after boot); this only removes the
+    # cold-start cost. No-op with PARALLEL_SQL_LOOKUP_ENABLED off.
+    from backend import table_store
+
+    warmed = table_store.warm_all()
+    if warmed:
+        logger.info("Warmed table vocabulary for %d user(s).", warmed)
 
 
 # --------------------------------------------------------------------------
@@ -297,6 +306,16 @@ class UploadFileResult(BaseModel):
             "V3.1: 'markdown', or 'text' when the plain-text path was used -- "
             "either because MARKDOWN_INGESTION_ENABLED is off or because "
             "conversion fell back (a scanned / image-only PDF)."
+        ),
+    )
+    table_cells: int | None = Field(
+        default=None,
+        description=(
+            "Addendum 2: table cells now exactly lookup-able for this document. "
+            "0 both when PARALLEL_SQL_LOOKUP_ENABLED is off and when the document "
+            "has no tables -- surfaced here for the same reason as "
+            "extraction_mode, so a document that produced nothing is visible at "
+            "upload time rather than only by inspecting the database."
         ),
     )
     error: str | None = None
@@ -774,6 +793,7 @@ def _ingest_one_file(user_id: str, filename: str, content: bytes) -> UploadFileR
         chunks_created=result["chunks_created"],
         chunks_indexed=result["chunks_indexed"],
         extraction_mode=result["extraction_mode"],
+        table_cells=result.get("table_cells", 0),
     )
 
 

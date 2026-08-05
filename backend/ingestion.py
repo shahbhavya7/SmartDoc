@@ -441,7 +441,12 @@ def extract_document(pdf_path: str | Path) -> ParsedDocument:
                 pages.append(PageText(page=page_no, text=page_text))
 
         source = path.name
-        if table_aware:
+        # Addendum 2 needs the same structured tables to fill the relational cell
+        # store, so extraction runs for EITHER flag -- one parse serves both. What
+        # each flag controls is what happens downstream: table-aware ingestion
+        # changes the chunk stream (``build_chunks`` gates on its own flag), while
+        # the SQL store only reads ``parsed.tables`` and leaves chunking alone.
+        if table_aware or config.PARALLEL_SQL_LOOKUP_ENABLED:
             # Imported here, not at module scope: backend.tables depends on this
             # module's cleaner and heading test, so a top-level import would be
             # circular.
@@ -823,7 +828,11 @@ def build_chunks(
     # complete unit (its header block is repeated in every part), and substituting
     # a prose parent for it would replace the rows with the surrounding text.
     # Completeness comes from sibling expansion instead.
-    if parsed.tables:
+    # Gated on the flag, not merely on ``parsed.tables`` being populated: with
+    # Addendum 2 on and table-aware chunking off, tables are extracted for the
+    # SQL store alone and must NOT change the chunk stream. Keying off the flag
+    # is what keeps flag-off chunk output byte-identical.
+    if parsed.tables and config.TABLE_AWARE_INGESTION_ENABLED:
         from backend.tables import build_table_documents
 
         children = _splice_by_page(

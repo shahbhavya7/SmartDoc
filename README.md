@@ -268,6 +268,46 @@ python scripts/verify_v3_3.py --structural   # 25 checks, no API calls
 python scripts/verify_v3_3.py                # plus each layer measured independently
 ```
 
+## Exact table values (Addendum 2)
+
+`PARALLEL_SQL_LOOKUP_ENABLED` (default **off**). Dense retrieval finds a table by
+what it is *about*; it cannot find a cell by what it *contains*. Ask for one row
+out of ninety and the question's embedding is nearly equidistant from all of
+them.
+
+So at ingest every table cell is **also** written to SQLite as
+`(row label, column, value)` with its filename, page and table title. At query
+time an indexed SQL lookup runs **alongside** the full hybrid pipeline never
+instead of it.
+
+| | Decision 1 fire SQL? | Decision 2 trust it? |
+|---|---|---|
+| **When** | Before any result exists | After both results are in |
+| **Stance** | Permissive fire on any hint | Strict reject on any doubt |
+| **Why** | ~1ms, no API call, another thread. A wrong guess is free. | A wrong value stated authoritatively is worse than none the reader cannot tell it from a right one. |
+| **Rule** | A phrase fuzzy-matches a column **or** a row label **or** the question has a numeric cue | Entity **and** column both 85, **exactly one** row back, **no** multi-answer cue (all/every/list/compare/why/explain/summarize/breakdown) |
+
+**Merge, don't choose.** When SQL is confident the model gets *both* the exact
+fact, labelled authoritative and cited, and the retrieved passages so one answer
+can be exact *and* explained ("78 in English, above the 40-mark passing
+threshold"). Anything less than confident is dropped silently and the passages
+answer alone, which is exactly the flag-off behaviour.
+
+**Identifiers are pinned, not fuzzed.** `WRatio("employee 45", "employee 1")` is
+about 95 comfortably over the trust floor so edit distance alone would answer
+row 45 with row 1's salary. Resolution tries exact match first, and fuzzy
+matching only ever considers labels with the *same digit runs*.
+
+Also supported: `MAX`/`MIN`, `COUNT`, and numeric filters ("who scored highest in
+Math"), which vector search cannot do at all because no passage states the
+answer. Same discipline a tie has no winner, and a column living in two tables
+is not aggregable.
+
+```bash
+python scripts/verify_addendum2.py --structural   # 20 checks, no API calls
+python scripts/verify_addendum2.py                # plus the measured concurrency proof
+```
+
 ## Run everything
 
 From the project root:

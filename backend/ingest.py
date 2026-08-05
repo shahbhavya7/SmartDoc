@@ -31,7 +31,7 @@ import time
 from pathlib import Path
 
 import backend.config as config
-from backend import db, manifest, semantic
+from backend import db, manifest, semantic, table_store
 from backend.ingestion import _pdfs_in, build_chunks
 from backend.markdown_ingestion import extract_document_auto
 from backend.user_scope import user_scope
@@ -114,7 +114,11 @@ def main() -> None:
     print(
         f"Metadata       : semantic "
         f"{'ON' if config.SEMANTIC_METADATA_ENABLED else 'OFF'} | manifest routing "
-        f"{'ON' if config.MANIFEST_ROUTING_ENABLED else 'OFF'}\n"
+        f"{'ON' if config.MANIFEST_ROUTING_ENABLED else 'OFF'}"
+    )
+    print(
+        f"Parallel SQL   : {'ON' if config.PARALLEL_SQL_LOOKUP_ENABLED else 'OFF'}"
+        f" (PARALLEL_SQL_LOOKUP_ENABLED)\n"
     )
 
     # Bind the scope around the whole run, so the content-hash check, the
@@ -136,6 +140,7 @@ def _run(args, owner: dict | None) -> None:
     total_tables = 0
     total_stitched = 0
     total_items = 0
+    total_cells = 0
     skipped = 0
     start = time.time()
 
@@ -176,6 +181,12 @@ def _run(args, owner: dict | None) -> None:
             total_items += manifest.store_manifest(
                 owner["id"], document_id, manifest.build_manifest(parsed, children)
             )
+            # Addendum 2: flatten the same structured tables into the relational
+            # cell store. Off by flag, and skipped entirely on an unscoped run --
+            # cells are owned rows and there is no account to own them.
+            total_cells += table_store.store_document_tables(
+                owner["id"], document_id, parsed.tables, doc_title=parsed.title
+            )
 
         indexed = ingest_documents(
             children, parents=parents, document_id=document_id
@@ -200,6 +211,13 @@ def _run(args, owner: dict | None) -> None:
         print(
             "Manifest       : none written -- an unscoped run has no documents row "
             "to attach one to. Pass --user to build manifests."
+        )
+    if total_cells:
+        print(f"Table cells    : {total_cells} exactly lookup-able (parallel SQL)")
+    elif config.PARALLEL_SQL_LOOKUP_ENABLED and total_tables:
+        print(
+            "Table cells    : none stored -- an unscoped run has no owner to attach "
+            "them to. Pass --user to populate the SQL lookup store."
         )
     if total_tables:
         # A stitched table is one that crossed a page break and was reassembled

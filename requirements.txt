@@ -17,6 +17,12 @@ tiktoken==0.8.0
 rank_bm25==0.2.2
 python-multipart==0.0.32
 
+# Addendum 2 -- fuzzy term resolution for the parallel SQL table lookup. C++
+# under the hood, so a 90-entity vocabulary scores in microseconds and Decision 1
+# stays free enough to fire permissively. Pure-Python difflib was measured at the
+# wrong order of magnitude for a per-query gate.
+rapidfuzz==3.9.7
+
 # V2 -- auth and the relational layer
 bcrypt==4.2.1
 PyJWT==2.10.1

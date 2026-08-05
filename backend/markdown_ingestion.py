@@ -601,8 +601,11 @@ def extract_document_markdown(
 
     # V3.2: tables come from PyMuPDF's structured finder in BOTH ingestion modes,
     # so a table is stitched and headered identically whichever text path is on.
+    # Addendum 2 extracts here too, so the relational cell store is populated on
+    # the markdown path as well. ``build_chunks`` gates the CHUNKING on
+    # TABLE_AWARE_INGESTION_ENABLED, so the extra extraction changes no chunk.
     structured_tables = []
-    if config.TABLE_AWARE_INGESTION_ENABLED:
+    if config.TABLE_AWARE_INGESTION_ENABLED or config.PARALLEL_SQL_LOOKUP_ENABLED:
         from backend.tables import extract_tables, tables_hash
 
         structured_tables = extract_tables(path, path.name)

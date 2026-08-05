@@ -113,12 +113,50 @@ CREATE TABLE IF NOT EXISTS manifest_items (
     table_id      TEXT NOT NULL DEFAULT ''
 );
 
+-- Addendum 2. Every table cell, one row per cell (entity-attribute-value).
+--
+-- Long rather than wide because the tables being stored have no fixed shape: a
+-- column-per-column schema would need DDL per document. EAV makes
+-- "entity + column -> value" one indexed lookup and makes MAX/MIN/COUNT over a
+-- column a plain aggregate, which is exactly the two access patterns this exists
+-- for. ``value`` is TEXT even for numbers: it is the cell verbatim, and an answer
+-- must be able to quote "78%" or "1,200" as the document wrote it. Numeric
+-- comparison casts at query time instead.
+--
+-- source/page/table_title travel with every cell so a SQL-path answer can be
+-- cited without a second lookup. An uncited exact value is a failure, not a
+-- feature.
+CREATE TABLE IF NOT EXISTS table_cells (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id     TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL,
+    table_id        TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    table_title     TEXT NOT NULL DEFAULT '',
+    page            INTEGER,
+    row_index       INTEGER NOT NULL,
+    row_entity      TEXT NOT NULL,
+    row_entity_norm TEXT NOT NULL,
+    column_name     TEXT NOT NULL,
+    column_norm     TEXT NOT NULL,
+    value           TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user  ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_manifests_user ON document_manifests(user_id);
 CREATE INDEX IF NOT EXISTS idx_manifest_items_user ON manifest_items(user_id, item_norm);
 CREATE INDEX IF NOT EXISTS idx_manifest_items_doc ON manifest_items(document_id);
+-- The lookup index. (user_id, row_entity_norm, column_norm) is the single-cell
+-- path; the second index serves MAX/MIN/COUNT, which scan one column of one
+-- table. user_id leads both: ownership is part of the key, not a filter applied
+-- to rows the index already found.
+CREATE INDEX IF NOT EXISTS idx_cells_lookup
+    ON table_cells(user_id, row_entity_norm, column_norm);
+CREATE INDEX IF NOT EXISTS idx_cells_column
+    ON table_cells(user_id, column_norm, table_id);
+CREATE INDEX IF NOT EXISTS idx_cells_doc ON table_cells(document_id);
 """
 
 _init_lock = threading.Lock()
@@ -435,6 +473,113 @@ def manifest_group_items(
             (user_id, document_id, group_label, kind),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Addendum 2 -- the relational table-cell store
+# ---------------------------------------------------------------------------
+
+
+def replace_table_cells(user_id: str, document_id: str, cells: list[dict]) -> int:
+    """Replace this document's stored cells in one transaction.
+
+    Replace, not upsert, for the reason ``replace_manifest`` gives one level up:
+    a re-ingested spreadsheet whose row was deleted must not keep answering for
+    that row. A stale exact value is worse than none -- it is stated
+    authoritatively and is not in the document any more.
+    """
+    init_db()
+    with connect() as conn:
+        conn.execute("DELETE FROM table_cells WHERE document_id = ?", (document_id,))
+        conn.executemany(
+            "INSERT INTO table_cells (document_id, user_id, table_id, source,"
+            " table_title, page, row_index, row_entity, row_entity_norm,"
+            " column_name, column_norm, value) VALUES (:document_id, :user_id,"
+            " :table_id, :source, :table_title, :page, :row_index, :row_entity,"
+            " :row_entity_norm, :column_name, :column_norm, :value)",
+            [{**row, "document_id": document_id, "user_id": user_id} for row in cells],
+        )
+    return len(cells)
+
+
+def table_vocabulary(user_id: str) -> list[dict]:
+    """Every distinct (table, column, entity) triple this user owns.
+
+    Read once per user into the in-memory cache that Decision 1 fuzzy-matches
+    against, so the fire/skip decision never costs a database round trip.
+    """
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT table_id, source, table_title, column_name, column_norm,"
+            " row_entity, row_entity_norm, MIN(page) AS page"
+            " FROM table_cells WHERE user_id = ?"
+            " GROUP BY table_id, column_norm, row_entity_norm"
+            " ORDER BY table_id, row_index",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def lookup_cells(
+    user_id: str, entity_norm: str, column_norm: str, limit: int = 10
+) -> list[dict]:
+    """Cells matching one resolved entity and one resolved column.
+
+    Returns every match rather than the first: more than one IS the ambiguous
+    case Decision 2 must see and discard, and a ``LIMIT 1`` here would hide it
+    behind a confident-looking single answer.
+    """
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM table_cells WHERE user_id = ? AND row_entity_norm = ?"
+            " AND column_norm = ? ORDER BY table_id, row_index LIMIT ?",
+            (user_id, entity_norm, column_norm, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def column_cells(
+    user_id: str, column_norm: str, table_id: str | None = None, limit: int = 5000
+) -> list[dict]:
+    """Every cell in one column, for MAX/MIN/COUNT and threshold filters.
+
+    Ranking happens in Python, not in SQL's ``ORDER BY CAST(value AS REAL)``:
+    SQLite's cast silently yields 0.0 for "N/A" or "see note 3", which would make
+    a non-numeric cell the confident winner of a MIN. The Python side parses and
+    DISCARDS what it cannot read as a number, and reports how many it discarded.
+    """
+    init_db()
+    sql = "SELECT * FROM table_cells WHERE user_id = ? AND column_norm = ?"
+    params: list = [user_id, column_norm]
+    if table_id:
+        sql += " AND table_id = ?"
+        params.append(table_id)
+    sql += " ORDER BY table_id, row_index LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def count_table_cells(user_id: str) -> int:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM table_cells WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def users_with_tables() -> list[str]:
+    """Owners who have at least one stored cell, for warming the cache at boot."""
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT user_id FROM table_cells WHERE user_id <> ''"
+        ).fetchall()
+    return [r["user_id"] for r in rows]
 
 
 def set_document_extraction(
