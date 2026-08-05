@@ -45,6 +45,7 @@ is additionally kept out of the text chunk stream, because the table path owns i
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -60,8 +61,22 @@ from backend.ingestion import _is_heading, clean_text, count_tokens
 CELL = " | "
 
 # Metadata key that marks a summary chunk. Kept as a bool because Chroma stores
-# scalars and because retrieval filters on it.
+# scalars and because retrieval filters on it. Unused by the grouped-JSON path
+# (there is no separate summary chunk any more -- see TABLE_CHUNK_FORMAT below),
+# kept for the legacy pipe-format path it was built for.
 SUMMARY_FLAG = "is_table_summary"
+
+# V4: delimiter for entities_in_group, deliberately different from
+# chunk_schema.LIST_DELIMITER -- this field is a citation aid read by code, not
+# a Layer B list, and does not need the extra readability of a space.
+ENTITY_DELIM = ","
+
+# Metadata marker written ONLY by the grouped-JSON path. Its presence (or
+# absence) is how backend.tables.assemble tells a table's two possible chunk
+# shapes apart, and how the migration script tells a migrated table_id from a
+# stale one.
+TABLE_CHUNK_FORMAT = "table_chunk_format"
+GROUPED_JSON_FORMAT = "grouped_json_v1"
 
 
 @dataclass
@@ -220,6 +235,115 @@ def _section_for(fragment: TableFragment, headings: list[str]) -> str:
     return ""
 
 
+def _page_spans(page: fitz.Page) -> list[tuple[float, float, float, float, str]]:
+    """Every non-blank text span on ``page``, one entry per PyMuPDF span.
+
+    A span, not a word: PyMuPDF's ``dict``-mode text already groups a
+    multi-word cell ("Employee 1", "Manager 5", "Quarterly performance review
+    record #1") into a single span per visual line, so reading spans avoids
+    re-splitting a multi-word value the way word-by-word text does.
+
+    The clip is deliberately wider than the page's own mediabox: PyMuPDF's
+    ``get_text()`` silently drops any glyph positioned outside it even with no
+    ``clip`` argument at all, which is exactly what a page laid out wider than
+    its own margins (as on ``Large_Multi_Page_Tables_Test.pdf``, where the
+    leftmost column sits at a negative x-coordinate and two-digit values in
+    the rightmost column run past the right edge) needs recovered -- confirmed
+    directly: the unclipped default returns "MP0001" and "...record #1" for a
+    cell whose actual content, recoverable only with a wider clip, is
+    "EMP0001" and "...record #10".
+    """
+    wide = fitz.Rect(-150, 0, page.rect.width + 150, page.rect.height)
+    spans = []
+    for block in page.get_text("dict", clip=wide)["blocks"]:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if text and text.strip():
+                    x0, y0, x1, y1 = span["bbox"]
+                    spans.append((x0, y0, x1, y1, text))
+    return spans
+
+
+def _orphan_spans(
+    page: fitz.Page, rect: fitz.Rect
+) -> list[tuple[float, float, float, float, str]]:
+    """Spans inside ``rect``'s row band but outside its column band.
+
+    ``find_tables()``'s default line-based strategy sizes a table's bbox off
+    detected ruling/gridlines. A borderless table has none, so the bbox comes
+    from text alignment instead -- and on
+    ``Large_Multi_Page_Tables_Test.pdf`` it silently excludes the leftmost and
+    rightmost columns (the leftmost header even sits at a negative x-coordinate,
+    off the printable margin). A span that falls within the table's row band
+    but outside its detected column span is proof a column was dropped.
+    """
+    return [
+        (x0, y0, x1, y1, text)
+        for x0, y0, x1, y1, text in _page_spans(page)
+        if y0 >= rect.y0 - 1
+        and y1 <= rect.y1 + 1
+        and (x1 < rect.x0 - 2 or x0 > rect.x1 + 2)
+    ]
+
+
+def _recover_borderless_columns(
+    table,
+    rect: fitz.Rect,
+    rows: list[list[str]],
+    orphans: list[tuple[float, float, float, float, str]],
+) -> list[list[str]] | None:
+    """Reattach the column(s) ``orphans`` proves ``find_tables()`` dropped.
+
+    Deliberately does NOT re-detect the table with PyMuPDF's ``strategy="text"``
+    -- tried first, it fabricated characters that do not exist in the PDF's own
+    content stream (turned the real "MP0001" into "EMP0001" near this
+    document's negative-x-coordinate margin). Instead this reuses
+    ``table.rows[i].bbox`` -- PyMuPDF's own per-row y-band, already proven
+    correct for the columns it did detect -- to slot each orphan span into the
+    right row, by row order rather than by re-running detection at all.
+    """
+    if len(rows) != len(table.rows):
+        return None  # extract() and .rows should always be 1:1; don't guess if not
+
+    left = sorted((o for o in orphans if o[2] <= rect.x0 + 2), key=lambda o: o[0])
+    right = sorted((o for o in orphans if o[0] >= rect.x1 - 2), key=lambda o: o[0])
+    if not left and not right:
+        return None
+
+    def cell_for_row(pool, y0: float, y1: float) -> str:
+        parts = [text for ox0, oy0, ox1, oy1, text in pool if oy0 >= y0 - 1 and oy1 <= y1 + 1]
+        return " ".join(parts).strip()
+
+    new_rows = []
+    for row, table_row in zip(rows, table.rows):
+        _, y0, _, y1 = table_row.bbox
+        new_row = list(row)
+        if left:
+            new_row = [cell_for_row(left, y0, y1)] + new_row
+        if right:
+            new_row = new_row + [cell_for_row(right, y0, y1)]
+        new_rows.append(new_row)
+
+    # Only trust the recovery if every row that had content to begin with --
+    # including the header -- actually got a value for the recovered
+    # column(s); a row-band mismatch that leaves a real row's cell blank is
+    # worse than the dropped column it was meant to fix. A row that was
+    # already entirely blank stays blank either way and is not evidence of a
+    # bad recovery -- it is filtered out downstream regardless.
+    header = new_rows[0]
+    if left and not header[0].strip():
+        return None
+    if right and not header[-1].strip():
+        return None
+    for original, new_row in zip(rows[1:], new_rows[1:]):
+        if _is_blank_row(original):
+            continue
+        if (left and not new_row[0].strip()) or (right and not new_row[-1].strip()):
+            return None
+    return new_rows
+
+
 def extract_fragments(pdf_doc: fitz.Document, source: str) -> list[TableFragment]:
     """Extract every table on every page, in reading order, with page context.
 
@@ -267,6 +391,14 @@ def extract_fragments(pdf_doc: fitz.Document, source: str) -> list[TableFragment
                 rows = [list(r) for r in table.extract()]
             except Exception:
                 continue
+            orphans = _orphan_spans(page, rect)
+            if orphans:
+                # Before the blank-row filter: recovery relies on rows and
+                # table.rows staying 1:1 so a row-band bbox lines up with the
+                # right extracted row.
+                recovered = _recover_borderless_columns(table, rect, rows, orphans)
+                if recovered is not None:
+                    rows = recovered
             rows = [r for r in rows if not _is_blank_row(r)]
             if not rows:
                 continue
@@ -512,6 +644,167 @@ def chunk_table(table: LogicalTable, max_tokens: int | None = None) -> list[Tabl
 
 
 # ---------------------------------------------------------------------------
+# V4: grouped-JSON row chunking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TableGroup:
+    """One chunk of a table under the grouped-JSON scheme: a whole number of
+    rows, each rendered as a ``{column: value}`` object."""
+
+    rows: list[dict]
+    row_start: int
+    row_end: int
+    page_start: int
+    page_end: int
+    entities: list[str]
+
+
+def _row_object(headers: list[str], row: list[str]) -> dict:
+    """One row as a JSON object keyed by column header.
+
+    A blank or missing header falls back to ``colN`` (1-indexed) rather than
+    dropping the cell -- a ragged row must not silently lose a value just
+    because its column has no name.
+    """
+    obj: dict[str, str] = {}
+    for index, cell in enumerate(row):
+        name = _cell(headers[index]) if index < len(headers) else ""
+        obj[name or f"col{index + 1}"] = _cell(cell)
+    return obj
+
+
+def group_table_rows_json(
+    table: LogicalTable,
+    rows_per_chunk: int | None = None,
+    max_tokens: int | None = None,
+    description: str = "",
+) -> list[TableGroup]:
+    """Group a table's rows into JSON-array chunks.
+
+    ``rows_per_chunk`` (default ``config.TABLE_ROWS_PER_CHUNK``) is a target,
+    not a hard cap: a group flushes early, before reaching it, if adding the
+    next row would push the rendered chunk (description included) over the
+    token budget -- the same trade ``chunk_table`` makes for pipe-rendered
+    parts, just measured on JSON instead. A single row that alone exceeds the
+    budget is still emitted rather than split; a row is the smallest unit that
+    keeps its cells meaningful.
+    """
+    limit_rows = rows_per_chunk or config.TABLE_ROWS_PER_CHUNK
+    budget = max_tokens or config.TABLE_CHUNK_MAX_TOKENS or config.CHUNK_SIZE
+
+    def render(rows: list[dict]) -> str:
+        body = json.dumps(rows, ensure_ascii=False)
+        return f"{description}\n{body}" if description else body
+
+    groups: list[TableGroup] = []
+    buffer: list[dict] = []
+    pages: list[int] = []
+    indices: list[int] = []
+
+    def flush() -> None:
+        nonlocal buffer, pages, indices
+        if not buffer:
+            return
+        entities: list[str] = []
+        for obj in buffer:
+            label = next(iter(obj.values()), "")
+            if label and label not in entities:
+                entities.append(label)
+        groups.append(
+            TableGroup(
+                rows=list(buffer),
+                row_start=indices[0],
+                row_end=indices[-1],
+                page_start=min(pages),
+                page_end=max(pages),
+                entities=entities,
+            )
+        )
+        buffer, pages, indices = [], [], []
+
+    for position, (row, page) in enumerate(zip(table.rows, table.row_pages)):
+        obj = _row_object(table.headers, row)
+        if not any(v for v in obj.values()):
+            continue
+        candidate = buffer + [obj]
+        if buffer and (
+            len(candidate) > limit_rows or count_tokens(render(candidate)) > budget
+        ):
+            flush()
+        buffer.append(obj)
+        pages.append(page)
+        indices.append(position)
+    flush()
+
+    if not groups:
+        # A header-only table (every row blank) still deserves to be findable.
+        groups.append(
+            TableGroup(
+                rows=[],
+                row_start=0,
+                row_end=-1,
+                page_start=table.page_start,
+                page_end=table.page_end,
+                entities=[],
+            )
+        )
+    return groups
+
+
+def build_table_documents_grouped_json(
+    tables: list[LogicalTable],
+    doc_title: str,
+    content_hash: str,
+    heading_paths: dict[int, str] | None = None,
+    rows_per_chunk: int | None = None,
+    max_tokens: int | None = None,
+) -> list[Document]:
+    """V4: one Document per row-group, JSON-encoded, no separate summary chunk.
+
+    Each group's ``page_content`` is the table's one-line description (the same
+    text ``summary_line`` produces for the legacy path, folded in here instead
+    of shipped as its own chunk) followed by the group's rows as a JSON array.
+    Column names live inside every row object, so nothing needs repeating the
+    way the pipe-format header block did.
+
+    Metadata keeps the sibling-linking fields ``table_id``/``table_part``/
+    ``table_total_parts``/``page_range``/``table_headers`` at GROUP granularity
+    (one group = one part), and adds ``entities_in_group`` -- the group's
+    first-column values, for entity-name retrieval without a per-row chunk.
+    ``table_chunk_format`` marks these as the new shape.
+    """
+    out: list[Document] = []
+    for table in tables:
+        heading_path = (heading_paths or {}).get(table.index, "")
+        base = _base_metadata(table, doc_title, heading_path)
+        description = summary_line(table)
+        groups = group_table_rows_json(table, rows_per_chunk, max_tokens, description)
+        total = len(groups)
+
+        for number, group in enumerate(groups, start=1):
+            body = json.dumps(group.rows, ensure_ascii=False)
+            out.append(
+                Document(
+                    page_content=f"{description}\n{body}",
+                    metadata={
+                        **base,
+                        "page": group.page_start,
+                        "page_end": group.page_end,
+                        "table_part": number,
+                        "table_total_parts": total,
+                        "entities_in_group": ENTITY_DELIM.join(group.entities),
+                        TABLE_CHUNK_FORMAT: GROUPED_JSON_FORMAT,
+                        SUMMARY_FLAG: False,
+                        "content_hash": content_hash,
+                    },
+                )
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Documents for the index
 # ---------------------------------------------------------------------------
 
@@ -661,13 +954,13 @@ class AssembledTable:
     complete: bool
 
 
-def assemble(
+def _assemble_legacy(
     records: list[dict],
     matched_parts: set[int],
-    max_parts: int | None = None,
-    max_tokens: int | None = None,
+    limit_parts: int,
+    limit_tokens: int,
 ) -> AssembledTable | None:
-    """Rebuild one logical table from the sibling chunks fetched by ``table_id``.
+    """Legacy pipe-format reassembly: rebuild from repeated-header row parts.
 
     ``records`` are ``{"document", "metadata"}`` dicts straight from the metadata
     fetch, summary chunk included. The summary is used only when the caps bite --
@@ -680,11 +973,6 @@ def assemble(
     the context window, and the parts that matched are the ones the question is
     about.
     """
-    limit_parts = max_parts if max_parts is not None else config.TABLE_SIBLING_MAX_PARTS
-    limit_tokens = (
-        max_tokens if max_tokens is not None else config.TABLE_SIBLING_MAX_TOKENS
-    )
-
     parts = sorted(
         (r for r in records if not r["metadata"].get(SUMMARY_FLAG)),
         key=lambda r: int(r["metadata"].get("table_part") or 0),
@@ -745,6 +1033,110 @@ def assemble(
         note = re.sub(r"^Table:\s*", "", summaries[0]["document"] or "").strip()
         note = f"Full table summary -- {note}" if note else ""
     return render(kept[:limit_parts], complete=False, note=note)
+
+
+def _parse_group_rows(document: str) -> list[dict]:
+    """Recover a grouped-JSON chunk's row objects from its ``page_content``.
+
+    The content is ``"<description>\\n<json array>"`` -- the description is
+    exactly one line (``summary_line`` never emits an embedded newline), so
+    splitting on the first ``\\n`` isolates the JSON blob unambiguously.
+    """
+    _, _, blob = (document or "").partition("\n")
+    try:
+        parsed = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _assemble_grouped_json(
+    records: list[dict],
+    matched_parts: set[int],
+    limit_parts: int,
+    limit_tokens: int,
+) -> AssembledTable | None:
+    """V4 reassembly: concatenate row-objects from sibling groups, in order.
+
+    No header block to de-duplicate -- every row object already carries its own
+    column names -- so this is simpler than the legacy path: parse each group's
+    JSON array, concatenate in ``table_part`` order, and re-render as one array.
+    """
+    groups = sorted(records, key=lambda r: int(r["metadata"].get("table_part") or 0))
+    if not groups:
+        return None
+
+    first = groups[0]["metadata"]
+    total = int(first.get("table_total_parts") or len(groups))
+    section = str(first.get("section") or "")
+    page_range = str(first.get("page_range") or "")
+    description = (groups[0]["document"] or "").split("\n", 1)[0]
+
+    def label(complete: bool, shown: list[int]) -> str:
+        what = f"Table: {section}" if section else "Table"
+        where = f" (page {page_range})" if page_range else ""
+        if complete:
+            return what + where
+        parts_shown = ", ".join(str(n) for n in shown)
+        return f"{what}{where} -- excerpt, part{'s' if len(shown) != 1 else ''} " \
+               f"{parts_shown} of {total}"
+
+    def render(chosen: list[dict], complete: bool) -> AssembledTable:
+        rows: list[dict] = []
+        for record in chosen:
+            rows.extend(_parse_group_rows(record["document"] or ""))
+        pages = [int(r["metadata"].get("page") or 0) for r in chosen] or [0]
+        ends = [
+            int(r["metadata"].get("page_end") or r["metadata"].get("page") or 0)
+            for r in chosen
+        ]
+        shown = [int(r["metadata"].get("table_part") or 0) for r in chosen]
+        heading = label(complete, shown)
+        body = json.dumps(rows, ensure_ascii=False)
+        text = "\n".join(line for line in [heading, description, body] if line)
+        return AssembledTable(
+            text=text,
+            page_start=min(pages),
+            page_end=max(ends or pages),
+            parts_included=len(chosen),
+            parts_total=total,
+            complete=complete,
+        )
+
+    full = render(groups, complete=True)
+    if len(groups) <= limit_parts and count_tokens(full.text) <= limit_tokens:
+        return full
+
+    kept = [
+        r for r in groups if int(r["metadata"].get("table_part") or 0) in matched_parts
+    ] or groups[:1]
+    return render(kept[:limit_parts], complete=False)
+
+
+def assemble(
+    records: list[dict],
+    matched_parts: set[int],
+    max_parts: int | None = None,
+    max_tokens: int | None = None,
+) -> AssembledTable | None:
+    """Rebuild one logical table from the sibling chunks fetched by ``table_id``.
+
+    Dispatches on ``table_chunk_format``: a table's chunks are either ALL
+    grouped-JSON (written by ``build_table_documents_grouped_json``) or ALL
+    legacy pipe-format (written by ``build_table_documents``) -- a single table
+    is never split across both, because the migration script and
+    ``build_chunks`` always replace a table's chunks as one unit. Records are
+    routed to whichever reassembly the majority carry, so a caller need not know
+    which path ingested this table.
+    """
+    limit_parts = max_parts if max_parts is not None else config.TABLE_SIBLING_MAX_PARTS
+    limit_tokens = (
+        max_tokens if max_tokens is not None else config.TABLE_SIBLING_MAX_TOKENS
+    )
+    grouped = [r for r in records if r["metadata"].get(TABLE_CHUNK_FORMAT) == GROUPED_JSON_FORMAT]
+    if grouped:
+        return _assemble_grouped_json(grouped, matched_parts, limit_parts, limit_tokens)
+    return _assemble_legacy(records, matched_parts, limit_parts, limit_tokens)
 
 
 def tables_hash(tables: list[LogicalTable]) -> str:
