@@ -78,6 +78,13 @@ ENTITY_DELIM = ","
 TABLE_CHUNK_FORMAT = "table_chunk_format"
 GROUPED_JSON_FORMAT = "grouped_json_v1"
 
+# V4 bugfix: header names that mark a column as an alternate row label (an
+# ID's paired name), narrow and explicit on purpose -- pairing every second
+# column with the first would glue a fault code to its "Meaning" description.
+_ALIAS_NAME_HEADERS = frozenset(
+    {"name", "full name", "employee name", "customer name", "vendor name", "contact name"}
+)
+
 
 @dataclass
 class TableFragment:
@@ -694,6 +701,14 @@ def group_table_rows_json(
     limit_rows = rows_per_chunk or config.TABLE_ROWS_PER_CHUNK
     budget = max_tokens or config.TABLE_CHUNK_MAX_TOKENS or config.CHUNK_SIZE
 
+    # V4 bugfix: a bare first-column value ("Employee ID": "EMP0034") only
+    # names a row one way, and a question can just as easily name it "Employee
+    # 34" (the second column). Paired only when column 1's header is
+    # explicitly name-shaped -- NOT for every second column, or a fault-code
+    # table's "Meaning" description would get wrongly glued to its code.
+    second_header = table.headers[1].strip().casefold() if len(table.headers) > 1 else ""
+    pair_second_column = second_header in _ALIAS_NAME_HEADERS
+
     def render(rows: list[dict]) -> str:
         body = json.dumps(rows, ensure_ascii=False)
         return f"{description}\n{body}" if description else body
@@ -709,7 +724,10 @@ def group_table_rows_json(
             return
         entities: list[str] = []
         for obj in buffer:
-            label = next(iter(obj.values()), "")
+            values = list(obj.values())
+            label = values[0] if values else ""
+            if pair_second_column and len(values) > 1 and values[1] and values[1] != label:
+                label = f"{label}:{values[1]}" if label else values[1]
             if label and label not in entities:
                 entities.append(label)
         groups.append(

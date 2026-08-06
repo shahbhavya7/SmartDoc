@@ -179,6 +179,23 @@ def _variants(text: str) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
+_ID_CODE_RE = re.compile(r"^[A-Za-z]{1,6}[-_]?\d{2,10}$")
+
+
+def _looks_like_id_values(values: list[str]) -> bool:
+    """Is this column almost entirely short alnum codes ("EMP0034", "E-01")?
+
+    Distinguishes an identifier column from a free-text one (a name, a
+    description) using shape alone -- no header-name guessing, since headers
+    vary too much across documents to rely on.
+    """
+    sample = [v.strip() for v in values if v and v.strip()][:50]
+    if len(sample) < 3:
+        return False
+    hits = sum(1 for v in sample if _ID_CODE_RE.match(v))
+    return hits / len(sample) >= 0.9
+
+
 def cells_from_tables(tables: list, max_cells: int | None = None) -> list[dict]:
     """Flatten stitched tables into (entity, column, value) rows.
 
@@ -191,6 +208,15 @@ def cells_from_tables(tables: list, max_cells: int | None = None) -> list[dict]:
     A row shorter than the header is zipped to the shorter of the two rather than
     padded: a missing trailing cell is missing, and storing "" for it would let a
     lookup return an empty string as a confident exact value.
+
+    A second row label, aliased: a table whose first column is an ID code
+    ("Employee ID") and whose second is free text ("Name") names each row two
+    ways, and a question can use either -- "MP0075's department" or "Employee
+    75's department" must resolve to the same row. When column 0 looks like an
+    ID column and column 1 does not, column 1's value is stored as a second,
+    equally real row label for the same row, with every other column
+    (including column 0 itself) as its attribute -- not a fallback path, a
+    second entry alongside the first.
     """
     limit = max_cells if max_cells is not None else config.PARALLEL_SQL_MAX_CELLS_PER_DOC
     out: list[dict] = []
@@ -205,40 +231,63 @@ def cells_from_tables(tables: list, max_cells: int | None = None) -> list[dict]:
         rows = getattr(table, "rows", []) or []
         row_pages = getattr(table, "row_pages", []) or []
 
+        alias_index = None
+        if len(headers) > 2:
+            col0 = [str(r[0]) if r else "" for r in rows]
+            col1 = [str(r[1]) if len(r) > 1 else "" for r in rows]
+            if _looks_like_id_values(col0) and not _looks_like_id_values(col1):
+                alias_index = 1
+
         for index, row in enumerate(rows):
             values = [str(c or "").replace("\n", " ").strip() for c in row]
             if not values:
                 continue
-            entity = values[0]
-            entity_norm = normalise(entity)
-            if not entity_norm:
-                continue
             page = row_pages[index] if index < len(row_pages) else getattr(
                 table, "page_start", 0
             )
-            for column, value in zip(headers[1:], values[1:]):
-                column_norm = normalise(column)
-                if not column_norm or not value.strip():
-                    continue
-                out.append(
-                    {
-                        "table_id": getattr(table, "table_id", ""),
-                        "source": getattr(table, "source", ""),
-                        "table_title": title,
-                        "page": int(page or 0),
-                        "row_index": index,
-                        "row_entity": entity,
-                        "row_entity_norm": entity_norm,
-                        "column_name": column,
-                        "column_norm": column_norm,
-                        "value": value,
-                    }
-                )
-                if len(out) >= limit:
-                    logger.warning(
-                        "table cell cap %d reached; later cells not stored", limit
+
+            def emit(entity: str, entity_norm: str, skip_index: int | None) -> bool:
+                """Returns False once ``limit`` is hit, so the caller can stop."""
+                for col_idx, (column, value) in enumerate(zip(headers, values)):
+                    if col_idx == 0 and skip_index is None:
+                        continue  # primary pass: column 0 IS the entity, not an attribute
+                    if col_idx == skip_index:
+                        continue  # alias pass: the alias column IS the entity here
+                    column_norm = normalise(column)
+                    if not column_norm or not value.strip():
+                        continue
+                    out.append(
+                        {
+                            "table_id": getattr(table, "table_id", ""),
+                            "source": getattr(table, "source", ""),
+                            "table_title": title,
+                            "page": int(page or 0),
+                            "row_index": index,
+                            "row_entity": entity,
+                            "row_entity_norm": entity_norm,
+                            "column_name": column,
+                            "column_norm": column_norm,
+                            "value": value,
+                        }
                     )
-                    return out
+                    if len(out) >= limit:
+                        logger.warning(
+                            "table cell cap %d reached; later cells not stored", limit
+                        )
+                        return False
+                return True
+
+            entity = values[0]
+            entity_norm = normalise(entity)
+            if entity_norm and not emit(entity, entity_norm, skip_index=None):
+                return out
+
+            if alias_index is not None and alias_index < len(values):
+                alias_entity = values[alias_index]
+                alias_norm = normalise(alias_entity)
+                if alias_norm and alias_norm != entity_norm:
+                    if not emit(alias_entity, alias_norm, skip_index=alias_index):
+                        return out
     return out
 
 

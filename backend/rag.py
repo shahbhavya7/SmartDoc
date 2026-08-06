@@ -624,24 +624,55 @@ def _json_table_values(context_text: str) -> set[str]:
     return values
 
 
-def _drop_json_supported_claims(claims: list[str], context_text: str) -> list[str]:
-    """Remove claims the LLM flagged that are literally a JSON table cell value.
+_EXACT_FACT_LINE_RE = re.compile(
+    r"EXACT FACT \(from table, authoritative\):\s*(.+?)\s*-\s*(.+?):\s*(.+)"
+)
 
-    A claim like "Employee 33's grade is G4" gets flagged unsupported by the
-    LLM judge even though "G4" is right there as a value in the retrieved
-    row -- so a claim carrying at least one code token that matches an actual
-    cell value in context is treated as grounded rather than pruned.
+
+def _exact_fact_pairs(context_text: str) -> list[tuple[str, str]]:
+    """(entity, value) pairs out of every Addendum-2 "EXACT FACT" line.
+
+    ``table_store.render_facts`` renders a Decision-2-confirmed cell as
+    "EXACT FACT (from table, authoritative): {entity} - {column}: {value}" --
+    supported by construction (it IS the stored cell), so a claim naming both
+    halves is grounded regardless of what the LLM judge makes of a large,
+    structurally repetitive context diluting its attention. Observed: with 200
+    near-identical rows in context, the judge flagged "Employee 5 works in the
+    Security department" as unsupported even with that exact line present.
+    """
+    pairs = []
+    for line in context_text.splitlines():
+        match = _EXACT_FACT_LINE_RE.search(line)
+        if match:
+            entity, _column, value = match.groups()
+            pairs.append((entity.strip().casefold(), value.strip().casefold()))
+    return pairs
+
+
+def _drop_structurally_supported_claims(claims: list[str], context_text: str) -> list[str]:
+    """Remove claims the LLM flagged that are literally supported by structure.
+
+    Two independent literal fallbacks for the LLM entailment judge, which
+    treats the whole chunk as opaque text: a claim carrying a code token that
+    matches an actual JSON table cell value, or a claim naming both halves of
+    an authoritative "EXACT FACT" line.
     """
     json_values = _json_table_values(context_text)
-    if not json_values:
+    fact_pairs = _exact_fact_pairs(context_text)
+    if not json_values and not fact_pairs:
         return claims
-    return [
-        claim
-        for claim in claims
-        if not any(
+
+    def supported(claim: str) -> bool:
+        if json_values and any(
             token.casefold() in json_values for token in _CODE_TOKEN_RE.findall(claim)
+        ):
+            return True
+        claim_fold = claim.casefold()
+        return any(
+            entity in claim_fold and value in claim_fold for entity, value in fact_pairs
         )
-    ]
+
+    return [claim for claim in claims if not supported(claim)]
 
 
 _FAITHFULNESS_PROMPT = """You verify whether an answer is fully supported by the \
@@ -705,7 +736,7 @@ def verify_grounding(
             note = "LLM faithfulness check unavailable; structural check only."
             faithful = not unverified_numbers
         elif unsupported:
-            survivors = _drop_json_supported_claims(unsupported, context_text)
+            survivors = _drop_structurally_supported_claims(unsupported, context_text)
             if len(survivors) != len(unsupported):
                 note = (
                     "Dropped claim(s) the LLM flagged that are literally present "
