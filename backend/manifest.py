@@ -62,6 +62,16 @@ _LABELLED = re.compile(r"^(?P<label>[^:–—-]{2,60})\s*[:–—-]\s+\S")
 # outline row.
 _SECTION_NUMBER = re.compile(r"^\s*\d+(?:\.\d+)*[.)]?\s+")
 
+# A content word for term extraction. The plain alternative alone
+# (``[A-Za-z][\w-]{2,}``, 3+ characters) silently drops a 2-letter initialism
+# ("IT", "HR") entirely -- not filtered as a stopword, just invisible to the
+# regex -- which then promotes whatever word follows it to head noun instead.
+# Measured: "types of IT support requests" picked "support" as the head
+# (the true head, "request", never got tried) and matched the wrong group.
+# The second alternative admits an exactly-2-letter, ALL-CAPS token as its own
+# content word without loosening the 3+ char rule for ordinary words.
+_CONTENT_WORD_RE = re.compile(r"[A-Za-z][\w-]{2,}|\b[A-Z]{2}\b")
+
 _STOPWORDS = {
     "a", "all", "an", "and", "any", "are", "as", "at", "available", "be", "by",
     "can", "complete", "different", "do", "does", "each", "every", "everything",
@@ -213,18 +223,58 @@ def _aggregate(children: list, key: str, limit: int = 40) -> list[str]:
     return [value for value, _ in ranked[:limit]]
 
 
+_NUMBER_PREFIX = re.compile(r"^\s*(\d+(?:\.\d+)*)")
+
+
+def _parent_number(number: str) -> str | None:
+    """'2.3.1' -> '2.3'; a top-level number ('2') has no numbered parent."""
+    parts = number.split(".")
+    return ".".join(parts[:-1]) if len(parts) > 1 else None
+
+
+def _numbered_titles(tree: list[dict]) -> dict[str, str]:
+    """Heading NUMBER -> heading TITLE, for every numbered heading in the tree."""
+    titles: dict[str, str] = {}
+    for node in tree:
+        parts = [p.strip() for p in node["path"].split(">") if p.strip()]
+        if not parts:
+            continue
+        match = _NUMBER_PREFIX.match(parts[-1])
+        if match:
+            titles[match.group(1)] = _SECTION_NUMBER.sub("", parts[-1]).strip() or parts[-1]
+    return titles
+
+
 def _section_items(tree: list[dict]) -> list[ManifestItem]:
-    """Every heading becomes an item, grouped under its parent path."""
+    """Every heading becomes an item, grouped under its parent path.
+
+    On the plain-text ingestion path, ``heading_path`` is a flat "title >
+    heading" (``ingestion._fallback_heading``) -- there is no intermediate
+    level, so every section in the document collapses into ONE group under
+    the title, and an enumeration question can no longer tell "the 8 IT
+    request types" apart from anything else. When the heading carries its
+    own numeric prefix ("2.3.1 Hardware Request"), its numbered PARENT
+    heading ("2.3 Types of IT Support Requests", if the tree has one) is a
+    real, finer-grained group -- used in preference to the flat path.
+    """
+    numbered_titles = _numbered_titles(tree)
     items: list[ManifestItem] = []
     for node in tree:
         parts = [p.strip() for p in node["path"].split(">") if p.strip()]
         if len(parts) < 2:
             continue  # the document title is not one of its own items
+        leaf = parts[-1]
+        group_label = " > ".join(parts[:-1])
+        match = _NUMBER_PREFIX.match(leaf)
+        if match:
+            parent_number = _parent_number(match.group(1))
+            if parent_number and parent_number in numbered_titles:
+                group_label = numbered_titles[parent_number]
         items.append(
             ManifestItem(
                 kind="section",
                 item=_SECTION_NUMBER.sub("", parts[-1]).strip() or parts[-1],
-                group_label=" > ".join(parts[:-1]),
+                group_label=group_label,
                 heading_path=node["path"],
                 page=node["page_start"],
             )
@@ -275,7 +325,23 @@ def _list_items(children: list, max_per_chunk: int = 12) -> list[ManifestItem]:
         if metadata.get("table_id"):
             continue  # table rows are handled exactly, above
         found = 0
-        for line in (child.page_content or "").split("\n"):
+        lines = (child.page_content or "").split("\n")
+        for index, line in enumerate(lines):
+            if (
+                index == 0
+                and index + 1 < len(lines)
+                and not lines[index + 1].strip()
+                and " > " in line
+            ):
+                # ingestion._breadcrumb() prepends "title > heading_path" as
+                # the chunk's own first line, blank-line-separated from its
+                # real text. When the document's OWN title is itself a
+                # numbered heading ("1. Introduction and Purpose" -- a title-
+                # detection artifact of the plain-text path, not a real
+                # title), that breadcrumb starts with "1. " and _LIST_LEAD
+                # matches it as a numbered list item, so it must never reach
+                # the regex below at all.
+                continue
             match = _LIST_LEAD.match(line)
             if not match:
                 continue
@@ -365,7 +431,7 @@ def enumeration_terms(question: str, limit: int = 8) -> list[str]:
     identifies a group that "code" does not.
     """
     words = [
-        w for w in re.findall(r"[A-Za-z][\w-]{2,}", question or "")
+        w for w in _CONTENT_WORD_RE.findall(question or "")
         if w.lower() not in _STOPWORDS
     ]
     bigrams = [f"{_singular(a)} {_singular(b)}" for a, b in zip(words, words[1:])]
@@ -377,12 +443,37 @@ def enumeration_terms(question: str, limit: int = 8) -> list[str]:
     return list(seen)[:limit]
 
 
+_TYPES_OF_RE = re.compile(r"\b(?:types?|kinds?)\s+of\b", re.IGNORECASE)
+
+
 def head_noun(question: str) -> str:
-    """The first content word -- what the enumeration is actually about."""
+    """The word that names what the enumeration is actually about.
+
+    The FIRST content word, except after an explicit "type(s)/kind(s) of"
+    cue: "types of IT support requests" enumerates REQUESTS, and every word
+    between the cue and it is a modifier, not the head -- first-word-wins
+    would pick "support" (or, before the cue existed, would have silently
+    dropped "IT" as too short and picked "support" regardless). "list every
+    approval required" has no such cue, so it keeps first-word ("approval"),
+    deliberately: trying "required" as a fallback head here previously
+    walked straight into a same-named-but-wrong group ("Required Trainings")
+    that exists in this same document for something else entirely -- the
+    exact failure the original single, first-word-only rule existed to
+    prevent, and a rule that isn't gated on the cue re-opens it.
+    """
+    match = _TYPES_OF_RE.search(question or "")
+    if match:
+        tail_words = [
+            _singular(w) for w in _CONTENT_WORD_RE.findall(question[match.end():])
+            if w.lower() not in _STOPWORDS
+        ]
+        if tail_words:
+            return tail_words[-1]
+
     return next(
         (
             _singular(w)
-            for w in re.findall(r"[A-Za-z][\w-]{2,}", question or "")
+            for w in _CONTENT_WORD_RE.findall(question or "")
             if w.lower() not in _STOPWORDS
         ),
         "",
@@ -512,6 +603,66 @@ def plan_enumeration(user_id: str, question: str) -> EnumerationPlan | None:
                 term=term,
                 items=items[: config.MANIFEST_MAX_ITEMS],
                 truncated_from=total if total > config.MANIFEST_MAX_ITEMS else 0,
+            )
+            if best is None or score > best[0]:
+                best = (score, plan)
+
+        # A document whose members of one enumeration are scattered across
+        # DIFFERENT chapters -- an overview section names "VPN Request" and
+        # seven siblings, but each gets its own full section elsewhere, so no
+        # single group_label ever holds all of them. word_match(term, item)
+        # -- the heading's own TEXT, not its group -- still finds every one,
+        # regardless of which chapter it lives in. Only trusted when it beats
+        # every single-group candidate above: a document whose enumeration
+        # genuinely lives in one place must not be second-guessed into a
+        # noisier cross-document union.
+        candidates = [
+            row
+            for row in rows
+            if word_match(term, row["item"])
+            # Excludes the enumeration's own overview heading ("2.3 Types of
+            # IT Support Requests") from counting as one of its own members --
+            # a real member is never itself phrased as "type(s)/kind(s) of X".
+            and not _TYPES_OF_RE.search(row["item"])
+        ]
+        # Scoped to ONE document, the one with the most matches -- ``rows``
+        # is not itself document-scoped, and blending two unrelated
+        # documents' headings that happen to share a word would synthesize
+        # an enumeration that exists in neither.
+        by_document: dict[str, list[dict]] = {}
+        for row in candidates:
+            by_document.setdefault(row["document_id"], []).append(row)
+        pattern_items = max(by_document.values(), key=len, default=[])
+
+        # A sub-heading elaborating on an already-listed item ("VPN Request
+        # -- Exceptions for Contractors and Interns") shares its parent's
+        # full name before the dash; keep only the shorter, canonical form.
+        by_prefix: dict[str, dict] = {}
+        for row in pattern_items:
+            prefix = normalise(re.split(r"\s*[-–—]\s*", row["item"], maxsplit=1)[0])
+            existing = by_prefix.get(prefix)
+            if existing is None or len(row["item"]) < len(existing["item"]):
+                by_prefix[prefix] = row
+        pattern_items = list(by_prefix.values())
+
+        # Deduped by normalised text -- e.g. the SAME heading independently
+        # (mis)detected as both a "section" and a "list_item" -- and the
+        # MANIFEST_MIN_ITEMS floor applied only now, after both dedup
+        # passes: checking it on the raw, pre-dedup count let two duplicate
+        # extractions of ONE real heading pass as if they were two.
+        deduped: dict[str, dict] = {}
+        for row in pattern_items:
+            deduped.setdefault(normalise(row["item"]), row)
+        pattern_items = list(deduped.values())
+
+        if len(pattern_items) >= config.MANIFEST_MIN_ITEMS:
+            score = 0.5 * len(pattern_items) + 0.25 * len(term.split())
+            plan = EnumerationPlan(
+                term=term,
+                items=pattern_items[: config.MANIFEST_MAX_ITEMS],
+                truncated_from=(
+                    len(pattern_items) if len(pattern_items) > config.MANIFEST_MAX_ITEMS else 0
+                ),
             )
             if best is None or score > best[0]:
                 best = (score, plan)

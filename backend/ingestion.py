@@ -67,6 +67,17 @@ _ENCODING = "cl100k_base"
 _NUMBERED_HEADING = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(\S.{0,80})$")
 _MAX_HEADING_CHARS = 90
 
+# A ticket/asset-register row rendered as a flat text line ("Hardware Request
+# P3 03-Jan-2026" wrapped and truncated to "Hardware Request P3 03-") passes
+# the title-case heuristic below -- every word capitalised, no terminal
+# punctuation -- exactly like a real heading. Measured on a real IT support
+# manual ingested on the plain-text path: five such rows got promoted into
+# the manifest's heading tree alongside the document's genuine "2.3.1
+# Hardware Request" section, inflating an 8-item enumeration to 15. A
+# priority code (P1-P4) followed by a trailing digit-hyphen fragment is not
+# a pattern any real heading in this corpus produces.
+_TICKET_ROW_RE = re.compile(r"\bP[1-4]\b.*\d+-\s*$")
+
 
 class PDFReadError(Exception):
     """Raised when a PDF cannot be located, opened, or read."""
@@ -256,6 +267,8 @@ def _is_heading(text: str) -> bool:
         # what separate them.
         return not text.endswith(".") or len(text.split()) <= 6
     if text.endswith((".", ":", ";", ",")):
+        return False
+    if _TICKET_ROW_RE.search(text):
         return False
     words = text.split()
     if not 1 <= len(words) <= 12:
