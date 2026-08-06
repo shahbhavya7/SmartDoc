@@ -620,6 +620,45 @@ def _resolve(candidates: list[Span], choices: tuple[str, ...], display: dict) ->
     return best
 
 
+def _resolve_extra_columns(
+    candidates: list[Span],
+    claimed: list[Span],
+    seen: set[str],
+    choices: tuple[str, ...],
+    display: dict,
+) -> list[TermMatch]:
+    """Other columns EXACTLY named alongside the primary one, for one entity.
+
+    ``_resolve`` stops at the first exact match it finds (longest-first), which
+    is right for a single-column question but means "location and salary
+    band" only ever resolves whichever phrase happened to be checked first --
+    observed: always "salary band", never "location". Exact-only and
+    non-overlapping-span-only, deliberately more conservative than the
+    primary resolution's fuzzy fallback: a false EXTRA column costs a second,
+    wrong authoritative-looking fact, not just a missed opportunity.
+    """
+    available = set(choices)
+    found: list[TermMatch] = []
+    for span in candidates:
+        if any(span.overlaps(c) for c in claimed):
+            continue
+        for variant in _variants(span.text):
+            if variant in available and variant not in seen:
+                found.append(
+                    TermMatch(
+                        query_text=span.text,
+                        resolved=variant,
+                        display=display.get(variant, variant),
+                        score=100.0,
+                        span=span,
+                    )
+                )
+                seen.add(variant)
+                claimed.append(span)
+                break
+    return found
+
+
 @dataclass
 class Probe:
     """Decision 1's output: everything the SQL thread needs, resolved in memory.
@@ -635,6 +674,11 @@ class Probe:
     reason: str = ""
     entity: TermMatch = field(default_factory=TermMatch)
     column: TermMatch = field(default_factory=TermMatch)
+    # A compound question ("location AND salary band of Employee 100") names
+    # more than one column for the same entity. ``column`` stays whichever one
+    # `_resolve` found first, for backward-compatible diagnostics; these ride
+    # alongside it so a second attribute is not silently dropped.
+    extra_columns: list[TermMatch] = field(default_factory=list)
     multi_answer_cue: str = ""
     numeric_cue: str = ""
     aggregate: str = ""          # "", "max", "min", "count", "filter"
@@ -738,6 +782,12 @@ def prepare(user_id: str, question: str) -> Probe:
     ]
     probe.entity = _resolve(entity_candidates, vocab.entities, vocab.entity_display)
 
+    claimed = [s for s in (probe.column.span, probe.entity.span) if s]
+    seen = {probe.column.resolved} if probe.column.resolved else set()
+    probe.extra_columns = _resolve_extra_columns(
+        candidates, claimed, seen, vocab.columns, vocab.column_display
+    )
+
     probe.multi_answer_cue = _has_cue(question, MULTI_ANSWER_CUES)
     probe.numeric_cue = _has_cue(question, NUMERIC_CUES)
     # After resolution, not before: both aggregate suppressions need to know what
@@ -750,6 +800,8 @@ def prepare(user_id: str, question: str) -> Probe:
     reasons = []
     if probe.column.score >= floor:
         reasons.append(f"column~{probe.column.resolved}({probe.column.score:.0f})")
+    for extra in probe.extra_columns:
+        reasons.append(f"column~{extra.resolved}(100)")
     if probe.entity.score >= floor:
         reasons.append(f"entity~{probe.entity.resolved}({probe.entity.score:.0f})")
     if probe.numeric_cue:
@@ -843,7 +895,15 @@ def _fact(row: dict, kind: str = "cell") -> ExactFact:
 
 
 def _single_cell(probe: Probe) -> SqlResult:
-    """The lookup path: one resolved entity, one resolved column, one value."""
+    """The lookup path: one resolved entity, one resolved column, one value.
+
+    ``probe.extra_columns`` (a compound question -- "location AND salary
+    band") ride along AFTER the primary column's own Decision-2 verdict is
+    settled: adding a second attribute must never turn a solid single-column
+    answer into "ambiguous" just because the second one did not resolve as
+    cleanly. Each extra fact is included only if it independently lands on
+    exactly one row.
+    """
     result = SqlResult()
     trust = config.PARALLEL_SQL_TRUST_THRESHOLD
 
@@ -876,6 +936,13 @@ def _single_cell(probe: Probe) -> SqlResult:
     else:
         result.verdict = "confident"
         result.facts = [_fact(rows[0])]
+        for extra in probe.extra_columns:
+            extra_rows = db.lookup_cells(
+                probe.user_id, probe.entity.resolved, extra.resolved
+            )
+            result.rows_returned += len(extra_rows)
+            if len(extra_rows) == 1:
+                result.facts.append(_fact(extra_rows[0]))
     return result
 
 
