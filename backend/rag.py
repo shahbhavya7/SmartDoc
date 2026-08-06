@@ -230,7 +230,13 @@ side, say which side is missing rather than implying symmetry.""",
     MULTI_HOP: """This is a MULTI-STEP question. The answer depends on an \
 intermediate fact (for example an entity's category, tier, or classification). \
 Identify that intermediate fact from the context first, then apply the rule that \
-governs it, and state both links explicitly so the reasoning is checkable.""",
+governs it, and state both links explicitly so the reasoning is checkable.
+
+Name the section or document each link came from ("Section 5.1 gives the base \
+policy; Section 8.1 states the contractor exception") -- not just the values. A \
+reviewer checking this answer must be able to tell that two different parts of \
+the context were actually combined, rather than one passage happening to \
+contain the whole answer already.""",
     PROCEDURAL: """This is a PROCEDURAL question. Answer as an ordered list of \
 steps in the order the documents give them. Preserve every stated deadline, \
 threshold, and approver. Do not merge or reorder steps, and do not invent steps \
@@ -502,11 +508,70 @@ def citation_display(
     return f"{trail}, {pages}" if trail else pages
 
 
-def build_sources(context: AssembledContext) -> list[Source]:
-    """Build citations from exactly the units that entered the prompt."""
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _content_words(text: str) -> set[str]:
+    # >= 3, not > 3: a short acronym ("SLA", "VPN") is exactly the kind of
+    # word that names what a citation is actually about.
+    return {w for w in _WORD_RE.findall((text or "").lower()) if len(w) >= 3}
+
+
+def _contributed(unit_text: str, answer_words: set[str]) -> bool:
+    """Did this unit plausibly contribute to the answer, or share nothing with it?
+
+    Deliberately lenient -- one shared content word is enough to keep a
+    citation. The bar this replaces (every unit in ``units_used`` gets cited,
+    full stop) was a considered choice, not an oversight: a distance-margin
+    filter tried before it dropped a passage the model actually read from,
+    so the fix here does not repeat that mistake by requiring a STRONG match.
+    It only drops a citation for a passage sharing NOTHING with what was
+    actually said -- e.g. a same-page neighbour chunk retrieved alongside the
+    one that answered, whose own heading/content the answer never touches.
+    """
+    if not answer_words:
+        return True  # nothing to compare against; do not risk under-citing
+    return bool(_content_words(unit_text) & answer_words)
+
+
+def multi_hop_provenance(units: list) -> dict:
+    """How many distinct sections actually backed a multi-hop answer.
+
+    Diagnostics only, not a gate -- auto-repairing a multi-hop answer that
+    looks like a lucky single-chunk guess risks inventing the SECOND link
+    rather than genuinely re-deriving it. What this gives a reviewer is the
+    signal they need to tell the difference themselves: a real two-step
+    synthesis draws from >= 2 distinct (source, section) pairs; a single
+    passage that happened to already contain the whole answer draws from
+    just one, no matter how confidently the prose claims to have combined two.
+    """
+    pairs = {
+        (getattr(u, "source", "") or "", str(u.metadata.get("section", "") or ""))
+        for u in units
+    }
+    return {
+        "distinct_sections": len(pairs),
+        "sections": sorted(f"{s} > {sec}" if sec else s for s, sec in pairs if s),
+    }
+
+
+def build_sources(context: AssembledContext, answer_text: str = "") -> list[Source]:
+    """Build citations from the units that entered the prompt AND were used.
+
+    ``answer_text`` is optional and defaults to citing every unit (the
+    original, deliberately over-inclusive behaviour) when omitted -- a
+    caller that only has the context, not the finished answer, keeps working
+    unchanged. When given, a unit sharing no content word at all with the
+    answer is dropped: two different units from the SAME page, one of which
+    the answer never actually drew from, no longer both get cited just
+    because both were in the prompt.
+    """
+    answer_words = _content_words(answer_text) if answer_text else set()
     sources: list[Source] = []
     seen: set[tuple[str, int, str]] = set()
     for unit in context.units_used:
+        if answer_text and not _contributed(unit.matched_text or unit.text, answer_words):
+            continue
         section = unit.metadata.get("section", "") or ""
         key = (unit.source, unit.page, section)
         if key in seen:
@@ -1706,6 +1771,9 @@ def query(
         },
     }
 
+    if plan.query_type == MULTI_HOP:
+        diagnostics["multi_hop"] = multi_hop_provenance(context.units_used)
+
     # Addendum 2 diagnostics. Reported even when the SQL result was DISCARDED:
     # the interesting failure is a correct lookup rejected by Decision 2, and
     # that is invisible unless the rejection and its reason are recorded.
@@ -1865,7 +1933,7 @@ def query(
             diagnostics=diagnostics,
         )
 
-    sources = build_sources(context)
+    sources = build_sources(context, answer_text)
     if sql_result is not None and sql_result.confident:
         sources = add_sql_sources(sources, sql_result.facts)
 
