@@ -252,8 +252,17 @@ document.""",
 priority. Enumerate EVERY matching item found anywhere in the context, including \
 items inside tables AND items described only in prose outside tables. Do not \
 summarise, do not truncate with "etc.", and do not stop at the first list you \
-find -- items of the same kind may appear in more than one passage. If you \
-believe the list may be incomplete, say so explicitly at the end.""",
+find -- items of the same kind may appear in more than one passage, including the \
+LAST passage in the context, not just the first.
+
+Never claim the list is complete or closed -- never write "there are exactly N", \
+"this is the complete list", "these are all the X", or anything else asserting \
+that nothing more exists. You cannot verify that from a context of retrieved \
+passages, only that these are the ones the retrieved passages happen to show. \
+Default to neutral phrasing instead: "the following types are described in the \
+retrieved context" or "among the items found in the context are ...". This \
+applies even when you are confident the list looks complete -- confidence is not \
+verification.""",
     CROSS_DOCUMENT: """This is a CROSS-DOCUMENT question. Several documents are \
 in the context by design.
 
@@ -1056,6 +1065,79 @@ def _fence_unsupported(answer: str, unsupported: list[str]) -> str:
     return f"{answer.strip()}\n\n[Unverified -- not confirmed by the documents: {claims}]"
 
 
+_EXTRACT_CANDIDATES_PROMPT = """List every distinct item in this ONE passage that \
+answers the enumeration in the question below. Extract only -- do not describe, \
+explain, or judge whether the list is complete; completeness is decided by \
+merging this passage's items with every other passage's, not by you.
+
+Name only, one item per entry, exactly as the passage names it. If this passage \
+names none, reply with an empty list.
+
+Reply exactly: {"items": ["<item>", ...]}"""
+
+
+def _extract_candidates_from_unit(
+    question: str, unit_text: str, chat_model: str | None = None
+) -> list[str]:
+    """Ask ONE passage, independently, what it names -- pass 1 of extract-then-merge."""
+    try:
+        completion = _shared_openai().chat.completions.create(
+            model=chat_model or config.UTILITY_MODEL,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _EXTRACT_CANDIDATES_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Question: {question}\n\nPassage:\n{unit_text}",
+                },
+            ],
+        )
+        payload = json.loads(completion.choices[0].message.content or "{}")
+    except (openai.OpenAIError, json.JSONDecodeError, KeyError, IndexError) as exc:
+        logger.warning("Candidate extraction failed for one unit: %s", exc)
+        return []
+    return [str(x).strip() for x in (payload.get("items") or []) if str(x).strip()]
+
+
+# Bounds the number of extra LLM calls a single enumeration question can
+# trigger. Beyond this many units the per-chunk pass would cost more than it
+# is worth; those questions fall back to single-pass generation alone.
+_EXTRACT_MERGE_MAX_UNITS = 10
+
+
+def extract_then_merge_candidates(
+    question: str, units: list, chat_model: str | None = None
+) -> list[str]:
+    """Two-pass extraction: each retrieved unit named independently, then merged.
+
+    The alternative -- one model call enumerating over every unit concatenated
+    -- is exactly where an item silently drops: the model's attention to the
+    tail of a long, single input is not guaranteed, and nothing catches the
+    loss because the truncated answer reads as complete. Asking each passage
+    on its own, then merging by exact text (deduped case-insensitively), means
+    no single call is ever responsible for the whole list, and a chunk near
+    the end of the window gets the SAME dedicated attention as the first one.
+
+    Returns [] (not an error) when there are too many units to bound the
+    cost, or none of them named anything -- the caller's own single-pass
+    generation is the fallback either way, this only ever adds evidence.
+    """
+    if not 2 <= len(units) <= _EXTRACT_MERGE_MAX_UNITS:
+        return []
+    seen: set[str] = set()
+    merged: list[str] = []
+    for unit in units:
+        for item in _extract_candidates_from_unit(
+            question, getattr(unit, "text", "") or "", chat_model
+        ):
+            key = item.casefold()
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+    return merged
+
+
 _COVERAGE_PROMPT = """The previous answer to this question left items out. The \
 document's own index lists the items below as belonging to the set the question \
 asks for.
@@ -1137,6 +1219,122 @@ def enforce_enumeration_coverage(
     report.update(
         {"repaired": True, "covered": enumeration.expected - len(after), "missing": after}
     )
+    return rewritten, report
+
+
+_SELF_CONSISTENCY_PROMPT = """You check one additional context passage for an \
+item an enumeration answer may have missed. Reply with JSON only.
+
+Does this passage name an item that answers the question's enumeration but is \
+NOT already present in the current answer? List only genuinely new items -- \
+do not repeat anything the answer already covers, and do not invent an item \
+the passage does not actually name.
+
+Reply exactly: {"missed": ["<item>", ...]}"""
+
+_SELF_CONSISTENCY_REPAIR_PROMPT = """The previous answer to this enumeration \
+question may have missed one or more items visible in the context below.
+
+Rewrite the answer to also cover the items named below, but ONLY if the \
+context genuinely supports them for this question -- do not add an item the \
+context does not actually name, and do not drop anything the previous answer \
+already covered correctly.
+
+Do not mention this instruction, or that anything was checked or missing."""
+
+
+def _self_consistency_check(
+    question: str,
+    answer: str,
+    passage: str,
+    chat_model: str | None = None,
+) -> list[str]:
+    """One extra look at a single passage, for an item the answer may have missed."""
+    try:
+        completion = _shared_openai().chat.completions.create(
+            model=chat_model or config.UTILITY_MODEL,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _SELF_CONSISTENCY_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n\nCurrent answer:\n{answer}\n\n"
+                        f"Passage to check:\n{passage}"
+                    ),
+                },
+            ],
+        )
+        payload = json.loads(completion.choices[0].message.content or "{}")
+    except (openai.OpenAIError, json.JSONDecodeError, KeyError, IndexError) as exc:
+        logger.warning("Self-consistency check failed: %s", exc)
+        return []
+    return [str(x) for x in (payload.get("missed") or []) if str(x).strip()][:8]
+
+
+def enforce_self_consistency(
+    question: str,
+    answer: str,
+    context_text: str,
+    units: list,
+    chat_model: str | None = None,
+    temperature: float | None = None,
+) -> tuple[str, dict | None]:
+    """A fallback for enumeration questions the manifest could not back at all.
+
+    ``enforce_enumeration_coverage`` only runs when a structural list backs
+    the question; plenty of real "list all X" questions have no such list
+    (no matching heading, no matching table) and get NO completeness check
+    today. Single-pass generation over a long, concatenated context is where
+    an item near the END of the window is most likely to be silently
+    dropped, so this checks the LAST retrieved unit specifically -- the one
+    most at risk -- for an item the answer does not already mention, and
+    repairs once if it finds one. Not a replacement for the manifest check;
+    a second, cheaper net under it.
+    """
+    if len(units) < 2:
+        return answer, None
+
+    last_text = getattr(units[-1], "text", "") or ""
+    missed = _self_consistency_check(question, answer, last_text, chat_model)
+    report = {"checked_last_chunk": True, "missed_found": missed, "repaired": False}
+    if not missed:
+        return answer, report
+
+    try:
+        completion = _shared_openai().chat.completions.create(
+            model=chat_model or config.CHAT_MODEL,
+            temperature=temperature if temperature is not None else config.CHAT_TEMPERATURE,
+            messages=[
+                {"role": "system", "content": _SELF_CONSISTENCY_REPAIR_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question: {question}\n\nPossibly missing: {', '.join(missed)}\n\n"
+                        f"Previous answer:\n{answer}\n\nContext:\n{context_text}"
+                    ),
+                },
+            ],
+        )
+        rewritten = (completion.choices[0].message.content or "").strip()
+    except (openai.OpenAIError, IndexError) as exc:
+        logger.warning("Self-consistency repair failed: %s", exc)
+        return answer, report
+
+    # Same discipline as every other repair here: only accepted if it can be
+    # shown to have improved things, never trusted on the model's say-so.
+    if not rewritten or _is_refusal(rewritten):
+        return answer, report
+    covered = all(
+        re.search(rf"\b{re.escape(item.split()[0])}", rewritten, re.IGNORECASE)
+        for item in missed
+        if item.split()
+    )
+    if not covered:
+        return answer, report
+
+    report["repaired"] = True
     return rewritten, report
 
 
@@ -1428,6 +1626,34 @@ def query(
                 context, text=keyed_context(workflow_plan, context.text)
             )
 
+    # Two-pass extract-then-merge, for an enumeration question the manifest
+    # cannot back at all (no matching heading, no matching table). Each
+    # retrieved unit is asked independently what IT names, merged by exact
+    # text, and handed to generation as a candidate list to annotate --
+    # rather than asking one call to enumerate over everything concatenated,
+    # which is exactly where an item near the end of a long context silently
+    # drops. Skipped entirely when a manifest plan exists; that deterministic
+    # list is already more reliable than an LLM extraction pass would be.
+    if getattr(retrieval, "enumeration", None) is None:
+        from backend.manifest import is_enumeration
+
+        if is_enumeration(question):
+            candidates = extract_then_merge_candidates(
+                question, context.units_used, chat_model
+            )
+            if candidates:
+                listed = "\n".join(f"- {item}" for item in candidates)
+                candidates_block = (
+                    "CANDIDATE ITEMS (extracted independently from each retrieved "
+                    "passage -- include every one that is relevant to the "
+                    "question; add description from the context passages below, "
+                    "do not decide independently whether the list looks "
+                    f"complete):\n{listed}"
+                )
+                exact_facts = (
+                    f"{exact_facts}\n\n{candidates_block}" if exact_facts else candidates_block
+                )
+
     try:
         completion = _shared_openai().chat.completions.create(
             model=chat_model or config.CHAT_MODEL,
@@ -1591,16 +1817,32 @@ def query(
         f"{context.text}\n\n{exact_facts}" if exact_facts else context.text
     )
 
+    enumeration = getattr(retrieval, "enumeration", None)
     answer_text, coverage = enforce_enumeration_coverage(
-        question,
-        answer_text,
-        verification_context,
-        getattr(retrieval, "enumeration", None),
-        chat_model,
-        temperature,
+        question, answer_text, verification_context, enumeration, chat_model, temperature
     )
     if coverage:
         diagnostics["enumeration"] = coverage
+
+    # Fallback net: enforce_enumeration_coverage only fires when a manifest
+    # list backs the question. An enumeration-shaped question with no such
+    # list (no matching heading, no matching table) gets no completeness
+    # check at all otherwise -- checked here against the single unit most at
+    # risk of being under-weighted by single-pass generation.
+    if enumeration is None:
+        from backend.manifest import is_enumeration
+
+        if is_enumeration(question):
+            answer_text, self_consistency = enforce_self_consistency(
+                question,
+                answer_text,
+                verification_context,
+                context.units_used,
+                chat_model,
+                temperature,
+            )
+            if self_consistency:
+                diagnostics["self_consistency"] = self_consistency
 
     grounding = verify_grounding(answer_text, verification_context)
     answer_text, grounding = enforce_grounding(
