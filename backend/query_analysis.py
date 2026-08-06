@@ -455,7 +455,13 @@ question that names a specific entity (a vendor, a record type, a product, a \
 band) and asks about a rule that depends on that entity's category, tier, or \
 classification is multi_hop -- the category must be looked up before the rule \
 can be applied. Classify these as multi_hop even when they read like a single \
-simple question.
+simple question. Do NOT classify as multi_hop a question that just asks for \
+two or more DIRECT attributes of the SAME named entity ("Employee 100's \
+location and salary band", "the vendor's address and phone number") -- every \
+attribute is a plain lookup in the SAME row or record, no rule and no \
+category to resolve first, so this is fact_lookup even though it reads like \
+"two things." The test is whether a RULE is being applied to a looked-up \
+category, not whether the question names more than one field.
 - procedural: asks for ordered steps or a process.
 - synthesis: asks for a DOCUMENT-WIDE treatment of one subject -- summarise the \
 document, explain the entire process, design a complete workflow, give an \
