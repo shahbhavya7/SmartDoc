@@ -648,6 +648,19 @@ def upsert_document(
     return record
 
 
+def document_owners() -> list[str]:
+    """Distinct owners with at least one document row.
+
+    For the table-chunk migration script, which needs to walk every user's
+    documents rather than one user's -- the same "no unscoped variant" rule as
+    ``list_documents`` still holds; this returns owner ids only, never rows.
+    """
+    init_db()
+    with connect() as conn:
+        rows = conn.execute("SELECT DISTINCT user_id FROM documents").fetchall()
+    return [r["user_id"] for r in rows]
+
+
 def list_documents(user_id: str) -> list[dict]:
     """This user's documents, newest first. There is no unscoped variant."""
     init_db()

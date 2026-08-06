@@ -833,11 +833,18 @@ def build_chunks(
     # SQL store alone and must NOT change the chunk stream. Keying off the flag
     # is what keeps flag-off chunk output byte-identical.
     if parsed.tables and config.TABLE_AWARE_INGESTION_ENABLED:
-        from backend.tables import build_table_documents
+        # V4: grouped-JSON row chunks replace the legacy pipe-format ones once
+        # GROUPED_JSON_TABLE_CHUNKS_ENABLED is on. The legacy builder stays
+        # available (and is what the V3.2 tests/verify script still exercise)
+        # for as long as the flag can still be measured against itself.
+        if config.GROUPED_JSON_TABLE_CHUNKS_ENABLED:
+            from backend.tables import build_table_documents_grouped_json as _build_tables
+        else:
+            from backend.tables import build_table_documents as _build_tables
 
         children = _splice_by_page(
             children,
-            build_table_documents(
+            _build_tables(
                 parsed.tables,
                 doc_title=parsed.title,
                 content_hash=parsed.content_hash,

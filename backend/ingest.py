@@ -112,6 +112,10 @@ def main() -> None:
         f" (TABLE_AWARE_INGESTION_ENABLED)"
     )
     print(
+        f"Table chunks   : {'grouped-JSON' if config.GROUPED_JSON_TABLE_CHUNKS_ENABLED else 'legacy pipe-format'}"
+        f" (GROUPED_JSON_TABLE_CHUNKS_ENABLED, {config.TABLE_ROWS_PER_CHUNK} rows/chunk)"
+    )
+    print(
         f"Metadata       : semantic "
         f"{'ON' if config.SEMANTIC_METADATA_ENABLED else 'OFF'} | manifest routing "
         f"{'ON' if config.MANIFEST_ROUTING_ENABLED else 'OFF'}"

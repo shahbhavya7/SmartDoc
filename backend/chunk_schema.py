@@ -89,6 +89,13 @@ OPTIONAL_FIELDS: tuple[str, ...] = (
     "doc_title", "page_end", "parent_id", "prev_id", "next_id", "has_table",
     "token_count", "content_hash", "document_id", "is_table_summary",
     "table_rows", "table_spans_pages", "table_fragments",
+    # --- V4: grouped-JSON table chunks ---
+    # entities_in_group: delimited first-column values present in this group,
+    # for entity-name retrieval/citation without a per-row chunk.
+    # table_chunk_format: written ONLY by the grouped-JSON path ("grouped_json_v1"),
+    # absent on legacy pipe-format chunks -- the marker the migration script and
+    # backend.tables.assemble use to tell the two chunk shapes apart.
+    "entities_in_group", "table_chunk_format",
 )
 
 

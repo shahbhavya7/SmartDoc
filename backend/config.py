@@ -166,6 +166,36 @@ TABLE_SIBLING_MAX_TOKENS = _int("TABLE_SIBLING_MAX_TOKENS", 3000)
 TABLE_SUMMARY_MAX_LABELS = _int("TABLE_SUMMARY_MAX_LABELS", 12)
 
 # ---------------------------------------------------------------------------
+# V4 -- grouped-JSON table chunk storage
+#
+# Shipped ON: scripts/migrate_grouped_json_tables.py has run against the real
+# corpus and scripts/verify_grouped_json_tables.py's known-answer before/after
+# showed zero regressions (see eval/v4_grouped_json/). The flag remains so the
+# mechanism can still be measured against the legacy one it replaced -- the
+# legacy pipe-format builder (backend.tables.build_table_documents) stays
+# available for exactly that comparison, exercised by tests/test_v3_2_tables.py
+# and scripts/verify_v3_2.py, both of which pin this flag OFF regardless of the
+# default below. This replaces
+# the pipe-delimited row-chunk text AND the separate summary-only chunk with one
+# document per GROUP of rows: each row becomes a JSON object keyed by column
+# header, several rows are grouped into one JSON array, and a short
+# natural-language description of the table is prepended to every group. Column
+# names travel inside every row object, so no header block needs repeating, and
+# the description makes every group self-describing for embedding on its own.
+#
+# The SQL exact-lookup path (table_store.py / PARALLEL_SQL_LOOKUP_ENABLED) is
+# untouched by this flag -- it reads the same LogicalTable objects independently
+# and keeps storing rows relationally in SQLite regardless of how the vector
+# side chunks them.
+# ---------------------------------------------------------------------------
+GROUPED_JSON_TABLE_CHUNKS_ENABLED = _bool("GROUPED_JSON_TABLE_CHUNKS_ENABLED", True)
+
+# Target rows per JSON group. Not a hard cap: a group still flushes early if
+# adding the next row would exceed the token budget below, so wide rows still
+# keep each chunk near the ~800-token budget rather than overshooting it.
+TABLE_ROWS_PER_CHUNK = _int("TABLE_ROWS_PER_CHUNK", 10)
+
+# ---------------------------------------------------------------------------
 # V3.3 -- the universal metadata layer
 #
 # Metadata is a headline feature of V3, not an optional add-on, so unlike every
