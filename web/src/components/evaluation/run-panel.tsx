@@ -139,7 +139,7 @@ export function RunPanel({
         {/* ------------------------------------------------------------ */}
         {/* Row 2: the primary control in each column                     */}
         {/* ------------------------------------------------------------ */}
-        <div className="order-2 lg:order-none lg:col-start-1 lg:row-start-2">
+        <div className="order-2 flex lg:order-none lg:col-start-1 lg:row-start-2">
           <button
             type="button"
             onClick={() => setTestSet(null)}
@@ -164,7 +164,7 @@ export function RunPanel({
           </button>
         </div>
 
-        <div className="order-4 lg:order-none lg:col-start-2 lg:row-start-2">
+        <div className="order-4 flex flex-col lg:order-none lg:col-start-2 lg:row-start-2">
           {/* Repeated on small screens, where the row-1 label is hidden and
               the columns stack into a single flow. */}
           <p className="mb-2.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground lg:hidden">
@@ -176,9 +176,13 @@ export function RunPanel({
             placeholder="e.g. after fixing table retrieval"
             disabled={running}
             aria-label="Run label"
-            // Matched to the gold-set card's height so the two columns' primary
-            // controls occupy the same band instead of one floating mid-row.
-            className="h-[68px]"
+            // `h-full`, never a fixed pixel height. The gold-set card opposite
+            // sizes itself from its own two lines of text, so any hardcoded
+            // value here is correct only at one font size and one wrap point --
+            // an earlier `h-[68px]` matched a 64px card and left a visible 4px
+            // step. The row's `items-stretch` makes both cells the height of
+            // the taller one, so this tracks the card automatically.
+            className="h-full"
           />
         </div>
 
