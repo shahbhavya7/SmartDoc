@@ -11,7 +11,7 @@
  * result is not a slightly-early render but a visibly broken one:
  *
  * - A GFM table is only a table once its `|---|---|` divider row exists. Before
- *   that, remark renders the header as a paragraph of literal pipe characters —
+ *   that, remark renders the header as a paragraph of literal pipe characters
  *   so a table would appear as `| Band | Annual leave |` text, then snap into a
  *   table a few frames later.
  * - Half a row (`| Senior | 28 d`) is a row with the wrong number of cells, so
@@ -21,7 +21,7 @@
  *
  * The fix is to reveal at *structural* boundaries: never show a partial block
  * line, never show a table before it can render as one, and close what is still
- * open. Nothing is ever taken back — the clamp only ever shows LESS than the
+ * open. Nothing is ever taken back the clamp only ever shows LESS than the
  * character count, and the final call returns the text verbatim.
  */
 

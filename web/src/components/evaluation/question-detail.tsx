@@ -9,7 +9,7 @@
  * row wants "why did this fail" answered in the first line, not after scrolling
  * past two paragraphs of answer text.
  *
- * Checks that did not apply are omitted rather than shown as "n/a" — a
+ * Checks that did not apply are omitted rather than shown as "n/a" a
  * consistency row has no exact-value check, and printing an empty one for it
  * just adds noise to every card.
  */
@@ -86,7 +86,7 @@ export function QuestionDetail({
           {categoryLabel(result.category)}
         </span>
         {result.fail_reason ? (
-          <span className="text-xs text-rose-300">— {result.fail_reason}</span>
+          <span className="text-xs text-rose-300">{result.fail_reason}</span>
         ) : null}
         <span className="ml-auto text-[11px] tabular-nums text-muted-foreground/70">
           {result.latency_ms > 0
@@ -121,9 +121,9 @@ export function QuestionDetail({
         /* ---------------------------------------------------------------- */
         <>
           <div className="grid gap-3 lg:grid-cols-2">
-            <Field label="First run">{result.run1_answer || "—"}</Field>
+            <Field label="First run">{result.run1_answer || ""}</Field>
             <Field label="Second run (5 minutes later)">
-              {result.run2_answer || "—"}
+              {result.run2_answer || ""}
             </Field>
           </div>
           <div className="glass-raised rounded-xl p-3.5">
@@ -142,7 +142,7 @@ export function QuestionDetail({
               threshold={null}
             />
             <p className="mt-2 text-xs text-muted-foreground">
-              Compared against each other, not against the expected answer — this
+              Compared against each other, not against the expected answer this
               measures whether the system is stable, not whether it is right.
             </p>
           </div>
@@ -270,7 +270,7 @@ export function QuestionDetail({
                 <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground/75">
                   {result.correctly_declined
                     ? "Correctly declined instead of inventing an answer."
-                    : "Answered when it should have declined — this is a made-up answer."}
+                    : "Answered when it should have declined this is a made-up answer."}
                 </p>
               </div>
             ) : null}

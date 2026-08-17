@@ -226,7 +226,7 @@ export function Dashboard() {
           ) : docs.length === 0 ? (
             <div className="space-y-4">
               <p className="text-sm text-muted-foreground">
-                No documents yet. SmartDoc can only answer from what you upload —
+                No documents yet. SmartDoc can only answer from what you upload
                 with nothing indexed, every question returns{" "}
                 <em>&ldquo;I don&rsquo;t know based on the available
                 documents.&rdquo;</em>

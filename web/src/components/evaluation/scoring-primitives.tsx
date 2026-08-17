@@ -45,7 +45,7 @@ export const CATEGORY_LABELS: Record<string, string> = {
 /** What each category is actually testing, in one sentence. */
 export const CATEGORY_BLURBS: Record<string, string> = {
   fact_lookup: "A single fact stated plainly in one place.",
-  entity_specific: "A specific code, name, or identifier — exact-match territory.",
+  entity_specific: "A specific code, name, or identifier exact-match territory.",
   definitional: "What a term means, as the documents define it.",
   yes_no_justified: "A yes or no that has to say what it is based on.",
   numeric_quantitative: "A number that must be exactly right, not approximately.",
@@ -53,13 +53,13 @@ export const CATEGORY_BLURBS: Record<string, string> = {
   table_cell_lookup: "One cell from a table, found by row name or by ID.",
   table_aggregation: "Counting or listing across a whole table, not one row.",
   multi_section_synthesis: "An answer that has to combine two or more sections.",
-  enumeration: "Listing every item of a kind — tests completeness, not luck.",
+  enumeration: "Listing every item of a kind tests completeness, not luck.",
   document_summary: "Summarising a whole document.",
-  comparison: "Comparing options — should come back as a table.",
+  comparison: "Comparing options should come back as a table.",
   procedural_ordered: "Steps in the right order.",
   out_of_scope_unrelated: "Nothing to do with the documents. Must say it doesn't know.",
   out_of_scope_plausible:
-    "Sounds like it could be in the documents but isn't — the highest risk of a made-up answer.",
+    "Sounds like it could be in the documents but isn't the highest risk of a made-up answer.",
   out_of_scope_partial:
     "Half answerable: must answer the supported half and flag the rest as missing.",
   cross_document: "Pulling together facts from two or more different documents.",
@@ -92,7 +92,7 @@ export const SCORING_MODE_LABELS: Record<string, string> = {
  * A similarity score drawn against the pass threshold.
  *
  * `threshold` is drawn as a tick on the track. Without it the number is not
- * interpretable — the whole point is whether the score cleared the bar.
+ * interpretable the whole point is whether the score cleared the bar.
  */
 export function ScoreBar({
   value,

@@ -5,7 +5,7 @@
  * shows for the same PDF, and a mismatch reads as a bug.
  */
 export function formatBytes(bytes: number | null | undefined): string {
-  if (bytes === null || bytes === undefined) return "—";
+  if (bytes === null || bytes === undefined) return "";
   if (bytes <= 0) return "0 KB";
 
   const units = ["B", "KB", "MB", "GB"];

@@ -3,7 +3,7 @@ import Link from "next/link";
 import { cn } from "@/lib/utils";
 
 /**
- * The wordmark. A glass tile holding the mark, then champagne gradient type —
+ * The wordmark. A glass tile holding the mark, then champagne gradient type
  * the two design-system signatures in one element, so it reads as the same
  * product on the auth screens and inside the app.
  */

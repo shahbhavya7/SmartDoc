@@ -3,8 +3,8 @@
 /**
  * Starting an evaluation: upload a test set, or run the shipped one.
  *
- * A run is expensive — it asks the real system every question and pays for
- * embeddings — so this panel is explicit about what is about to happen and how
+ * A run is expensive it asks the real system every question and pays for
+ * embeddings so this panel is explicit about what is about to happen and how
  * long it takes, rather than presenting a bare button. The uploaded set is
  * validated server-side on upload, so an unusable file is rejected here with a
  * message naming the problem instead of failing minutes into a run.
@@ -157,8 +157,8 @@ export function RunPanel({
                 Built-in gold set
               </span>
               <span className="block text-xs text-muted-foreground">
-                {goldSet?.total ?? "—"} questions covering{" "}
-                {goldSet?.categories.length ?? "—"} question types.
+                {goldSet?.total ?? ""} questions covering{" "}
+                {goldSet?.categories.length ?? ""} question types.
               </span>
             </span>
           </button>
@@ -266,7 +266,7 @@ export function RunPanel({
 
           <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground/75">
             {running
-              ? "You can leave this page — the run continues on the server."
+              ? "You can leave this page the run continues on the server."
               : `Takes roughly ${estimate} minute${estimate === 1 ? "" : "s"}. Each question is a real request to the system.`}
           </p>
         </div>

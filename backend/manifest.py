@@ -56,7 +56,7 @@ _LIST_LEAD = re.compile(
 )
 
 # "Label: description" -- "Sick leave: ten days per year" enumerates *sick leave*.
-_LABELLED = re.compile(r"^(?P<label>[^:–—-]{2,60})\s*[:–—-]\s+\S")
+_LABELLED = re.compile(r"^(?P<label>[^:–-]{2,60})\s*[:–-]\s+\S")
 
 # A leading section number, stripped so an item reads as a thing rather than an
 # outline row.
@@ -639,7 +639,7 @@ def plan_enumeration(user_id: str, question: str) -> EnumerationPlan | None:
         # full name before the dash; keep only the shorter, canonical form.
         by_prefix: dict[str, dict] = {}
         for row in pattern_items:
-            prefix = normalise(re.split(r"\s*[-–—]\s*", row["item"], maxsplit=1)[0])
+            prefix = normalise(re.split(r"\s*[-–]\s*", row["item"], maxsplit=1)[0])
             existing = by_prefix.get(prefix)
             if existing is None or len(row["item"]) < len(existing["item"]):
                 by_prefix[prefix] = row

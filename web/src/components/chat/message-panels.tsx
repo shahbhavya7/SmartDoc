@@ -53,7 +53,7 @@ export function AnswerPanel({
 }) {
   const { visible, done } = useProgressiveText(content, animate);
 
-  // Citations and flags appear only once the prose has finished revealing —
+  // Citations and flags appear only once the prose has finished revealing
   // attaching them to a half-written answer reads as a rendering glitch.
   const showMeta = done;
 

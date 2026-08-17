@@ -8,7 +8,7 @@
  * should I believe that number"), and interleaving them would bury both.
  *
  * The page opens on the most recent run. Everything shown comes from the saved
- * run file — nothing is recomputed here, so what the page displays and what the
+ * run file nothing is recomputed here, so what the page displays and what the
  * CLI printed for the same run are the same numbers by construction.
  *
  * A run in flight is polled, and the poll is re-attached on mount rather than
@@ -263,7 +263,7 @@ export function Evaluation() {
         </h1>
         <p className="max-w-3xl text-sm text-muted-foreground">
           Every question below was asked to the real system and its answer
-          compared against a known-correct one. Nothing here is estimated —
+          compared against a known-correct one. Nothing here is estimated
           <span data-print="hide"> open any question to see exactly how it was
           judged.</span>
           <span className="hidden print:inline">
@@ -345,7 +345,7 @@ export function Evaluation() {
             >
               {runs.map((row) => (
                 <option key={row.run_id} value={row.run_id} className="bg-neutral-900">
-                  {runLabel(row)} — {row.passed}/{row.question_count} (
+                  {runLabel(row)} {row.passed}/{row.question_count} (
                   {row.pass_rate.toFixed(0)}%)
                   {row.shared ? " · baseline" : ""}
                 </option>
@@ -358,7 +358,7 @@ export function Evaluation() {
               onClick={downloadPdf}
               disabled={!run || loadingRun}
               className="h-9 gap-2"
-              title="Opens your browser's print dialog — choose 'Save as PDF'"
+              title="Opens your browser's print dialog choose 'Save as PDF'"
             >
               <Download className="size-4" aria-hidden />
               <span className="hidden sm:inline">Download PDF</span>
@@ -404,7 +404,7 @@ function RunMeta({ run }: { run: EvalRun }) {
   const when = parseRunTimestamp(run.meta.timestamp);
   const items: [string, string][] = [
     ["Run", run.meta.label || run.meta.timestamp],
-    ["When", when ? formatRelativeTime(when.toISOString()) : "—"],
+    ["When", when ? formatRelativeTime(when.toISOString()) : ""],
     ["Questions", String(run.meta.question_count)],
     ["Pass mark", run.meta.threshold.toFixed(2)],
     ["Embedding model", run.meta.embedding_model],

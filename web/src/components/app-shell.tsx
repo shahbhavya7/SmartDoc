@@ -129,7 +129,7 @@ export function AppShell({
               />
               <DropdownMenuContent align="end" className="w-64">
                 {/* The Group wrapper is required, not decorative: this shadcn
-                    build is Base UI, whose GroupLabel throws outside a Group —
+                    build is Base UI, whose GroupLabel throws outside a Group
                     which silently prevents the whole menu from opening. */}
                 <DropdownMenuGroup>
                   <DropdownMenuLabel className="flex flex-col gap-1">
@@ -157,7 +157,7 @@ export function AppShell({
           fullBleed
             // Same horizontal scale as the header above, so a fullBleed page's
             // own floating card lines up edge-to-edge with the nav bar instead
-            // of sitting flush against the viewport under a bar that floats —
+            // of sitting flush against the viewport under a bar that floats
             // that mismatch is exactly what looked "fixed to the edges and
             // odd" before this.
             //

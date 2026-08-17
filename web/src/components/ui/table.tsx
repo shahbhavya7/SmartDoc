@@ -1,7 +1,7 @@
 /**
  * shadcn/ui Table.
  *
- * Plain HTML elements with theme tokens, not a Base UI primitive — a table has
+ * Plain HTML elements with theme tokens, not a Base UI primitive a table has
  * no interactive behaviour to wrap, so this build's Base UI/Radix API
  * differences (DECISIONS.md F10) do not apply here.
  *

@@ -5,13 +5,13 @@
  *
  * Three layers, in the order someone actually reads them:
  *   1. the headline numbers,
- *   2. the per-category breakdown, weakest first — the question "what should I
+ *   2. the per-category breakdown, weakest first the question "what should I
  *      fix" is answered by ordering, not by making the reader scan,
  *   3. every individual question, filterable, each expandable into the full
  *      scoring detail.
  *
  * Every question is listed, not just the failures. A page that only shows what
- * broke cannot be checked for the thing that matters most here — that the
+ * broke cannot be checked for the thing that matters most here that the
  * passes were earned rather than scored generously.
  */
 
@@ -107,7 +107,7 @@ export function RunResults({
             Average meaning match
           </p>
           <p className="mt-2.5 text-3xl font-semibold tabular-nums tracking-tight">
-            {run.summary.mean_similarity?.toFixed(3) ?? "—"}
+            {run.summary.mean_similarity?.toFixed(3) ?? ""}
           </p>
           <p className="mt-1.5 text-xs text-muted-foreground/85">
             Pass mark is {threshold.toFixed(2)}

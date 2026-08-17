@@ -3,14 +3,14 @@
 /**
  * Renders an answer's prose.
  *
- * Phase 4 asks the model to shape each answer to its content — a table for a
- * comparison, a list for steps, prose for an explanation — so this component is
+ * Phase 4 asks the model to shape each answer to its content a table for a
+ * comparison, a list for steps, prose for an explanation so this component is
  * the other half of that instruction: every markdown block the prompt can
  * produce maps to the same shadcn primitives the rest of the app uses, rather
  * than to bare HTML that happens to inherit some styling.
  *
  * `react-markdown` is used with no raw-HTML plugin, so model output cannot inject
- * markup — the answer is untrusted text as far as this component is concerned,
+ * markup the answer is untrusted text as far as this component is concerned,
  * even though it originates from our own backend. That is also why there is no
  * `rehypeRaw` here and no `dangerouslySetInnerHTML` anywhere: a document
  * containing `<img onerror=...>` gets rendered as the literal characters.

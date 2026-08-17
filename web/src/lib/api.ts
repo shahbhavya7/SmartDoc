@@ -279,7 +279,7 @@ export const api = {
   evalJob: (token: string, jobId: string, signal?: AbortSignal) =>
     request<EvalJob>(`/eval/jobs/${encodeURIComponent(jobId)}`, { token, signal }),
 
-  /** The caller's in-flight run, if any — lets the page resume after a reload. */
+  /** The caller's in-flight run, if any lets the page resume after a reload. */
   evalActiveJob: (token: string, signal?: AbortSignal) =>
     request<{ job: EvalJob | null }>("/eval/jobs", { token, signal }),
 };

@@ -38,7 +38,7 @@ const MAX_MS = 1600;
 /**
  * Progress is stored WITH the text it describes, so a changed `text` reads as
  * "nothing revealed yet" during render instead of needing a reset write. That is
- * what keeps this hook free of any synchronous state update inside its effect —
+ * what keeps this hook free of any synchronous state update inside its effect
  * the only writes happen inside a requestAnimationFrame callback.
  */
 interface Progress {

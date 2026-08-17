@@ -114,7 +114,7 @@ export function MethodPanel({
               </div>
               <div className="glass-raised rounded-xl p-3.5">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  Wrong answer — but 0.98 similar
+                  Wrong answer but 0.98 similar
                 </p>
                 <p className="mt-1.5 text-sm">
                   Standard band employees accrue{" "}
@@ -236,7 +236,7 @@ function CalibrationPanel({ calibration }: { calibration: EvalCalibration }) {
           <p className="mt-4 rounded-lg bg-white/[0.04] p-3 text-xs leading-relaxed text-muted-foreground">
             The white tick marks the pass threshold ({threshold.toFixed(2)}).
             Notice that <strong className="text-foreground">wrong numbers and
-            wrong entities score about as high as correct answers</strong> — no
+            wrong entities score about as high as correct answers</strong> no
             threshold can separate them, which is exactly why the exact-value
             check is mandatory. What the threshold does catch is an answer to a
             different question, which scores far lower.
