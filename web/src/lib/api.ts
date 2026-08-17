@@ -20,6 +20,13 @@ import type {
   ChatSession,
   DeleteDocumentResponse,
   DocumentList,
+  EvalCalibration,
+  EvalGoldSetOverview,
+  EvalJob,
+  EvalMethod,
+  EvalRun,
+  EvalRunSummary,
+  EvalTestSetUpload,
   HealthResponse,
   TokenResponse,
   UploadResponse,
@@ -208,6 +215,73 @@ export const api = {
       token,
       signal,
     }),
+
+  /* ------------------------------------------------------------------------ */
+  /* Evaluation                                                              */
+  /*                                                                          */
+  /* Reading is cheap; starting a run is not. `startEvalRun` returns as soon   */
+  /* as the job is queued and progress is polled from `evalJob`, because a     */
+  /* full run is minutes long and holding a request open for it would time     */
+  /* out in every layer between here and the server.                          */
+  /* ------------------------------------------------------------------------ */
+
+  evalMethod: (token: string, signal?: AbortSignal) =>
+    request<EvalMethod>("/eval/method", { token, signal }),
+
+  evalGoldSet: (token: string, signal?: AbortSignal) =>
+    request<EvalGoldSetOverview>("/eval/gold-set", { token, signal }),
+
+  evalCalibration: (token: string, signal?: AbortSignal) =>
+    request<EvalCalibration>("/eval/calibration", { token, signal }),
+
+  evalRuns: (token: string, limit = 25, signal?: AbortSignal) =>
+    request<{ runs: EvalRunSummary[] }>(`/eval/runs?limit=${limit}`, {
+      token,
+      signal,
+    }),
+
+  evalRun: (token: string, runId: string, signal?: AbortSignal) =>
+    request<EvalRun>(`/eval/runs/${encodeURIComponent(runId)}`, { token, signal }),
+
+  evalLatestRun: (token: string, signal?: AbortSignal) =>
+    request<EvalRun>("/eval/runs/latest", { token, signal }),
+
+  uploadTestSet: (token: string, file: File, signal?: AbortSignal) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return request<EvalTestSetUpload>("/eval/test-sets", {
+      method: "POST",
+      formData,
+      token,
+      signal,
+    });
+  },
+
+  startEvalRun: (
+    token: string,
+    options: {
+      testSetId?: string | null;
+      categories?: string[] | null;
+      label?: string;
+    } = {},
+  ) =>
+    request<EvalJob>("/eval/runs", {
+      method: "POST",
+      body: {
+        test_set_id: options.testSetId ?? null,
+        categories: options.categories ?? null,
+        label: options.label ?? "",
+        skip_consistency_wait: true,
+      },
+      token,
+    }),
+
+  evalJob: (token: string, jobId: string, signal?: AbortSignal) =>
+    request<EvalJob>(`/eval/jobs/${encodeURIComponent(jobId)}`, { token, signal }),
+
+  /** The caller's in-flight run, if any — lets the page resume after a reload. */
+  evalActiveJob: (token: string, signal?: AbortSignal) =>
+    request<{ job: EvalJob | null }>("/eval/jobs", { token, signal }),
 };
 
 /** Where to send the browser to begin Google sign-in (a server-side redirect). */

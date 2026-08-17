@@ -325,3 +325,127 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Print / "Download PDF"
+
+   The screen design is dark glass on a glow; a printed copy of that is both
+   unreadable and a waste of toner, and most browsers drop the background
+   entirely anyway (leaving pale grey text on white). So print gets a genuine
+   light theme rather than a filtered version of the dark one: colours are
+   re-declared here, not inverted.
+
+   Elements are opted OUT of print with `data-print="hide"` and marked as
+   unbreakable with `data-print="keep"`, so the rules below stay generic and
+   the components decide what they mean. Anything interactive (filters, the
+   search box, the run button) is hidden -- it cannot be used on paper, and
+   printing a disabled-looking control just raises questions.
+   --------------------------------------------------------------------------- */
+@media print {
+  /* Colour is carried by borders and weight on paper, so the accent tints and
+     translucent fills are flattened rather than approximated. */
+  :root {
+    --background: #ffffff;
+    --foreground: #111111;
+    --muted-foreground: #4a4a4a;
+    --primary: #6b5a2a;
+    --ring: transparent;
+  }
+
+  @page {
+    margin: 14mm 12mm;
+  }
+
+  html,
+  body {
+    background: #ffffff !important;
+    color: #111111 !important;
+  }
+
+  /* The page glow and any decorative fixed layers. */
+  body::before,
+  body::after {
+    display: none !important;
+  }
+
+  [data-print="hide"] {
+    display: none !important;
+  }
+
+  /* Entrance animations use `both`, so their held start state (offset and
+     faded) can be what gets captured. Paper has no entrance. */
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    transform: none !important;
+    opacity: 1 !important;
+  }
+
+  /* Glass becomes a plain outlined card: no blur (which prints as a grey
+     smear), no shadow, no translucency. */
+  .glass,
+  .glass-raised,
+  .glass-chrome,
+  .glass-accent {
+    background: #ffffff !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    border: 1px solid #d4d4d4 !important;
+    box-shadow: none !important;
+  }
+
+  .glass-accent {
+    border-color: #b9a06a !important;
+  }
+
+  /* Tailwind's white/N% fills read as invisible-to-muddy on white. */
+  [class*="bg-white\\/"] {
+    background: #f4f4f5 !important;
+  }
+
+  .text-accent-gradient {
+    background: none !important;
+    -webkit-background-clip: initial !important;
+    background-clip: initial !important;
+    -webkit-text-fill-color: #6b5a2a !important;
+    color: #6b5a2a !important;
+  }
+
+  /* Score bars and pass-rate bars: keep the fill, since the proportion IS the
+     information. print-color-adjust stops the browser dropping it. */
+  [class*="bg-emerald"],
+  [class*="bg-amber"],
+  [class*="bg-rose"],
+  [class*="bg-primary"] {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+
+  /* Never split a question card, a stat tile, or a category row across pages. */
+  [data-print="keep"] {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Sections start on a fresh page only where the report has real chapters. */
+  [data-print="page-break"] {
+    break-before: page;
+    page-break-before: page;
+  }
+
+  /* Sticky/overflow containers clip printed content to one viewport's worth. */
+  .sticky,
+  .fixed {
+    position: static !important;
+  }
+
+  [class*="overflow-"] {
+    overflow: visible !important;
+  }
+
+  a[href]::after {
+    content: "";
+  }
+}

@@ -16,6 +16,10 @@ Endpoints:
     DELETE /documents/{id}-- delete a document: SQLite row AND its Chroma chunks.
     POST /ask             -- answer a question over the signed-in user's documents.
     POST/GET /sessions, /sessions/{id}/messages -- chat history, per user.
+    GET  /eval/method, /eval/gold-set, /eval/calibration -- how scoring works.
+    GET  /eval/runs, /eval/runs/{id} -- past evaluation results, per user.
+    POST /eval/test-sets  -- upload a test set to evaluate against.
+    POST /eval/runs       -- start an evaluation; GET /eval/jobs/{id} to poll.
 
 Authentication and isolation (V2):
     Every endpoint below ``/health`` and ``/auth`` depends on
@@ -58,7 +62,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 import backend.config as config
-from backend import auth, db, documents
+from backend import auth, db, documents, evaluation
 from backend.auth import (
     AuthError,
     OAuthNotConfigured,
@@ -1149,6 +1153,209 @@ def post_message(
             status_code=404, content=_error_body("not_found", "No such session.")
         )
     return MessageModel(**row)
+
+
+# --------------------------------------------------------------------------
+# Evaluation
+#
+# Read-only reporting over the evaluation harness in eval/eval_tool, plus the
+# ability to start a run. Everything is scoped to the caller: a run asks
+# questions against the caller's own documents, so listing someone else's
+# numbers would be reporting on a corpus they cannot see.
+# --------------------------------------------------------------------------
+
+
+class EvalRunRequest(BaseModel):
+    """Body for ``POST /eval/runs``."""
+
+    test_set_id: str | None = Field(
+        default=None,
+        description=(
+            "An uploaded test set (from POST /eval/test-sets). Omit to run the "
+            "shipped gold set."
+        ),
+    )
+    categories: list[str] | None = Field(
+        default=None, description="Restrict the run to these categories."
+    )
+    skip_consistency_wait: bool = Field(
+        default=True,
+        description=(
+            "Run the consistency pair back to back instead of waiting the "
+            "configured ~5 minutes. Kept on by default so a browser-initiated "
+            "run finishes in a reasonable time."
+        ),
+    )
+    label: str = Field(default="", description="Optional name for this run.")
+
+
+def _eval_error(exc: evaluation.EvalError) -> JSONResponse:
+    return JSONResponse(status_code=400, content=_error_body("eval_error", str(exc)))
+
+
+@app.get(
+    "/eval/method",
+    summary="How the evaluation scores answers, in plain English",
+    description=(
+        "Static explanation of the scoring process and metrics. Served from the "
+        "backend so the wording cannot drift away from the code that implements "
+        "it."
+    ),
+)
+def eval_method(_user_id: str = Depends(get_current_user_id)) -> dict:
+    return evaluation.METHOD_EXPLAINER
+
+
+@app.get(
+    "/eval/gold-set",
+    summary="Category coverage of the shipped gold set",
+)
+def eval_gold_set(_user_id: str = Depends(get_current_user_id)) -> dict:
+    return evaluation.gold_set_overview()
+
+
+@app.get(
+    "/eval/calibration",
+    summary="The measured similarity distributions behind the threshold",
+    description=(
+        "Returns the correct-vs-wrong score distributions from the last "
+        "calibration run, which is what justifies the pass threshold. 404 if "
+        "calibration has never been run."
+    ),
+)
+def eval_calibration(_user_id: str = Depends(get_current_user_id)):
+    data = evaluation.calibration()
+    if data is None:
+        return JSONResponse(
+            status_code=404,
+            content=_error_body("not_found", "No calibration has been run yet."),
+        )
+    # The per-pair detail is large and only the distributions are rendered.
+    return {k: v for k, v in data.items() if k != "pairs"}
+
+
+@app.get("/eval/runs", summary="List this user's evaluation runs, newest first")
+def eval_runs(limit: int = 25, user_id: str = Depends(get_current_user_id)) -> dict:
+    return {"runs": evaluation.list_runs(user_id, limit=max(1, min(limit, 100)))}
+
+
+@app.get(
+    "/eval/runs/latest",
+    summary="The most recent evaluation run, in full",
+)
+def eval_latest(user_id: str = Depends(get_current_user_id)):
+    run = evaluation.latest_run(user_id)
+    if run is None:
+        return JSONResponse(
+            status_code=404,
+            content=_error_body("not_found", "No evaluation has been run yet."),
+        )
+    return run
+
+
+@app.get(
+    "/eval/runs/{run_id}",
+    summary="One evaluation run, including every per-question result",
+)
+def eval_run(run_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        return evaluation.get_run(user_id, run_id)
+    except evaluation.EvalError as exc:
+        return JSONResponse(
+            status_code=404, content=_error_body("not_found", str(exc))
+        )
+
+
+@app.post(
+    "/eval/test-sets",
+    status_code=201,
+    summary="Upload a test set to evaluate against",
+    description=(
+        "Accepts a .json or .csv gold set. The file is validated against the "
+        "schema before it is accepted, so a malformed set is rejected here with "
+        "a message naming the problem rather than failing mid-run."
+    ),
+)
+async def eval_upload_test_set(
+    file: UploadFile = File(..., description="A .json or .csv test set."),
+    user_id: str = Depends(get_current_user_id),
+):
+    try:
+        content = await _read_limited(file, MAX_UPLOAD_BYTES)
+        if not content:
+            raise evaluation.EvalError("That file is empty.")
+        return evaluation.save_test_set(user_id, file.filename or "", content)
+    except evaluation.EvalError as exc:
+        return _eval_error(exc)
+    except UploadValidationError as exc:
+        return _eval_error(evaluation.EvalError(str(exc)))
+    finally:
+        await file.close()
+
+
+@app.post(
+    "/eval/runs",
+    status_code=202,
+    summary="Start an evaluation run in the background",
+    description=(
+        "Returns immediately with a job id; poll GET /eval/jobs/{job_id} for "
+        "progress. The run drives this same API over loopback using the "
+        "caller's own token, so it measures exactly what this user experiences "
+        "and sees only this user's documents."
+    ),
+)
+def eval_start_run(
+    payload: EvalRunRequest,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    # The harness authenticates as this caller, so it needs the raw bearer
+    # token. It is read back off the request rather than re-minted, so a run can
+    # never outlive the credential that started it.
+    header = request.headers.get("authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not token:
+        return _eval_error(evaluation.EvalError("Missing bearer token."))
+
+    # The port is a launch-time choice, so the loopback base URL is taken from
+    # the request the browser actually reached us on.
+    base_url = f"http://127.0.0.1:{request.url.port or 8000}"
+
+    try:
+        job = evaluation.start_run(
+            user_id,
+            token,
+            base_url,
+            test_set_id=payload.test_set_id,
+            categories=payload.categories,
+            skip_consistency_wait=payload.skip_consistency_wait,
+            label=payload.label,
+        )
+    except evaluation.EvalError as exc:
+        return _eval_error(exc)
+    return job.to_dict()
+
+
+@app.get(
+    "/eval/jobs/{job_id}",
+    summary="Progress of a running evaluation",
+)
+def eval_job(job_id: str, user_id: str = Depends(get_current_user_id)):
+    try:
+        return evaluation.get_job(user_id, job_id).to_dict()
+    except evaluation.EvalError as exc:
+        return JSONResponse(
+            status_code=404, content=_error_body("not_found", str(exc))
+        )
+
+
+@app.get(
+    "/eval/jobs",
+    summary="The caller's currently running evaluation, if any",
+)
+def eval_active_job(user_id: str = Depends(get_current_user_id)) -> dict:
+    job = evaluation.active_job(user_id)
+    return {"job": job.to_dict() if job else None}
 
 
 if __name__ == "__main__":

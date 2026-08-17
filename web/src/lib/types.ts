@@ -118,3 +118,169 @@ export interface HealthResponse {
   /** Whether the server has Google OAuth credentials configured. */
   google_oauth_enabled: boolean;
 }
+
+/* -------------------------------------------------------------------------- */
+/* Evaluation                                                                 */
+/*                                                                            */
+/* Mirrors backend/evaluation.py and the JSON written by                      */
+/* eval/eval_tool/report.py. As above, this is a transcription of the         */
+/* server's contract: no score is computed on this side, only displayed.      */
+/* -------------------------------------------------------------------------- */
+
+/** One question's full result. Every field the harness measured is kept. */
+export interface EvalQuestionResult {
+  id: string;
+  question: string;
+  category: string;
+  expected_answer: string;
+  expected_source: string | null;
+  generated_answer: string;
+  similarity: number;
+  passed: boolean;
+  fail_reason: string;
+
+  http_status: number;
+  latency_ms: number;
+  retrieved_sources: string[];
+  cited_expected_source: boolean | null;
+  query_type: string;
+
+  /** The exact-value guard: numbers, codes, and IDs that had to match. */
+  exact_match_applicable: boolean;
+  exact_match_passed: boolean;
+  expected_values: string[];
+  found_values: string[];
+  missing_values: string[];
+
+  /** List questions: how many expected items actually appeared. */
+  completeness_applicable: boolean;
+  items_expected: number;
+  items_found: number;
+  missing_items: string[];
+
+  /** comparison: did the answer render an actual table? */
+  rendered_table: boolean | null;
+  /** out_of_scope_*: did it correctly decline? */
+  correctly_declined: boolean | null;
+
+  /** consistency_pair: the same question asked twice. */
+  run1_answer: string;
+  run2_answer: string;
+  self_similarity: number | null;
+  stable: boolean | null;
+
+  /** input_edge_*: judged on behaviour, not similarity. */
+  expected_behavior: string;
+  actual_behavior: string;
+}
+
+export interface EvalCategoryStat {
+  total: number;
+  passed: number;
+  pass_rate: number;
+  mean_similarity: number | null;
+}
+
+export interface EvalRun {
+  meta: {
+    timestamp: string;
+    threshold: number;
+    consistency_threshold: number;
+    embedding_model: string;
+    api_base_url: string;
+    gold_set: string;
+    question_count: number;
+    consistency_wait_seconds: number;
+    label?: string;
+    user_id?: string;
+    source?: string;
+  };
+  summary: {
+    total: number;
+    passed: number;
+    pass_rate: number;
+    mean_similarity: number | null;
+  };
+  by_category: Record<string, EvalCategoryStat>;
+  results: EvalQuestionResult[];
+}
+
+/** A row in the run history list. */
+export interface EvalRunSummary {
+  run_id: string;
+  timestamp: string;
+  /** True for the project's baseline runs, which predate per-user tagging. */
+  shared: boolean;
+  label: string;
+  gold_set: string;
+  question_count: number;
+  passed: number;
+  pass_rate: number;
+  mean_similarity: number | null;
+  threshold: number | null;
+}
+
+export interface EvalJob {
+  job_id: string;
+  status: "queued" | "running" | "done" | "error";
+  phase: string;
+  total: number;
+  completed: number;
+  run_id: string | null;
+  error: string;
+  started_at: string;
+  finished_at: string;
+}
+
+export interface EvalTestSetUpload {
+  test_set_id: string;
+  filename: string;
+  question_count: number;
+  categories: { name: string; count: number }[];
+}
+
+export interface EvalGoldSetOverview {
+  total: number;
+  minimum_per_category: number;
+  categories: {
+    name: string;
+    count: number;
+    meets_minimum: boolean;
+    scored_by: string;
+  }[];
+  error?: string;
+}
+
+/** The plain-English explanation of scoring, served by the backend. */
+export interface EvalMethod {
+  summary: string;
+  steps: { title: string; body: string }[];
+  why_exact_match: string;
+  metrics: { name: string; plain: string; detail: string }[];
+  categories_note: string;
+}
+
+export interface EvalCalibration {
+  proposed_threshold: number;
+  current_threshold: number;
+  threshold_basis?: string;
+  gap: number;
+  wrong_section_p95?: number;
+  correct_median?: number;
+  embedding_model: string;
+  distributions: {
+    correct: DistributionStats;
+    wrong: DistributionStats;
+    wrong_by_kind: Record<string, { n: number; mean: number; max: number }>;
+  };
+}
+
+export interface DistributionStats {
+  n: number;
+  min: number;
+  max: number;
+  mean: number;
+  median: number;
+  p05?: number;
+  p95?: number;
+}

@@ -22,7 +22,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, LogOut, MessageSquare } from "lucide-react";
+import { FlaskConical, LayoutDashboard, LogOut, MessageSquare } from "lucide-react";
 
 import { useAuth } from "@/components/auth-provider";
 import { Brand } from "@/components/brand";
@@ -43,6 +43,7 @@ import { cn } from "@/lib/utils";
 const NAV = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/chat", label: "Chat", icon: MessageSquare },
+  { href: "/evaluation", label: "Evaluation", icon: FlaskConical },
 ];
 
 export function AppShell({
@@ -75,7 +76,12 @@ export function AppShell({
         fullBleed ? "h-dvh overflow-hidden" : "min-h-dvh",
       )}
     >
-      <header className="sticky top-3 z-40 mx-3 mt-3 sm:mx-4 lg:mx-6">
+      {/* Navigation is not part of any printed document, and as a sticky
+          element it would otherwise be laid out mid-page in the PDF. */}
+      <header
+        data-print="hide"
+        className="sticky top-3 z-40 mx-3 mt-3 sm:mx-4 lg:mx-6"
+      >
         <div className="glass-chrome mx-auto flex h-16 w-full max-w-[1400px] items-center gap-4 rounded-2xl border border-white/10 px-4 shadow-[0_10px_30px_-10px_rgba(0,0,0,0.65)] sm:px-6">
           <Brand href="/dashboard" size="sm" />
 
