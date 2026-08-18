@@ -65,13 +65,14 @@ import torch
 from PIL import Image
 
 from backend.config import OPENAI_API_KEY
+from backend.rag import InvalidQuestionError
 from colpali_experiment import store
 from colpali_experiment.embedder import embed_queries, score
 from colpali_experiment.renderer import render_pdf_pages
 
 logger = logging.getLogger("colpali_experiment.answer")
 
-DEFAULT_TOP_K = 3
+DEFAULT_TOP_K = 5
 GENERATION_MODEL = "gpt-4o-mini"
 
 # Same wording as backend.rag.REFUSAL_MESSAGE, kept as a literal so this
@@ -79,12 +80,64 @@ GENERATION_MODEL = "gpt-4o-mini"
 # visible phrasing is shared, not any code path.
 REFUSAL_MESSAGE = "I don't know based on the available documents."
 
+# Generic answer-shape and partial-coverage rules, ported from the same
+# categories of instruction backend.rag._BASE_RULES/_FORMAT_RULES already
+# proved out (see backend/rag.py) -- NOT copied as per-question fixes. Both
+# rules below are properties of the QUESTION/ANSWER pair in general (does the
+# answer compare things? does the context cover only part of it?), so they
+# generalize across the whole gold set rather than overfitting to any single
+# question. Added after the full gold-set comparison run showed a genuine,
+# repeated pattern in two categories:
+#   - `comparison`: every failure had fully correct content, just never
+#     rendered as a table (4/4 failures, 100% of that category).
+#   - `out_of_scope_partial`: the model answered a mixed-scope question in
+#     full instead of fencing the unsupported half.
+# Both are the SAME root cause -- this prompt had no instruction at all for
+# either "how much to answer when context is partial" or "what shape to use
+# for a multi-entity comparison" -- so one general rule per issue, not a fix
+# per failing question.
 _SYSTEM_PROMPT = (
     "You answer questions using ONLY the document page images provided to "
     "you. Use ONLY what is visible in these images. Never use outside "
     "knowledge or assumptions, even when you are confident of the real "
-    f'answer. If the pages shown do not answer the question, reply with '
-    f'EXACTLY this sentence and nothing else: "{REFUSAL_MESSAGE}"'
+    f'answer. If the pages shown do not answer the question at all, reply '
+    f'with EXACTLY this sentence and nothing else: "{REFUSAL_MESSAGE}"\n\n'
+    "If the question itself is not a real, answerable question -- random "
+    "characters, keyboard mashing, or punctuation with no actual words -- "
+    f'reply with EXACTLY this sentence and nothing else: "{REFUSAL_MESSAGE}" '
+    "Do not describe or summarize the page images in that case; a page "
+    "being visible is not the same as the question being real.\n\n"
+    "How much to answer:\n"
+    "- If the images fully answer the question, answer it completely.\n"
+    "- If the images answer only PART of the question, answer that part, "
+    "then add one short final sentence naming exactly what the images do "
+    "not cover. Do NOT use the fixed refusal sentence in this case -- that "
+    "sentence is only for a question the images do not address at all.\n\n"
+    "Structure -- match the shape of the answer to its content:\n"
+    "- Use a markdown table ONLY when the question explicitly asks you to "
+    "compare, or contrast, two or more named things ACROSS THE SAME SET OF "
+    "ATTRIBUTES (for example: compare band X and band Y's leave, notice, "
+    "and bonus eligibility side by side). One column per attribute, a "
+    "header row, one row per item. Every entity named in the question must "
+    "get its own row -- do not drop one because the images cover it less "
+    "fully.\n"
+    "- Do NOT use a table for a question that only asks what something IS "
+    "or asks to list items of one kind (\"what are the bands\", \"list the "
+    "non-reimbursable items\") -- answer those as prose or a plain list, "
+    "even if you could describe each item with several attributes.\n"
+    "- Do NOT use a table for a question asking HOW one thing differs from "
+    "another in general (\"how does X differ from Y\") unless it also names "
+    "the specific attributes to compare -- answer that as prose describing "
+    "the difference, since forcing unrelated facts into matched table rows "
+    "can misstate what is actually comparable between them.\n\n"
+    "Counting and listing:\n"
+    "- If the question asks 'how many' of something, or asks for a list of "
+    "items, name every individual item you can see in the images, not just "
+    "the count. A number without the items it counts is an incomplete "
+    "answer even if the number itself is correct.\n"
+    "- Items of the same kind can appear on more than one page, including "
+    "the last page shown to you, not only the first -- check every page "
+    "before finishing the list."
 )
 
 # Aggregation/enumeration/exhaustive intent, as a property of the question
@@ -119,6 +172,11 @@ class VisualAnswer:
     pages: list[RetrievedPage] = field(default_factory=list)
     expanded: bool = False
     pending_documents: list[str] = field(default_factory=list)
+    # Token usage for the vision generation call only (mirrors
+    # backend.rag.query's own "generation_usage" diagnostics field) -- lets
+    # the eval harness compute a comparable per-query cost. None when there
+    # was no generation call at all (refusal/pending/no-pages paths).
+    generation_usage: dict | None = None
 
 
 STILL_INDEXING_MESSAGE = (
@@ -217,7 +275,19 @@ def _image_to_data_url(image: Image.Image) -> str:
     return f"data:image/png;base64,{encoded}"
 
 
-def _generate(question: str, pages: list[RetrievedPage], images: list[Image.Image]) -> str:
+def _generate(
+    question: str, pages: list[RetrievedPage], images: list[Image.Image]
+) -> tuple[str, dict | None]:
+    """Returns ``(answer_text, generation_usage)``.
+
+    ``generation_usage`` mirrors ``backend.rag.query``'s own diagnostics field
+    (model name + prompt/completion/total tokens) so the eval harness can
+    compute cost identically for both backends -- the prompt token count here
+    is dominated by IMAGE tokens (each page image costs meaningfully more
+    tokens than the equivalent text chunk would), which is exactly the
+    "vision-input pricing, different from text-only calls" distinction the
+    comparison report has to keep honest rather than normalize away.
+    """
     import openai
 
     if not OPENAI_API_KEY:
@@ -244,7 +314,19 @@ def _generate(question: str, pages: list[RetrievedPage], images: list[Image.Imag
             {"role": "user", "content": content},
         ],
     )
-    return (response.choices[0].message.content or "").strip()
+    answer_text = (response.choices[0].message.content or "").strip()
+    usage = getattr(response, "usage", None)
+    generation_usage = (
+        {
+            "model": GENERATION_MODEL,
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        }
+        if usage is not None
+        else None
+    )
+    return answer_text, generation_usage
 
 
 def answer(user_id: str, question: str, top_k: int = DEFAULT_TOP_K) -> VisualAnswer:
@@ -276,6 +358,16 @@ def answer(user_id: str, question: str, top_k: int = DEFAULT_TOP_K) -> VisualAns
     pages" check missed it because pages from the ready document DID rank.
     """
     question = question.strip()
+    if not question:
+        # Same guard and same exception type as backend.rag.query (see
+        # InvalidQuestionError there) -- main.py's global exception handler
+        # already turns this into a 400, and reusing it means a blank
+        # question is rejected the same way regardless of which backend
+        # answers, rather than reaching retrieval at all. Without this,
+        # top_k pages still MaxSim-rank against an empty query string (some
+        # page always scores highest) and the model would summarize
+        # whatever came back instead of recognizing there was no question.
+        raise InvalidQuestionError("Question must not be empty or whitespace-only.")
 
     def _pending_filenames() -> list[str]:
         statuses = store.get_ingest_statuses_for_user(user_id)
@@ -318,7 +410,7 @@ def answer(user_id: str, question: str, top_k: int = DEFAULT_TOP_K) -> VisualAns
             return VisualAnswer(answer=STILL_INDEXING_MESSAGE, pending_documents=pending)
         return VisualAnswer(answer=REFUSAL_MESSAGE, pages=[], expanded=expanded)
 
-    generated = _generate(question, resolved_pages, images)
+    generated, generation_usage = _generate(question, resolved_pages, images)
     if generated.strip() == REFUSAL_MESSAGE:
         # The model itself refused based on the pages it was shown -- still
         # ambiguous if this user has anything pending, for the same reason as
@@ -332,7 +424,12 @@ def answer(user_id: str, question: str, top_k: int = DEFAULT_TOP_K) -> VisualAns
                 expanded=expanded,
                 pending_documents=pending,
             )
-    return VisualAnswer(answer=generated, pages=resolved_pages, expanded=expanded)
+    return VisualAnswer(
+        answer=generated,
+        pages=resolved_pages,
+        expanded=expanded,
+        generation_usage=generation_usage,
+    )
 
 
 def to_rag_response(visual_answer: VisualAnswer):
@@ -369,4 +466,19 @@ def to_rag_response(visual_answer: VisualAnswer):
         )
         for page in visual_answer.pages
     ]
-    return RagResponse(answer=visual_answer.answer, sources=sources, query_type="colpali")
+    # "expanded" surfaces whether _expand_visual_siblings actually widened the
+    # page set for this answer -- the only place that signal is otherwise
+    # visible is this module's own return value, and the eval harness (whose
+    # only view of the system is the /ask HTTP boundary, by design -- see
+    # eval/eval_tool/api_client.py) needs it to attribute a category-level
+    # pass-rate gap to retrieval architecture rather than partly to whichever
+    # backend's intent classifier happened to fire.
+    diagnostics: dict = {"expanded": visual_answer.expanded}
+    if visual_answer.generation_usage is not None:
+        diagnostics["generation_usage"] = visual_answer.generation_usage
+    return RagResponse(
+        answer=visual_answer.answer,
+        sources=sources,
+        query_type="colpali",
+        diagnostics=diagnostics,
+    )

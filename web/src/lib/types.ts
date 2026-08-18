@@ -289,3 +289,67 @@ export interface DistributionStats {
   p05?: number;
   p95?: number;
 }
+
+/* -------------------------------------------------------------------------- */
+/* ColPali vs Hybrid comparison (colpali branch experiment)                   */
+/* -------------------------------------------------------------------------- */
+
+export interface ComparisonBackendSummary {
+  label: string;
+  run_path: string;
+  timestamp: string;
+  total: number;
+  passed: number;
+  pass_rate: number;
+  mean_similarity: number | null;
+  mean_latency_ms: number | null;
+  mean_cost_usd: number | null;
+  cost_coverage: string;
+  by_category: Record<string, EvalCategoryStat>;
+}
+
+export interface ComparisonCategoryRow {
+  category: string;
+  hybrid_pass_rate: number | null;
+  hybrid_total: number;
+  colpali_pass_rate: number | null;
+  colpali_total: number;
+  delta: number | null;
+  /** True for the two hypothesis-relevant category groups. */
+  watch: boolean;
+}
+
+export interface ComparisonHypothesis {
+  categories: string[];
+  held: boolean | null;
+  detail: string;
+  /** Root-cause note for the 'comparison' category's ColPali failures, when applicable. */
+  comparison_formatting_note?: string;
+}
+
+export interface ComparisonIntentRow {
+  id: string;
+  question: string;
+  hybrid_detector: string;
+  hybrid_fired: boolean | null;
+  hybrid_passed: boolean;
+  colpali_detector: string;
+  colpali_fired: boolean | null;
+  colpali_passed: boolean;
+}
+
+export interface ComparisonReport {
+  generated_at: string | null;
+  hybrid: ComparisonBackendSummary;
+  colpali: ComparisonBackendSummary;
+  by_category: ComparisonCategoryRow[];
+  hypotheses: {
+    sql_exact_match_outperforms: ComparisonHypothesis;
+    colpali_layout_outperforms: ComparisonHypothesis;
+  };
+  surprising_categories: ComparisonCategoryRow[];
+  intent_classifier_asymmetry: {
+    per_question: ComparisonIntentRow[];
+    hybrid_blind_spot_questions: { id: string; question: string }[];
+  };
+}

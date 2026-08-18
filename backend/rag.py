@@ -1745,6 +1745,14 @@ def query(
         raise GenerationError(f"OpenAI chat completion failed: {exc}") from exc
     answered_at = time.perf_counter()
 
+    # colpali branch experiment: token usage for the FINAL answer-generation
+    # call only (not the classification/verification calls above), captured
+    # here since the SDK response already carries it -- purely additive, same
+    # pattern as context_tokens below. Lets the eval harness compute a
+    # comparable per-query cost against colpali_experiment.answer's own
+    # (vision-input) usage, without instrumenting every internal completion.
+    usage = getattr(completion, "usage", None)
+
     diagnostics = {
         "plan": plan.to_dict(),
         "retrieval": retrieval.stages,
@@ -1769,6 +1777,12 @@ def query(
             "retrieval": round((retrieved_at - started) * 1000),
             "generation": round((answered_at - retrieved_at) * 1000),
         },
+        "generation_usage": {
+            "model": chat_model or config.CHAT_MODEL,
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        } if usage is not None else None,
     }
 
     if plan.query_type == MULTI_HOP:

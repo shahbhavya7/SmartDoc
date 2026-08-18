@@ -162,6 +162,42 @@ def calibration() -> dict | None:
     return data
 
 
+# --------------------------------------------------------------------------
+# ColPali vs Hybrid comparison (colpali branch experiment)
+# --------------------------------------------------------------------------
+
+
+def latest_comparison() -> dict | None:
+    """The most recent ColPali-vs-Hybrid comparison report, if one exists.
+
+    Written by ``eval.eval_tool.run_comparison`` as
+    ``eval/results/comparison-<timestamp>.json`` -- a project-wide artifact
+    (it compares two whole runs, not one user's data), so unlike
+    ``list_runs``/``get_run`` this is served to any authenticated user with
+    no ownership filtering, the same treatment already given to the
+    ownerless "shared" baseline runs above.
+
+    Deliberately does NOT reuse ``_load()``: that helper requires
+    ``"summary"`` in the payload, which is the shape of a per-backend RUN
+    file, not this comparison file's own shape (``"hybrid"``/``"colpali"``
+    top-level keys). Reusing it silently returned None for every real
+    comparison file until this was caught by testing the endpoint directly.
+    """
+    candidates = sorted(
+        RESULTS_DIR.glob("comparison-*.json"), key=lambda p: p.name, reverse=True
+    )
+    if not candidates:
+        return None
+    try:
+        payload = json.loads(candidates[0].read_text())
+    except (OSError, ValueError):
+        logger.warning("Unreadable comparison file: %s", candidates[0])
+        return None
+    if not isinstance(payload, dict) or "hybrid" not in payload or "colpali" not in payload:
+        return None
+    return payload
+
+
 def gold_set_overview() -> dict:
     """Category counts for the shipped gold set, for the coverage display."""
     from eval.eval_tool import schema

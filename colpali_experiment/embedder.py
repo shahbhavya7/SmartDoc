@@ -10,12 +10,29 @@ hybrid pipeline's pinned versions in requirements.txt).
 
 from __future__ import annotations
 
+import threading
 from functools import lru_cache
 
 import torch
 from PIL import Image
 
 from colpali_experiment import config
+
+# FastAPI runs sync endpoints in a thread pool (backend/main.py's /ask is a
+# sync `def`), and the eval harness fires several questions concurrently
+# (eval.eval_tool.config.CONCURRENCY). @lru_cache alone does not make the
+# FIRST call to a cached function thread-safe -- it only memoizes the
+# *return value*, so N concurrent threads that all miss the empty cache all
+# enter the function body together. That is exactly what surfaced here:
+# multiple threads calling ColQwen2.from_pretrained(..., device_map=device)
+# at once corrupted accelerate's meta-device dispatch, raising
+# "NotImplementedError: Cannot copy out of meta tensor; no data!" on every
+# request during a concurrent eval run (measured, not assumed -- reproduced
+# with eval.eval_tool.run_eval --backend colpali, CONCURRENCY=4). A plain
+# lock around the load serializes only the one-time ~2GB model load; every
+# call after the first returns instantly via lru_cache without ever
+# acquiring it.
+_load_lock = threading.Lock()
 
 
 def _resolve_device(requested: str) -> str:
@@ -68,8 +85,8 @@ def _patch_transformers_chat_template_bug() -> None:
 
 
 @lru_cache(maxsize=1)
-def _load():
-    """Load model + processor once per process. Cached: this is a ~2GB model."""
+def _load_uncached():
+    """The actual one-time load. Never call directly -- go through _load()."""
     _patch_transformers_chat_template_bug()
     from colpali_engine.models import ColQwen2, ColQwen2Processor
 
@@ -85,6 +102,18 @@ def _load():
     ).eval()
     processor = ColQwen2Processor.from_pretrained(config.COLPALI_MODEL_NAME)
     return model, processor, device
+
+
+def _load():
+    """Load model + processor once per process. Cached: this is a ~2GB model.
+
+    Locked so concurrent callers (see the module docstring above) block on
+    the first, real load instead of racing into it -- every call after the
+    first returns from lru_cache's memo without blocking on the lock at all,
+    since acquiring an uncontended threading.Lock is cheap.
+    """
+    with _load_lock:
+        return _load_uncached()
 
 
 def device_in_use() -> str:

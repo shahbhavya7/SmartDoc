@@ -1357,6 +1357,30 @@ def eval_latest(user_id: str = Depends(get_current_user_id)):
 
 
 @app.get(
+    "/eval/comparison/latest",
+    summary="Most recent ColPali-vs-Hybrid comparison report",
+    description=(
+        "colpali branch experiment: the most recent side-by-side comparison "
+        "produced by `eval.eval_tool.run_comparison` from two saved eval "
+        "runs (one per RETRIEVAL_BACKEND value) against the SAME gold set. "
+        "Read-only, project-wide (not per-user) -- same auth as every other "
+        "endpoint, no new unauthenticated route. 404 if no comparison has "
+        "been generated yet."
+    ),
+)
+def eval_comparison_latest(_user_id: str = Depends(get_current_user_id)):
+    comparison = evaluation.latest_comparison()
+    if comparison is None:
+        return JSONResponse(
+            status_code=404,
+            content=_error_body(
+                "not_found", "No ColPali-vs-Hybrid comparison has been generated yet."
+            ),
+        )
+    return comparison
+
+
+@app.get(
     "/eval/runs/{run_id}",
     summary="One evaluation run, including every per-question result",
 )

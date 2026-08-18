@@ -18,6 +18,7 @@ import type {
   AskResponse,
   ChatMessage,
   ChatSession,
+  ComparisonReport,
   DeleteDocumentResponse,
   DocumentList,
   EvalCalibration,
@@ -253,6 +254,10 @@ export const api = {
 
   evalLatestRun: (token: string, signal?: AbortSignal) =>
     request<EvalRun>("/eval/runs/latest", { token, signal }),
+
+  /** colpali branch experiment: most recent ColPali-vs-Hybrid comparison. */
+  evalComparisonLatest: (token: string, signal?: AbortSignal) =>
+    request<ComparisonReport>("/eval/comparison/latest", { token, signal }),
 
   uploadTestSet: (token: string, file: File, signal?: AbortSignal) => {
     const formData = new FormData();

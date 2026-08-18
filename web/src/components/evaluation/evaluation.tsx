@@ -3,9 +3,11 @@
 /**
  * The evaluation page.
  *
- * Two tabs: the results of a run, and how the scoring works. They are separate
+ * Three tabs: the results of a run, how the scoring works, and (colpali
+ * branch experiment) a ColPali-vs-Hybrid comparison. They are separate
  * because they answer different questions ("how is the system doing" vs "why
- * should I believe that number"), and interleaving them would bury both.
+ * should I believe that number" vs "which pipeline actually wins where"), and
+ * interleaving them would bury all three.
  *
  * The page opens on the most recent run. Everything shown comes from the saved
  * run file nothing is recomputed here, so what the page displays and what the
@@ -17,11 +19,12 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Download, FlaskConical, History, TriangleAlert } from "lucide-react";
+import { Download, FlaskConical, GitCompare, History, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/auth-provider";
 import { Button } from "@/components/ui/button";
+import { Comparison } from "@/components/evaluation/comparison";
 import { MethodPanel } from "@/components/evaluation/method-panel";
 import { RunPanel } from "@/components/evaluation/run-panel";
 import { RunResults } from "@/components/evaluation/run-results";
@@ -54,7 +57,7 @@ function runLabel(run: EvalRunSummary): string {
   return date ? formatRelativeTime(date.toISOString()) : run.run_id;
 }
 
-type Tab = "results" | "method";
+type Tab = "results" | "method" | "comparison";
 
 export function Evaluation() {
   const { authorizedFetch } = useAuth();
@@ -307,6 +310,7 @@ export function Evaluation() {
             [
               ["results", "Results", FlaskConical],
               ["method", "How this is measured", History],
+              ["comparison", "ColPali vs Hybrid", GitCompare],
             ] as const
           ).map(([value, text, Icon]) => (
             <button
@@ -370,7 +374,9 @@ export function Evaluation() {
       {/* ---------------------------------------------------------------- */}
       {/* Body                                                              */}
       {/* ---------------------------------------------------------------- */}
-      {tab === "method" ? (
+      {tab === "comparison" ? (
+        <Comparison />
+      ) : tab === "method" ? (
         <MethodPanel method={method} calibration={calibration} loading={false} />
       ) : loadingRun ? (
         <div className="space-y-4">
