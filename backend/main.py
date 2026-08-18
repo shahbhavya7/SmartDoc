@@ -122,6 +122,17 @@ app.add_middleware(
     https_only=False,
 )
 
+# Colpali branch experiment: a self-contained router under /colpali/*, additive
+# only -- see colpali_experiment/api.py. Guarded by try/except so a missing
+# experimental dependency (torch, colpali-engine) cannot take down the hybrid
+# app; this is not a code path any other branch or deployment relies on.
+try:
+    from colpali_experiment.api import router as colpali_router
+
+    app.include_router(colpali_router)
+except ImportError:  # pragma: no cover - experimental dependency not installed
+    logger.warning("colpali_experiment not available; /colpali/* routes disabled.")
+
 
 @app.on_event("startup")
 def _startup() -> None:

@@ -29,3 +29,12 @@ PyJWT==2.10.1
 Authlib==1.4.0
 itsdangerous==2.2.0
 pytest==8.3.4
+
+# Colpali branch experiment ONLY (colpali_experiment/) -- never imported by
+# the hybrid pipeline. torch is pinned to 2.5.1: later 2.6.x builds are
+# reported broken for ColQwen2 on Mac MPS. Installing these pulls in
+# tokenizers>=0.21, which is newer than chromadb 0.5.23's declared
+# tokenizers<=0.20.3 ceiling -- verified harmless, since this stack's Chroma
+# usage embeds via OpenAI, not a local tokenizers-based embedding function.
+torch==2.5.1
+colpali-engine==0.3.12

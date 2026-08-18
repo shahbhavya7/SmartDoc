@@ -44,3 +44,9 @@ web/tsconfig.tsbuildinfo
 
 # Demo JWT minted by scripts/mint_demo_token.py -- a live credential, never committed
 .demo_token
+
+# Colpali branch experiment: generated artifacts only, never the module code
+colpali_experiment/page_images/
+colpali_experiment/colpali_store.db
+colpali_experiment/colpali_store.db-wal
+colpali_experiment/colpali_store.db-shm
