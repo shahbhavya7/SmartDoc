@@ -54,7 +54,7 @@ from typing import Literal
 
 import openai
 import uvicorn
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -126,12 +126,28 @@ app.add_middleware(
 # only -- see colpali_experiment/api.py. Guarded by try/except so a missing
 # experimental dependency (torch, colpali-engine) cannot take down the hybrid
 # app; this is not a code path any other branch or deployment relies on.
+#
+# The two names below are also used directly by /upload (background fan-out)
+# and /ask (RETRIEVAL_BACKEND=colpali dispatch) further down this file. Both
+# call sites re-check ``_colpali_available`` before touching them, so a
+# missing experimental dependency degrades those call sites too -- /upload's
+# hybrid ingestion and /ask's hybrid answers are entirely unaffected either
+# way, per the hard isolation rule.
+_colpali_available = False
 try:
+    from colpali_experiment.answer import answer as _colpali_answer
+    from colpali_experiment.answer import to_rag_response as _colpali_to_rag_response
     from colpali_experiment.api import router as colpali_router
+    from colpali_experiment.ingest import ingest_document_for_upload as _colpali_ingest_for_upload
+    from colpali_experiment.store import set_ingest_status as _colpali_set_ingest_status
 
     app.include_router(colpali_router)
+    _colpali_available = True
 except ImportError:  # pragma: no cover - experimental dependency not installed
-    logger.warning("colpali_experiment not available; /colpali/* routes disabled.")
+    logger.warning(
+        "colpali_experiment not available; /colpali/* routes disabled and "
+        "RETRIEVAL_BACKEND=colpali will report an error instead of answering."
+    )
 
 
 @app.on_event("startup")
@@ -229,6 +245,9 @@ class AskRequest(BaseModel):
     }
 
 
+RetrievalBackend = Literal["hybrid", "colpali"]
+
+
 class SourceModel(BaseModel):
     """A single structural citation."""
 
@@ -274,6 +293,16 @@ class AskResponse(BaseModel):
     )
     session_id: str | None = Field(
         default=None, description="Echoed back when the request named a session."
+    )
+    backend: RetrievalBackend = Field(
+        default="hybrid",
+        description=(
+            "colpali branch experiment: which pipeline actually answered -- "
+            "'hybrid' (the text pipeline described above) or 'colpali' "
+            "(colpali_experiment, a separate visual/page-image pipeline). "
+            "Selected by RETRIEVAL_BACKEND, overridable per-request via the "
+            "`backend` query parameter on this endpoint."
+        ),
     )
 
     model_config = {
@@ -824,10 +853,26 @@ def _ingest_one_file(user_id: str, filename: str, content: bytes) -> UploadFileR
     ),
 )
 async def upload(
+    background_tasks: BackgroundTasks,
     files: list[UploadFile] = File(..., description="One or more .pdf files."),
     user_id: str = Depends(get_current_user_id),
 ) -> UploadResponse:
-    """Ingest, embed, and index each uploaded PDF; return a per-file summary."""
+    """Ingest, embed, and index each uploaded PDF; return a per-file summary.
+
+    Colpali branch experiment: after a file's normal hybrid ingestion above
+    succeeds -- unchanged, same result, same response shape -- its ColPali
+    embedding + visual clustering is scheduled via ``BackgroundTasks`` (the
+    same mechanism ``/ask`` already uses for summarization), so this response
+    is never held up by ColPali's meaningfully heavier per-page model
+    inference. A status row is written 'pending' synchronously, before this
+    function returns, specifically so a client that immediately switches to
+    RETRIEVAL_BACKEND=colpali and asks a question sees a clear
+    still-indexing message (colpali_experiment.answer.STILL_INDEXING_MESSAGE)
+    rather than a silent empty answer -- there is no gap where the status is
+    simply absent. A missing colpali_experiment dependency (see
+    ``_colpali_available`` above) skips this entirely; hybrid ingestion above
+    is unaffected either way.
+    """
     results: list[UploadFileResult] = []
 
     for upload_file in files:
@@ -849,6 +894,13 @@ async def upload(
                 raise UploadValidationError(f"'{original_name}' is empty.")
 
             result = _ingest_one_file(user_id, safe_name, content)
+            if _colpali_available and result.document_id:
+                _colpali_set_ingest_status(
+                    result.document_id, user_id, safe_name, status="pending"
+                )
+                background_tasks.add_task(
+                    _colpali_ingest_for_upload, result.document_id, user_id, safe_name
+                )
         except UploadValidationError as exc:
             result = UploadFileResult(
                 filename=original_name, status="error", error=str(exc)
@@ -909,7 +961,12 @@ async def upload(
         "and answer are stored in that session, the session's running summary "
         "is used to resolve references (\"that policy\", \"the same band\"), and "
         "the summary is updated by a background task AFTER this response is "
-        "sent -- summarization never adds to this call's latency."
+        "sent -- summarization never adds to this call's latency.\n\n"
+        "colpali branch experiment: `backend` selects which pipeline answers "
+        "-- 'hybrid' (default, this description) or 'colpali' (a separate "
+        "visual/page-image pipeline, colpali_experiment). Omit it to use "
+        "RETRIEVAL_BACKEND's configured default. Session/memory persistence "
+        "is identical either way."
     ),
     responses={404: {"model": ErrorResponse}},
 )
@@ -917,6 +974,13 @@ def ask(
     payload: AskRequest,
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
+    backend: RetrievalBackend | None = Query(
+        default=None,
+        description=(
+            "colpali branch experiment: override RETRIEVAL_BACKEND for this "
+            "request only, e.g. for side-by-side testing without a restart."
+        ),
+    ),
 ) -> AskResponse | JSONResponse:
     """Answer ``payload.question``, optionally as a turn in ``payload.session_id``."""
     question = payload.question
@@ -925,6 +989,19 @@ def ask(
             f"Question is {len(question)} characters, which exceeds the "
             f"{MAX_QUESTION_CHARS}-character limit. Please shorten it."
         )
+
+    # Per-request override takes precedence over the .env default -- the
+    # brief's requirement that switching never needs a restart. Falls back to
+    # "hybrid" (not whatever config.RETRIEVAL_BACKEND says) if the requested
+    # backend is "colpali" but the experimental dependency isn't installed --
+    # see _colpali_available above; the hybrid path must always work.
+    active_backend: RetrievalBackend = backend or config.RETRIEVAL_BACKEND  # type: ignore[assignment]
+    if active_backend == "colpali" and not _colpali_available:
+        logger.warning(
+            "RETRIEVAL_BACKEND=colpali requested but colpali_experiment is "
+            "unavailable; falling back to hybrid."
+        )
+        active_backend = "hybrid"
 
     session = None
     if payload.session_id is not None:
@@ -973,24 +1050,35 @@ def ask(
             session_id=session["id"] if session else None,
         )
 
-    # The scope is bound around the whole pipeline rather than passed into it:
-    # retrieval is final code and takes no user argument, and binding here means
-    # every store read it makes -- dense, BM25, routing, neighbour and parent
-    # expansion -- is filtered without any of those modules being modified.
-    with user_scope(user_id):
-        # Blank questions raise InvalidQuestionError inside query() itself.
-        response = query(
-            question,
-            conversation_context=session["summary"] if session else None,
-            conversation_focus=session["last_document"] if session else None,
-        )
+    if active_backend == "colpali":
+        # colpali_experiment.answer.answer() does its own per-user filtering
+        # at the store layer (store.get_user_embeddings(user_id) is scoped in
+        # SQL), so it needs no user_scope() -- that context manager exists
+        # specifically to filter Chroma/the hybrid stores, which this path
+        # never touches.
+        visual_answer = _colpali_answer(user_id, question)
+        response = _colpali_to_rag_response(visual_answer)
+    else:
+        # The scope is bound around the whole pipeline rather than passed into
+        # it: retrieval is final code and takes no user argument, and binding
+        # here means every store read it makes -- dense, BM25, routing,
+        # neighbour and parent expansion -- is filtered without any of those
+        # modules being modified.
+        with user_scope(user_id):
+            # Blank questions raise InvalidQuestionError inside query() itself.
+            response = query(
+                question,
+                conversation_context=session["summary"] if session else None,
+                conversation_focus=session["last_document"] if session else None,
+            )
 
     if session is not None:
         db.add_message(user_id, session["id"], "assistant", response.answer)
         if response.sources:
             # Synchronous and free of any LLM call, so it costs nothing on the
             # request's critical path; only the summary text needs the
-            # background round-trip to an LLM.
+            # background round-trip to an LLM. Identical regardless of which
+            # backend produced `response` -- this reads only `.sources[0].source`.
             db.update_session_memory(
                 user_id, session["id"], last_document=response.sources[0].source
             )
@@ -1007,7 +1095,11 @@ def ask(
             response.answer,
         )
 
-    return AskResponse(**response.to_dict(), session_id=session["id"] if session else None)
+    return AskResponse(
+        **response.to_dict(),
+        session_id=session["id"] if session else None,
+        backend=active_backend,
+    )
 
 
 # --------------------------------------------------------------------------

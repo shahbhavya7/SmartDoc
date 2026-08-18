@@ -43,6 +43,26 @@ CREATE TABLE IF NOT EXISTS colpali_page_embeddings (
 
 CREATE INDEX IF NOT EXISTS idx_colpali_doc ON colpali_page_embeddings(document_id);
 CREATE INDEX IF NOT EXISTS idx_colpali_user ON colpali_page_embeddings(user_id);
+
+-- Per-document ColPali readiness, written the instant /upload fans out
+-- ingestion (status='pending') and updated by the background task when it
+-- finishes (status='ready'/'failed'). Lives here, in this experiment's own
+-- DB file, rather than as a column on the real `documents` table in
+-- smartdoc.db -- adding a column there would violate the hard isolation
+-- rule even though the column itself would be additive; a whole separate
+-- table in a whole separate file is the stronger guarantee this experiment
+-- has used everywhere else. document_id is the primary key: one status per
+-- document, always the most recent ingestion attempt.
+CREATE TABLE IF NOT EXISTS colpali_ingest_status (
+    document_id  TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    filename     TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'failed')),
+    error        TEXT,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_colpali_status_user ON colpali_ingest_status(user_id);
 """
 
 # table_group_id: a page-level cluster id from the VISION-based page-to-page
@@ -211,3 +231,49 @@ def stats() -> dict:
             " FROM colpali_page_embeddings"
         ).fetchone()
     return {"pages": row["pages"], "documents": row["documents"]}
+
+
+def set_ingest_status(
+    document_id: str,
+    user_id: str,
+    filename: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    """Record this document's ColPali readiness -- 'pending'/'ready'/'failed'.
+
+    One row per document (``document_id`` is the primary key), so re-ingesting
+    (e.g. a re-upload) simply overwrites the previous attempt's outcome rather
+    than accumulating history a status check would have to sort through.
+    """
+    init_db()
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO colpali_ingest_status"
+            " (document_id, user_id, filename, status, error, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(document_id) DO UPDATE SET"
+            " user_id=excluded.user_id, filename=excluded.filename,"
+            " status=excluded.status, error=excluded.error,"
+            " updated_at=excluded.updated_at",
+            (document_id, user_id, filename, status, error, utc_now()),
+        )
+
+
+def get_ingest_status(document_id: str) -> dict | None:
+    init_db()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM colpali_ingest_status WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_ingest_statuses_for_user(user_id: str) -> list[dict]:
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM colpali_ingest_status WHERE user_id = ?", (user_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]

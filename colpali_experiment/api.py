@@ -14,7 +14,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from backend.auth import get_current_user_id
-from colpali_experiment import ingest, query as colpali_query, store
+from colpali_experiment import answer as colpali_answer, ingest, query as colpali_query, store
 
 router = APIRouter(prefix="/colpali", tags=["colpali-experiment"])
 
@@ -60,3 +60,32 @@ def colpali_ask(
     if not question.strip():
         raise HTTPException(status_code=400, detail="question must not be blank")
     return {"results": colpali_query.top_pages(user_id, question, top_k=top_k)}
+
+
+@router.get("/ask")
+def colpali_answer_endpoint(
+    question: str, top_k: int = 3, user_id: str = Depends(get_current_user_id)
+) -> dict:
+    """Full visual query path: MaxSim retrieval -> visual sibling expansion
+    (whenever a retrieved page belongs to a visual table group) -> vision-
+    grounded generation over the retrieved page IMAGES. See
+    ``colpali_experiment.answer`` -- entirely separate code from
+    ``backend.rag``, scoped to the signed-in user's own stored page
+    embeddings only.
+    """
+    if not question.strip():
+        raise HTTPException(status_code=400, detail="question must not be blank")
+    result = colpali_answer.answer(user_id, question, top_k=top_k)
+    return {
+        "answer": result.answer,
+        "expanded": result.expanded,
+        "pages": [
+            {
+                "filename": p.filename,
+                "page_number": p.page_number,
+                "score": p.score,
+                "source": p.source,
+            }
+            for p in result.pages
+        ],
+    }

@@ -121,3 +121,31 @@ def ingest_all_for_user(user_id: str, skip_existing: bool = True) -> list[dict]:
                 {"document_id": document_id, "filename": record["filename"], "error": str(exc)}
             )
     return results
+
+
+def ingest_document_for_upload(document_id: str, user_id: str, filename: str) -> None:
+    """Full ColPali pipeline (embed + visual table clustering) for one just-
+    uploaded document, with a status row tracked throughout -- the function
+    ``/upload`` hands to ``BackgroundTasks`` (see ``backend/main.py``).
+
+    Runs strictly AFTER the caller has already recorded ``status='pending'``
+    (synchronously, before the upload response is sent), so a client that
+    polls status immediately after upload never sees "no status at all" --
+    only pending, then ready or failed. Never raises: a background task's
+    exception has nowhere to surface except a log line and this status row,
+    so every failure is caught and recorded rather than propagated.
+    """
+    from colpali_experiment.table_clustering import cluster_document
+
+    try:
+        ingest_document(document_id, user_id)
+        cluster_document(document_id)
+        store.set_ingest_status(document_id, user_id, filename, status="ready")
+        logger.info("colpali upload fan-out: %s (%s) ready", filename, document_id)
+    except Exception as exc:  # noqa: BLE001 - background task, must not raise
+        logger.exception(
+            "colpali upload fan-out failed for %s (%s)", filename, document_id
+        )
+        store.set_ingest_status(
+            document_id, user_id, filename, status="failed", error=str(exc)
+        )

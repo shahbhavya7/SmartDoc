@@ -65,6 +65,17 @@ CHAT_TEMPERATURE = _float("CHAT_TEMPERATURE", 0.0)
 REQUEST_TIMEOUT_SECONDS = _float("REQUEST_TIMEOUT_SECONDS", 45.0)
 REQUEST_MAX_RETRIES = _int("REQUEST_MAX_RETRIES", 3)
 
+# `colpali` branch experiment ONLY. Which pipeline answers /ask by default:
+# "hybrid" (the text pipeline this whole config module otherwise describes)
+# or "colpali" (colpali_experiment/answer.py, an entirely separate module).
+# Plain os.getenv with no validation, the same precedent as EMBED_MODEL/
+# CHAT_MODEL above -- there is no existing restricted-choice config helper in
+# this module, and one is not worth adding for a single two-value switch.
+# /ask can override this per-request (query param), so switching backends for
+# side-by-side testing never requires a restart; only changing the .env
+# default does, which the brief accepts.
+RETRIEVAL_BACKEND = os.getenv("RETRIEVAL_BACKEND", "hybrid")
+
 # ---------------------------------------------------------------------------
 # Chunking
 #

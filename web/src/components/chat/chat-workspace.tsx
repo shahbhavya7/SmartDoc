@@ -27,6 +27,7 @@ import { FileWarning, MessageSquarePlus, PanelLeft } from "lucide-react";
 import { toast } from "sonner";
 
 import { useAuth } from "@/components/auth-provider";
+import { BackendToggle } from "@/components/chat/backend-toggle";
 import { Composer } from "@/components/chat/composer";
 import {
   AnswerPanel,
@@ -46,7 +47,7 @@ import {
 } from "@/lib/answer-cache";
 import { useDocuments, useSessions } from "@/lib/hooks";
 import { sessionLabel } from "@/lib/format";
-import type { AskResponse, ChatMessage } from "@/lib/types";
+import type { AskResponse, ChatMessage, RetrievalBackend } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** A turn still in flight, held outside the message list until it resolves. */
@@ -79,6 +80,10 @@ export function ChatWorkspace() {
   const [pending, setPending] = useState<PendingTurn | null>(null);
   const [turnError, setTurnError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
+  // colpali branch experiment: which pipeline answers the NEXT question.
+  // Per-request, not persisted -- switching is meant to be cheap, side-by-side
+  // testing, not a durable per-session setting.
+  const [retrievalBackend, setRetrievalBackend] = useState<RetrievalBackend>("hybrid");
 
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -328,7 +333,7 @@ export function ChatWorkspace() {
 
       try {
         const response = await authorizedFetch((token) =>
-          api.ask(token, trimmed, sessionId),
+          api.ask(token, trimmed, sessionId, retrievalBackend),
         );
 
         // Optimistic rows so the answer appears the moment it arrives. Temporary
@@ -379,7 +384,7 @@ export function ChatWorkspace() {
         setDraft(trimmed);
       }
     },
-    [authorizedFetch, sessions, recordTurnCitations],
+    [authorizedFetch, sessions, recordTurnCitations, retrievalBackend],
   );
 
   /**
@@ -602,6 +607,16 @@ export function ChatWorkspace() {
                 will be refused.
               </p>
             ) : null}
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <span className="text-[11px] font-medium text-muted-foreground">
+                Answer using
+              </span>
+              <BackendToggle
+                value={retrievalBackend}
+                onChange={setRetrievalBackend}
+                disabled={!!pending || creating}
+              />
+            </div>
             <Composer
               value={draft}
               onChange={setDraft}

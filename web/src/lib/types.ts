@@ -44,6 +44,9 @@ export interface Grounding {
   removed_claims: string[];
 }
 
+/** colpali branch experiment: which pipeline answers /ask. See backend/main.py. */
+export type RetrievalBackend = "hybrid" | "colpali";
+
 export interface AskResponse {
   answer: string;
   sources: Source[];
@@ -51,6 +54,8 @@ export interface AskResponse {
   grounding: Grounding | null;
   diagnostics: Record<string, unknown> | null;
   session_id: string | null;
+  /** Which pipeline actually answered -- 'hybrid' or 'colpali' (visual). */
+  backend: RetrievalBackend;
 }
 
 export interface DocumentRecord {

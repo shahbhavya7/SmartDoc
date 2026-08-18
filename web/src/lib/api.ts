@@ -28,6 +28,7 @@ import type {
   EvalRunSummary,
   EvalTestSetUpload,
   HealthResponse,
+  RetrievalBackend,
   TokenResponse,
   UploadResponse,
   User,
@@ -202,19 +203,26 @@ export const api = {
    * Ask a question. Passing `sessionId` makes it a remembered turn: the server
    * stores both messages, resolves references from the session's summary, and
    * updates that summary in a background task after responding.
+   *
+   * `backend` (colpali branch experiment) overrides RETRIEVAL_BACKEND for this
+   * one request only -- omit it to use the server's configured default.
    */
   ask: (
     token: string,
     question: string,
     sessionId?: string | null,
+    backend?: RetrievalBackend | null,
     signal?: AbortSignal,
   ) =>
-    request<AskResponse>("/ask", {
-      method: "POST",
-      body: { question, session_id: sessionId ?? null },
-      token,
-      signal,
-    }),
+    request<AskResponse>(
+      `/ask${backend ? `?backend=${encodeURIComponent(backend)}` : ""}`,
+      {
+        method: "POST",
+        body: { question, session_id: sessionId ?? null },
+        token,
+        signal,
+      },
+    ),
 
   /* ------------------------------------------------------------------------ */
   /* Evaluation                                                              */
