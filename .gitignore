@@ -41,3 +41,6 @@ web/out/
 web/next-env.d.ts
 web/.env.local
 web/tsconfig.tsbuildinfo
+
+# Demo JWT minted by scripts/mint_demo_token.py -- a live credential, never committed
+.demo_token

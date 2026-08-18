@@ -416,3 +416,127 @@ signing in.
 The V1 Streamlit UI is retired and preserved at
 `app/legacy_v1/streamlit_app.py`. It predates authentication and calls `/upload`
 and `/ask` without a token, so it receives 401s; it is kept for reference only.
+
+## Streamlit demo client (`streamlit_demo/`)
+
+A second, deliberately basic UI that satisfies the "Streamlit UI with source
+citation" deliverable. It is **not** a replacement for the Next.js app: it is an
+independent HTTP client of the same FastAPI backend, which is the point -- if
+both work, the API's auth and isolation hold from more than the one client they
+were built alongside. It contains no retrieval, ranking, or generation code.
+
+It runs separately from `./run.sh`, and both can run at once against the same
+backend.
+
+```bash
+# 1. Backend must be running (./run.sh, or just the API)
+uvicorn backend.main:app --port 8000
+
+# 2. Mint a token for the demo account (once per session; see below)
+python scripts/mint_demo_token.py
+
+# 3. Start the demo UI on http://localhost:8501
+streamlit run streamlit_demo/app.py
+```
+
+### Why a mint script instead of a login form
+
+The demo signs in as one pre-configured account and shows **no login screen**.
+That account signed up through Google, so it has no password and `/auth/login`
+cannot be used for it.
+
+The obvious shortcut -- an endpoint that issues a token for a given email -- is
+an authentication bypass: anything reachable over the network that hands out
+credentials for an arbitrary account defeats the entire auth layer. So
+`scripts/mint_demo_token.py` is a **local-only script**, never imported by
+`backend/` and never registered as a route. It reads the user row from SQLite
+read-only and calls the same `create_access_token()` that `/auth/login` uses
+internally, so the token it produces is completely ordinary.
+
+The token is written to `.demo_token` (git-ignored, mode 0600). When it expires,
+the app says so and tells you to re-run the script rather than crashing.
+
+Configure the account in `.env`:
+
+```
+DEMO_USER_EMAIL=your-account@example.com
+DEMO_API_BASE_URL=http://127.0.0.1:8000
+```
+
+### What it does
+
+| Tab | Contents |
+|---|---|
+| **Chat** | Last 10 sessions in the sidebar with a New chat button; selecting one loads its history. Answers render with `st.markdown`, so tables come back as tables and step lists as numbered lists -- the backend already decided the format. |
+| **Documents** | List (name, indexed chunks, date), upload a PDF via `/upload`, delete via the real endpoint, which reports how many chunks the cascade removed. |
+| **Evaluation** | Loads the most recent saved report from the existing eval pipeline, or triggers a live run. Displays the overall pass rate and the per-category table with `st.dataframe`. No scoring logic is reimplemented here. |
+
+**Citations are the deliverable.** Every generated answer renders its sources
+underneath it -- document name, page (or page range), section, and the snippet --
+in an expander, visually separated from the answer text. The data comes straight
+from the API response's `sources` array; nothing is inferred or reconstructed.
+
+The sidebar shows the demo user's document and session counts as plain metrics.
+
+### Constraints this app is held to
+
+* **No emoji anywhere**, enforced by `tests/test_streamlit_demo.py` rather than
+  by promise. The same suite asserts the app never imports pipeline code, that
+  the mint script stays unreachable from any route, and that a 401 becomes an
+  actionable message.
+* **Default Streamlit appearance.** No custom CSS, no theming; this is the
+  opposite of the Next.js app's design system by intent.
+
+```bash
+python -m pytest tests/test_streamlit_demo.py -q
+```
+
+Navigation is a sidebar radio, not `st.tabs`, for two reasons: `st.tabs` always
+opens on its first tab with no way to choose (so a reload could not land on
+Documents), and it renders every tab's body on every rerun, which meant the
+evaluation report was fetched even while reading the chat. **Documents is the
+default view on load.**
+
+The Chat view keeps a **fixed window of 5 sessions**. Creating a sixth deletes
+the least recently active one, through the ordinary `DELETE /sessions/{id}`
+endpoint, so the message cascade is the server's. This is a demo-client policy
+only -- the Next.js client has no such limit and the backend enforces none.
+
+> **This cap deletes real conversations.** Clicking "New chat" repeatedly to test
+> it will push genuine history out. `scripts/restore_pruned_sessions.py` can
+> recover deleted sessions from SQLite's free pages (dry run by default,
+> `--apply` to write, and it backs the database up first), but do not rely on
+> that -- reduce `MAX_SESSIONS` pressure or test against a throwaway account.
+
+### A crash worth knowing about (fixed)
+
+The app used to die mid-session with a macOS "Python quit unexpectedly" dialog.
+The cause was **not** Streamlit: the crash report points at
+`libarrow`'s mimalloc allocator, inside `mi_thread_init` reached from
+`NumPyConverter::Convert` -- PyArrow 25 converting a pandas frame to an Arrow
+table on one of Streamlit's worker threads, which segfaults the whole process.
+It is triggered by `st.dataframe`, so the Evaluation tab reproduced it reliably.
+
+`app.py` therefore sets `ARROW_DEFAULT_MEMORY_POOL=system` **before anything
+imports pyarrow**. The system allocator has no such thread-init path, and Arrow
+is only used here to draw two small tables, so nothing is lost. Verified by
+rendering the Evaluation tab repeatedly under browser churn -- the exact pattern
+that previously crashed every time.
+
+If you hit it again, check the version triple; this environment runs
+`streamlit 1.41.1 / pandas 2.3.3 / numpy 2.5.1 / pyarrow 25.0.0`.
+
+### Running the venv's binaries
+
+This project's `.venv` was created at a different path than it now lives at, so
+its console shims (`.venv/bin/streamlit`, `.venv/bin/pip`) carry a stale shebang
+and fail with `bad interpreter`. `.venv/bin/python` itself is fine, so invoke
+tools through it:
+
+```bash
+.venv/bin/python -m streamlit run streamlit_demo/app.py
+.venv/bin/python -m pip install ...        # NOT plain `pip`, which hits system Python
+```
+
+Activating the venv and running bare `streamlit` or `pip` silently falls through
+to the system Python and installs there instead.

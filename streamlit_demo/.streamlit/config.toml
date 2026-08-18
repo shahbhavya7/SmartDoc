@@ -1,0 +1,30 @@
+# Streamlit configuration for the demo app.
+#
+# The important setting here is folderWatchBlacklist. app.py puts the repository
+# root on sys.path so `from streamlit_demo import ...` resolves, and Streamlit's
+# file watcher then treats everything reachable from there as a source file to
+# poll -- 11,000+ Python files, almost all of them inside .venv. That spawns a
+# large pool of polling threads, which on macOS destabilises the process badly
+# enough to segfault it under load.
+#
+# Blacklisting the directories that can never contain app code keeps the watcher
+# scoped to streamlit_demo/ itself, where reload-on-save is actually wanted.
+
+[server]
+folderWatchBlacklist = [
+    ".venv",
+    "venv",
+    "node_modules",
+    "chroma_store",
+    "data",
+    "eval",
+    "web",
+    ".git",
+    ".logs",
+    ".pytest_cache",
+    "__pycache__",
+]
+
+# The demo is driven by a human clicking through it; usage stats add nothing.
+[browser]
+gatherUsageStats = false
