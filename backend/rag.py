@@ -1806,6 +1806,19 @@ def query(
             )
         diagnostics["sql_lookup"] = {
             "fired": bool(sql_future),
+            # The brief's "attribute a category gap to architecture, not
+            # tuning" requirement: every query logs which path actually
+            # answered. "sql_aggregation" covers every non-single-cell kind
+            # (row_count/sum/max/min/count/filter), not just the original
+            # MAX/MIN/threshold set, so a COUNT/SUM/filtered-list result is
+            # traceable the same way an existing MAX/MIN one already was.
+            "answered_by": (
+                "sql_aggregation"
+                if sql_result and sql_result.confident and sql_probe.aggregate
+                else "sql_single_cell"
+                if sql_result and sql_result.confident
+                else "retrieval"
+            ),
             "decision_1": sql_probe.reason,
             "entity": sql_probe.entity.resolved,
             "entity_score": round(sql_probe.entity.score, 1),

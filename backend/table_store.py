@@ -181,6 +181,17 @@ def _variants(text: str) -> tuple[str, ...]:
 
 _ID_CODE_RE = re.compile(r"^[A-Za-z]{1,6}[-_]?\d{2,10}$")
 
+# Marker suffix for the synthetic "row count" cell emitted once per table row
+# (see ``cells_from_tables``). Its column_norm is the entity column's own
+# normalised name plus this marker ("vendor entity_type") -- kept OUT of the
+# general column vocabulary and resolved through its own dedicated fuzzy pass
+# (``vocab.entity_type_columns``, built in ``_build_vocabulary``) instead of
+# ``_resolve``'s ordinary column search, so "how many vendors" is never
+# compared against real attribute columns that happen to share a word with
+# "vendor" ("Vendor Type", say) -- naming the KIND of row and naming an
+# ATTRIBUTE of it are different questions, resolved separately.
+_ENTITY_TYPE_MARKER = " entity_type"
+
 
 def _looks_like_id_values(values: list[str]) -> bool:
     """Is this column almost entirely short alnum codes ("EMP0034", "E-01")?
@@ -230,12 +241,27 @@ def cells_from_tables(tables: list, max_cells: int | None = None) -> list[dict]:
         title = getattr(table, "section", "") or entity_column
         rows = getattr(table, "rows", []) or []
         row_pages = getattr(table, "row_pages", []) or []
+        table_id = getattr(table, "table_id", "")
+        entity_type_column_norm = normalise(entity_column) + _ENTITY_TYPE_MARKER
 
         alias_index = None
         if len(headers) > 2:
             col0 = [str(r[0]) if r else "" for r in rows]
             col1 = [str(r[1]) if len(r) > 1 else "" for r in rows]
-            if _looks_like_id_values(col0) and not _looks_like_id_values(col1):
+            # A genuine second row label ("Name" alongside "Employee ID") is
+            # near-unique per row, the same as any row label must be to
+            # identify one row. A CATEGORY column ("Server Rack", "Laptop")
+            # can look non-ID-shaped too but is deliberately LOW cardinality
+            # -- many rows share one value -- and treating it as a second
+            # entity means every row is stored under both its real id AND
+            # its category, so a SUM/COUNT/filter over the table double-
+            # counts every row whose category has more than one member.
+            # Found by testing SUM against a synthetic asset register whose
+            # second column was "Category": total came back exactly 2x the
+            # correct sum, traced to this exact path.
+            nonblank = [v for v in col1 if v.strip()]
+            looks_unique = bool(nonblank) and len(set(nonblank)) / len(nonblank) >= 0.9
+            if _looks_like_id_values(col0) and not _looks_like_id_values(col1) and looks_unique:
                 alias_index = 1
 
         for index, row in enumerate(rows):
@@ -281,6 +307,37 @@ def cells_from_tables(tables: list, max_cells: int | None = None) -> list[dict]:
             entity_norm = normalise(entity)
             if entity_norm and not emit(entity, entity_norm, skip_index=None):
                 return out
+
+            # One synthetic cell per row, under the reserved entity-type
+            # column_norm (the entity column's own name + marker), value =
+            # the row's own entity label. Counting these rows is how "how
+            # many vendors are there" answers as a plain COUNT(*) over the
+            # table -- see ``_detect_aggregate``'s bare-count branch --
+            # without needing a numeric column to exist at all. Stored as a
+            # real cell so ownership/counting reuse the same table_cells
+            # machinery every other column does; resolved through its own
+            # fuzzy pass (``vocab.entity_type_columns``), not the general
+            # column search, per the module constant's docstring above.
+            if entity_norm:
+                out.append(
+                    {
+                        "table_id": table_id,
+                        "source": getattr(table, "source", ""),
+                        "table_title": title,
+                        "page": int(page or 0),
+                        "row_index": index,
+                        "row_entity": entity,
+                        "row_entity_norm": entity_norm,
+                        "column_name": entity_column,
+                        "column_norm": entity_type_column_norm,
+                        "value": entity,
+                    }
+                )
+                if len(out) >= limit:
+                    logger.warning(
+                        "table cell cap %d reached; later cells not stored", limit
+                    )
+                    return out
 
             if alias_index is not None and alias_index < len(values):
                 alias_entity = values[alias_index]
@@ -341,6 +398,25 @@ class Vocabulary:
     entity_display: dict[str, str] = field(default_factory=dict)
     column_tables: dict[str, tuple[str, ...]] = field(default_factory=dict)
     tables: dict[str, TableInfo] = field(default_factory=dict)
+    # Bare-count support: entity noun ("vendor") -> the reserved column_norm
+    # that counts its table's rows, and separately -> the table_id it counts.
+    # Kept apart from ``columns`` (see ``_ENTITY_TYPE_MARKER``'s docstring).
+    # Built from the SAME ``table_vocabulary`` rows as everything else -- no
+    # second query.
+    entity_type_columns: dict[str, str] = field(default_factory=dict)
+    entity_type_display: dict[str, str] = field(default_factory=dict)
+    entity_type_tables: dict[str, str] = field(default_factory=dict)
+    # Multi-condition filter support: column_norm -> {value_norm: display}.
+    # Lets "Under Repair" / "Pune" resolve to the COLUMN each is a value OF
+    # (Status, Site) before a filter can be built spanning more than one
+    # condition. A second query (``db.column_values``) because it is a
+    # different shape of read than row/column vocabulary -- distinct VALUES,
+    # not distinct labels -- not because it is a different cache lifetime;
+    # it is invalidated and rebuilt in lockstep with everything else here.
+    column_values: dict[str, dict[str, str]] = field(default_factory=dict)
+    # column_norm -> table_id, for resolving which table a matched VALUE
+    # belongs to when building a multi-condition filter.
+    column_value_tables: dict[str, str] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
@@ -366,9 +442,13 @@ def _build_vocabulary(user_id: str) -> Vocabulary:
     column_display: dict[str, str] = {}
     entity_display: dict[str, str] = {}
     column_tables: dict[str, set[str]] = {}
+    entity_type_columns: dict[str, str] = {}
+    entity_type_display: dict[str, str] = {}
+    entity_type_tables: dict[str, str] = {}
 
     for row in rows:
         table_id = row["table_id"]
+        column_norm = row["column_norm"]
         entry = tables.setdefault(
             table_id,
             {
@@ -379,11 +459,41 @@ def _build_vocabulary(user_id: str) -> Vocabulary:
                 "entities": {},
             },
         )
-        entry["columns"][row["column_norm"]] = row["column_name"]
+        # Every row still counts toward this table's entity list and the
+        # TableInfo row count, regardless of which cell (ordinary or
+        # entity-type) carried the row_entity_norm -- both point at the same
+        # underlying row. Only the COLUMN side excludes the entity-type
+        # marker, which is a synthetic bookkeeping column, not something a
+        # question should ever fuzzy-match as an attribute name.
         entry["entities"][row["row_entity_norm"]] = row["row_entity"]
-        column_display.setdefault(row["column_norm"], row["column_name"])
         entity_display.setdefault(row["row_entity_norm"], row["row_entity"])
-        column_tables.setdefault(row["column_norm"], set()).add(table_id)
+
+        if column_norm.endswith(_ENTITY_TYPE_MARKER):
+            noun = column_norm[: -len(_ENTITY_TYPE_MARKER)]
+            entity_type_columns.setdefault(noun, column_norm)
+            entity_type_display.setdefault(noun, row["column_name"])
+            entity_type_tables.setdefault(noun, table_id)
+            continue
+
+        entry["columns"][column_norm] = row["column_name"]
+        column_display.setdefault(column_norm, row["column_name"])
+        column_tables.setdefault(column_norm, set()).add(table_id)
+
+    value_rows = db.column_values(user_id)
+    column_values: dict[str, dict[str, str]] = {}
+    column_value_tables: dict[str, str] = {}
+    for row in value_rows:
+        column_norm = row["column_norm"]
+        if column_norm.endswith(_ENTITY_TYPE_MARKER):
+            continue  # the row label itself, not a filterable attribute value
+        value = row["value"]
+        value_norm = value.casefold()
+        column_values.setdefault(column_norm, {})[value_norm] = value
+        # Deliberately last-writer-wins, same as column_tables' "spans N
+        # tables" check catches downstream: a column name reused across two
+        # different tables is a genuine ambiguity the aggregate/filter path
+        # already refuses, not something this cache needs to pre-resolve.
+        column_value_tables[column_norm] = row["table_id"]
 
     return Vocabulary(
         user_id=user_id,
@@ -403,6 +513,11 @@ def _build_vocabulary(user_id: str) -> Vocabulary:
             )
             for table_id, entry in tables.items()
         },
+        entity_type_columns=entity_type_columns,
+        entity_type_display=entity_type_display,
+        entity_type_tables=entity_type_tables,
+        column_values=column_values,
+        column_value_tables=column_value_tables,
     )
 
 
@@ -659,6 +774,98 @@ def _resolve_extra_columns(
     return found
 
 
+_VALUE_FUZZY_FLOOR = 88  # deliberately stricter than PARALLEL_SQL_FIRE_THRESHOLD (78):
+# a value match seeds a WHERE clause that silently narrows a result set --
+# a loose match here does not fail loudly like a missed lookup would, it
+# just quietly drops rows that should have matched or keeps ones that
+# should not have. See ``_resolve_value_filters``.
+
+
+def _resolve_value_filters(
+    candidates: list[Span], claimed: list[Span], vocab: "Vocabulary"
+) -> list[tuple[TermMatch, TermMatch]]:
+    """Every (column, value) condition a question names, for a multi-condition
+    filtered list -- "Server Racks at the Pune site" is Category='Server Rack'
+    AND Site='Pune'.
+
+    Each span is checked against every column's distinct-value set
+    (``vocab.column_values``, built alongside the rest of the vocabulary in
+    ``_build_vocabulary``) rather than the general column vocabulary, because
+    the question here names a VALUE ("Pune"), not an attribute NAME ("Site").
+    Exact match first, then fuzzy at a stricter floor than everything else in
+    this module (see ``_VALUE_FUZZY_FLOOR``) -- a wrong entity/column match
+    only costs a missed opportunity (Decision 2 discards it), but a wrong
+    VALUE match silently changes which rows a WHERE clause keeps.
+
+    Longest spans win first and claim their words, so a four-word span that
+    matches is preferred over the two-word span inside it matching a second,
+    unrelated value coincidentally -- the same longest-first discipline
+    ``_resolve`` uses for columns/entities.
+    """
+    found: list[tuple[TermMatch, TermMatch]] = []
+    local_claimed = list(claimed)
+    seen_columns: set[str] = set()
+
+    for span in candidates:
+        if any(span.overlaps(c) for c in local_claimed):
+            continue
+        text = span.text
+        # A short span ("are", "for", "the") scores deceptively high against
+        # an unrelated long value purely from WRatio's partial-ratio
+        # component -- the same failure ``_resolve`` already guards against
+        # for columns/entities, via the "combine with plain ratio, lower
+        # wins" rule below. Filler words never name a value on their own, so
+        # they are excluded outright rather than merely down-weighted: a
+        # value match is a WHERE-clause condition, and ``_VALUE_FUZZY_FLOOR``
+        # is only a safe floor once the candidate is a real word.
+        if len(text) < 4 or text in _FILLER_WORDS:
+            continue
+        best_column = ""
+        best_value_match: TermMatch | None = None
+        for column_norm, values in vocab.column_values.items():
+            if column_norm in seen_columns:
+                continue  # one condition per column -- a second value for the
+                # same column would be a contradiction (Status='X' AND
+                # Status='Y'), never a second real condition.
+            if text in values:
+                best_column, best_value_match = column_norm, TermMatch(
+                    query_text=text,
+                    resolved=text,
+                    display=values[text],
+                    score=100.0,
+                    span=span,
+                )
+                break  # exact beats fuzzy; stop at the first exact hit
+            hit = process.extractOne(text, list(values), scorer=fuzz.WRatio)
+            if not hit:
+                continue
+            score = float(hit[1])
+            if len(hit[0]) <= 6:
+                score = min(score, float(fuzz.ratio(text, hit[0])))
+            if score >= _VALUE_FUZZY_FLOOR:
+                if best_value_match is None or score > best_value_match.score:
+                    best_column, best_value_match = column_norm, TermMatch(
+                        query_text=text,
+                        resolved=hit[0],
+                        display=values[hit[0]],
+                        score=score,
+                        span=span,
+                    )
+        if best_value_match is not None:
+            column_match = TermMatch(
+                query_text=text,
+                resolved=best_column,
+                display=vocab.column_display.get(best_column, best_column),
+                score=100.0,
+                span=span,
+            )
+            found.append((column_match, best_value_match))
+            seen_columns.add(best_column)
+            local_claimed.append(span)
+
+    return found
+
+
 @dataclass
 class Probe:
     """Decision 1's output: everything the SQL thread needs, resolved in memory.
@@ -681,10 +888,26 @@ class Probe:
     extra_columns: list[TermMatch] = field(default_factory=list)
     multi_answer_cue: str = ""
     numeric_cue: str = ""
-    aggregate: str = ""          # "", "max", "min", "count", "filter"
+    aggregate: str = ""          # "", "max", "min", "count", "sum", "filter", "row_count"
     threshold: float | None = None
     comparator: str = ""         # ">" or "<"
     vocabulary_size: int = 0
+    # Bare-count support ("how many vendors are there"): which entity noun
+    # resolved, and which table it counts. Separate from ``column`` because
+    # it is resolved against ``vocab.entity_type_columns``, not the ordinary
+    # column vocabulary -- see ``_ENTITY_TYPE_MARKER``.
+    entity_type: TermMatch = field(default_factory=TermMatch)
+    entity_type_table: str = ""
+    # Multi-condition filtered list ("Server Racks at the Pune site"): every
+    # (column, value) pair the question named, resolved against
+    # ``vocab.column_values``. A single-condition filter ("Category" ==
+    # "Server Rack") is just a value_filters list of length 1 -- there is no
+    # separate single-condition code path.
+    value_filters: list[tuple[TermMatch, TermMatch]] = field(default_factory=list)
+    # "How many assets are Under Repair" wants a NUMBER, not the row list
+    # ("List the Under Repair assets" wants the list). Same filter query
+    # either way; only what ``_multi_filter`` renders as a fact differs.
+    filter_count_only: bool = False
 
 
 # "best"/"worst" are deliberately absent: they are subjective, not numeric, and
@@ -693,6 +916,19 @@ _SUPERLATIVE_MAX = ("highest", "greatest", "largest", "most", "top", "maximum", 
 _SUPERLATIVE_MIN = ("lowest", "smallest", "least", "minimum", "min")
 _ABOVE = ("above", "over", "more than", "greater than", "at least", "exceeds")
 _BELOW = ("below", "under", "less than", "fewer than", "at most")
+# "most" is deliberately absent here too: it is already a MAX cue above, and
+# "the most expensive asset" must resolve to a single winning row, not a sum.
+_SUM_CUES = (
+    "total value", "total cost", "total amount", "sum of", "combined",
+    "aggregate", "grand total", "total worth",
+)
+# Bare row-count over a whole table, naming the KIND of row rather than a
+# column: "how many vendors", "number of trainings", "count of assets",
+# "total number of". Distinct from ``NUMERIC_CUES``'s "how many"/"total",
+# which fire Decision 1 speculatively -- this decides WHICH aggregate kind,
+# once something has already fired.
+_COUNT_CUES = ("how many", "number of", "count of", "total number")
+_LIST_CUES = ("list all", "which ones", "show all", "every", "all the")
 
 # Words that mark a span as belonging to a THRESHOLD or superlative phrase,
 # never to an entity name. Withheld from entity resolution in ``prepare`` --
@@ -729,6 +965,10 @@ def _detect_aggregate(
         cue = _has_cue(question, cues)
         if cue and not _has_cue(named, (cue,)):
             return kind, "", None
+
+    sum_cue = _has_cue(question, _SUM_CUES)
+    if sum_cue and not _has_cue(named, (sum_cue,)):
+        return "sum", "", None
 
     for cues, comparator in ((_ABOVE, ">"), (_BELOW, "<")):
         cue = _has_cue(question, cues)
@@ -796,6 +1036,55 @@ def prepare(user_id: str, question: str) -> Probe:
         question, probe.column, probe.entity
     )
 
+    # Bare row-count / filtered-list over a whole table: "how many vendors",
+    # "list all Server Racks at the Pune site". Gated on TWO conditions, both
+    # required, not attempted just because a table exists:
+    #
+    # 1. The column-bound aggregate above came back empty -- a question that
+    #    resolved a real numeric column (MAX/MIN/SUM/threshold) already has
+    #    its answer.
+    # 2. A trustworthy single-cell lookup did NOT already resolve as an
+    #    unambiguous ONE-ANSWER question -- same suppression rule
+    #    ``_detect_aggregate`` already applies for MAX/MIN/SUM ("a question
+    #    that names a specific ROW is a lookup, not an aggregate"): "What
+    #    tier is Northwind Logistics?" resolves entity+column cleanly with NO
+    #    multi-answer cue and must stay a single-cell answer. "List all the
+    #    fault codes ... and what each one means" also resolves entity+
+    #    column, but its "all" cue means it wants every row, not the one
+    #    ``_single_cell`` would have matched -- so a multi-answer/list/count
+    #    cue overrides the single-cell shortcut here exactly the way it
+    #    already overrides Decision 2's trust in ``_single_cell`` itself.
+    # 3. The question actually carries a count/sum/list CUE -- without this,
+    #    every ordinary lookup question would probe every column's value
+    #    vocabulary for no reason, and "Northwind Logistics" would spuriously
+    #    fuzzy-match some unrelated column's stored value at the 88 floor.
+    trust = config.PARALLEL_SQL_TRUST_THRESHOLD
+    count_cue = _has_cue(question, _COUNT_CUES)
+    list_cue = _has_cue(question, _LIST_CUES)
+    wants_many = bool(count_cue or list_cue or probe.multi_answer_cue)
+    single_cell_would_resolve = (
+        probe.entity.score >= trust and probe.column.score >= trust and not wants_many
+    )
+    if not probe.aggregate and not single_cell_would_resolve and wants_many:
+        probe.entity_type = _resolve(
+            candidates, tuple(vocab.entity_type_columns), vocab.entity_type_display
+        )
+        value_claimed = claimed + (
+            [probe.entity_type.span] if probe.entity_type.span else []
+        )
+        probe.value_filters = _resolve_value_filters(candidates, value_claimed, vocab)
+        if probe.entity_type.resolved:
+            probe.entity_type_table = vocab.entity_type_tables.get(
+                probe.entity_type.resolved, ""
+            )
+        if probe.value_filters:
+            probe.aggregate = "filter"
+            probe.filter_count_only = count_cue and not list_cue
+        elif probe.entity_type.resolved and count_cue:
+            probe.aggregate = "row_count"
+        elif probe.entity_type.resolved and list_cue:
+            probe.aggregate = "filter"  # list-all with no condition: every row
+
     floor = config.PARALLEL_SQL_FIRE_THRESHOLD
     reasons = []
     if probe.column.score >= floor:
@@ -804,6 +1093,10 @@ def prepare(user_id: str, question: str) -> Probe:
         reasons.append(f"column~{extra.resolved}(100)")
     if probe.entity.score >= floor:
         reasons.append(f"entity~{probe.entity.resolved}({probe.entity.score:.0f})")
+    if probe.entity_type.score >= floor:
+        reasons.append(f"entity_type~{probe.entity_type.resolved}({probe.entity_type.score:.0f})")
+    for col_match, val_match in probe.value_filters:
+        reasons.append(f"filter~{col_match.resolved}={val_match.resolved}({val_match.score:.0f})")
     if probe.numeric_cue:
         reasons.append(f"cue:{probe.numeric_cue}")
 
@@ -828,7 +1121,7 @@ class ExactFact:
     page: int
     table_title: str
     table_id: str
-    kind: str = "cell"  # "cell", "max", "min", "count", "filter"
+    kind: str = "cell"  # "cell", "max", "min", "count", "sum", "row_count", "filter"
 
     def line(self) -> str:
         return f"{self.entity} - {self.column}: {self.value}"
@@ -993,6 +1286,36 @@ def _aggregate(probe: Probe) -> SqlResult:
         result.facts = [_fact(winners[0], kind=probe.aggregate)]
         return result
 
+    if probe.aggregate == "sum":
+        # Every discarded (non-numeric) row is REPORTED, not silently
+        # dropped: a sum computed over 178 of 180 rows while the answer
+        # implies completeness is exactly the dishonest-confidence failure
+        # this whole module exists to avoid. ``rows_returned`` already holds
+        # the parsed count; ``rows` (pre-filter) holds the true total.
+        total = sum(n for _, n in numeric)
+        discarded = len(rows) - len(numeric)
+        column = vocab.column_display.get(probe.column.resolved, probe.column.resolved)
+        first = rows[0]
+        coverage = f"{len(numeric)} of {len(rows)} rows"
+        entity_label = f"total {column}" if discarded == 0 else (
+            f"total {column} ({coverage}; {discarded} row(s) had no numeric "
+            f"value and were excluded)"
+        )
+        result.verdict = "confident"
+        result.facts = [
+            ExactFact(
+                entity=entity_label,
+                column="sum",
+                value=f"{total:g}",
+                source=first["source"],
+                page=int(first["page"] or 0),
+                table_title=first["table_title"],
+                table_id=first["table_id"],
+                kind="sum",
+            )
+        ]
+        return result
+
     if probe.threshold is None or not probe.comparator:
         result.verdict = "empty"
         result.reason = "no threshold parsed"
@@ -1035,6 +1358,206 @@ def _aggregate(probe: Probe) -> SqlResult:
     return result
 
 
+def _row_count(probe: Probe) -> SqlResult:
+    """Bare COUNT(*) over a whole table -- "how many vendors are there",
+    with no column and no threshold at all. The entity-type resolution in
+    ``prepare`` already picked the table; this just counts its distinct
+    entities, which ``TableInfo.entities`` already holds in memory -- no
+    query needed for the number itself, only for the citation.
+    """
+    result = SqlResult()
+    trust = config.PARALLEL_SQL_TRUST_THRESHOLD
+
+    if probe.entity_type.score < trust:
+        result.verdict = "ambiguous"
+        result.reason = f"entity-type match {probe.entity_type.score:.0f} < {trust}"
+        return result
+    if not probe.entity_type_table:
+        result.verdict = "empty"
+        result.reason = "entity-type column resolved to no table"
+        return result
+
+    vocab = vocabulary(probe.user_id)
+    info = vocab.tables.get(probe.entity_type_table)
+    if info is None:
+        result.verdict = "empty"
+        result.reason = "table vanished between resolve and execute"
+        return result
+
+    result.rows_returned = len(info.entities)
+    noun = vocab.entity_type_display.get(probe.entity_type.resolved, probe.entity_type.resolved)
+    result.verdict = "confident"
+    result.facts = [
+        ExactFact(
+            entity=f"count of {noun} rows",
+            column="count",
+            value=str(len(info.entities)),
+            source=info.source,
+            page=info.page,
+            table_title=info.title,
+            table_id=info.table_id,
+            kind="row_count",
+        )
+    ]
+    return result
+
+
+def _multi_filter(probe: Probe) -> SqlResult:
+    """Filtered list over one or more (column, value) conditions --
+    "Server Racks at the Pune site" is Category='Server Rack' AND
+    Site='Pune'; "list all data classification tiers" (no condition
+    resolved, just a list-cue) is every row of the resolved entity type.
+
+    Every condition must resolve to the SAME table -- a filter spanning two
+    unrelated tables is the same "category error" ``_aggregate`` already
+    refuses for MAX/MIN, just with more than one column involved.
+
+    Returns the SQL rows themselves, verbatim, as facts -- the model is
+    handed the finished list (see ``render_facts``'s instruction not to
+    recount or extend it), which is what keeps a fabricated ID like
+    "AST-2188" from ever entering the answer: it was never generated, it was
+    read directly out of ``table_cells``.
+    """
+    result = SqlResult()
+    table_id = probe.entity_type_table or ""
+    if probe.value_filters:
+        owners = {
+            vocabulary(probe.user_id).column_value_tables.get(col.resolved, "")
+            for col, _ in probe.value_filters
+        }
+        owners.discard("")
+        if len(owners) > 1:
+            result.verdict = "ambiguous"
+            result.reason = f"filter conditions span {len(owners)} tables"
+            return result
+        if owners:
+            (only_owner,) = owners
+            if table_id and table_id != only_owner:
+                result.verdict = "ambiguous"
+                result.reason = "entity-type table and filter-column table disagree"
+                return result
+            table_id = only_owner
+
+    if not table_id:
+        result.verdict = "empty"
+        result.reason = "no table resolved for filter"
+        return result
+
+    vocab = vocabulary(probe.user_id)
+    info = vocab.tables.get(table_id)
+    if info is None:
+        result.verdict = "empty"
+        result.reason = "table vanished between resolve and execute"
+        return result
+
+    if not probe.value_filters:
+        # No condition at all: "list all data classification tiers" names
+        # only the entity type. Every row in the table is the answer. Read
+        # through the reserved entity-type column rather than an arbitrary
+        # attribute column -- it exists on every row by construction (see
+        # ``cells_from_tables``), so this never depends on which attribute
+        # columns happen to be non-empty.
+        entity_type_norm = next(
+            (k for k, v in vocab.entity_type_tables.items() if v == table_id), ""
+        )
+        all_cells = db.column_cells(
+            probe.user_id,
+            vocab.entity_type_columns.get(entity_type_norm, ""),
+            table_id=table_id,
+        )
+        matching_indices = {int(r["row_index"]) for r in all_cells}
+    else:
+        matching_indices = None
+        for col, val in probe.value_filters:
+            rows_for_condition = db.rows_matching(
+                probe.user_id, table_id, col.resolved, val.resolved
+            )
+            matching_indices = (
+                rows_for_condition
+                if matching_indices is None
+                else matching_indices & rows_for_condition
+            )
+            if not matching_indices:
+                break
+
+    if not matching_indices:
+        if probe.filter_count_only:
+            # Zero IS the exact answer to "how many X are Y" -- not a miss.
+            result.verdict = "confident"
+            result.facts = [_zero_count_fact(probe, vocab, table_id)]
+            return result
+        result.verdict = "empty"
+        result.reason = "no rows matched every condition"
+        return result
+
+    if probe.filter_count_only:
+        # A COUNT never needs the row cap: the row cap protects against
+        # dumping an unbounded LIST of rows into the prompt, and a bare
+        # number costs nothing extra to state whether it is 2 or 200.
+        first_id = next(iter(db.rows_by_index(probe.user_id, table_id, {min(matching_indices)})), None)
+        result.rows_returned = len(matching_indices)
+        result.verdict = "confident"
+        condition = _filter_condition_label(probe, vocab)
+        result.facts = [
+            ExactFact(
+                entity=f"count of rows where {condition}",
+                column="count",
+                value=str(len(matching_indices)),
+                source=first_id["source"] if first_id else "",
+                page=int(first_id["page"] or 0) if first_id else 0,
+                table_title=first_id["table_title"] if first_id else "",
+                table_id=table_id,
+                kind="row_count",
+            )
+        ]
+        return result
+
+    if len(matching_indices) > config.PARALLEL_SQL_MAX_FILTER_ROWS:
+        result.verdict = "ambiguous"
+        result.reason = f"{len(matching_indices)} rows matched, over the cap"
+        return result
+
+    cells = db.rows_by_index(probe.user_id, table_id, matching_indices)
+    result.rows_returned = len(cells)
+    if not cells:
+        result.verdict = "empty"
+        result.reason = "matched rows had no stored cells"
+        return result
+
+    # One fact per matched ROW (its own entity label), not per cell -- the
+    # brief's acceptance check wants exactly the ID list, not every
+    # attribute of every matched row repeated back.
+    by_row: dict[int, dict] = {}
+    for cell in cells:
+        by_row.setdefault(int(cell["row_index"]), cell)
+    result.verdict = "confident"
+    result.facts = [_fact(row, kind="filter") for row in by_row.values()]
+    return result
+
+
+def _filter_condition_label(probe: "Probe", vocab: "Vocabulary") -> str:
+    if not probe.value_filters:
+        return "no condition"
+    return " and ".join(
+        f"{vocab.column_display.get(col.resolved, col.resolved)} = {val.display}"
+        for col, val in probe.value_filters
+    )
+
+
+def _zero_count_fact(probe: "Probe", vocab: "Vocabulary", table_id: str) -> ExactFact:
+    info = vocab.tables.get(table_id)
+    return ExactFact(
+        entity=f"count of rows where {_filter_condition_label(probe, vocab)}",
+        column="count",
+        value="0",
+        source=info.source if info else "",
+        page=info.page if info else 0,
+        table_title=info.title if info else "",
+        table_id=table_id,
+        kind="row_count",
+    )
+
+
 def execute(probe: Probe) -> SqlResult:
     """Run the probe's query. Safe to call on a worker thread.
 
@@ -1051,7 +1574,17 @@ def execute(probe: Probe) -> SqlResult:
         if not probe.fire:
             result.reason = probe.reason
             return result
-        if probe.aggregate:
+        # ``row_count`` and the multi-condition ``filter`` (identified by
+        # ``entity_type``/``value_filters`` being set -- see ``prepare``,
+        # where they are only attempted once the column-bound aggregate
+        # below has already come back empty) are resolved via the
+        # entity-type table rather than one resolved numeric column, so they
+        # dispatch to their own functions rather than through ``_aggregate``.
+        if probe.aggregate == "row_count":
+            inner = _row_count(probe)
+        elif probe.aggregate == "filter" and (probe.entity_type.resolved or probe.value_filters):
+            inner = _multi_filter(probe)
+        elif probe.aggregate:
             inner = _aggregate(probe)
         else:
             inner = _single_cell(probe)
@@ -1081,7 +1614,12 @@ FACT_INSTRUCTION = (
     "For any numeric or exact value below, use the EXACT FACT verbatim -- never "
     "recompute, round, reformat, or paraphrase it. Use the context passages for "
     "explanation and surrounding detail, and answer the question fully rather "
-    "than returning the bare value."
+    "than returning the bare value.\n"
+    "If more than one EXACT FACT is listed below, together they ARE the "
+    "complete answer set -- state exactly those items and nothing else. Do "
+    "NOT add, drop, recount, re-derive, or estimate any item, and do NOT "
+    "list example rows of your own; an item not listed below was not found, "
+    "and inventing one is worse than a shorter answer."
 )
 
 

@@ -563,6 +563,70 @@ def column_cells(
     return [dict(r) for r in rows]
 
 
+def column_values(user_id: str) -> list[dict]:
+    """Every distinct (table, column, value) triple this user owns.
+
+    Seeds the vocabulary's per-column distinct-value cache, the piece needed
+    to resolve a query fragment like "Under Repair" or "Pune" to the COLUMN
+    it is a value of (Status, Site), before a multi-condition filter can be
+    built. Grouped, not raw, for the same reason ``table_vocabulary`` groups:
+    this is read once per user into memory, not re-queried per request.
+    """
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT table_id, column_norm, value FROM table_cells"
+            " WHERE user_id = ? GROUP BY table_id, column_norm, value",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def rows_matching(
+    user_id: str, table_id: str, column_norm: str, value_norm: str
+) -> set[int]:
+    """``row_index`` values in ``table_id`` where ``column_norm`` casefolds to
+    ``value_norm`` exactly.
+
+    Exact (post-casefold) rather than fuzzy: a multi-condition filter
+    intersects several of these sets, and letting each condition fuzzy-match
+    independently would compound false positives across conditions rather
+    than requiring each one to genuinely hold. Fuzzy resolution already
+    happened one level up, to pick WHICH column and WHICH stored value the
+    query fragment means -- this only checks whether a row actually carries
+    that already-resolved value.
+    """
+    init_db()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT row_index FROM table_cells WHERE user_id = ?"
+            " AND table_id = ? AND column_norm = ? AND LOWER(value) = ?",
+            (user_id, table_id, column_norm, value_norm),
+        ).fetchall()
+    return {int(r["row_index"]) for r in rows}
+
+
+def rows_by_index(user_id: str, table_id: str, row_indices: set[int]) -> list[dict]:
+    """Every cell for a set of rows in one table, for rendering a filter result.
+
+    Callers pass an already-computed set of matching ``row_index`` values
+    (see ``rows_matching``); this fetches everything about just those rows so
+    a filtered-list answer can show the row's own identifying label alongside
+    the columns that made it match, without a second per-row round trip.
+    """
+    if not row_indices:
+        return []
+    init_db()
+    placeholders = ",".join("?" for _ in row_indices)
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM table_cells WHERE user_id = ? AND table_id = ?"
+            f" AND row_index IN ({placeholders}) ORDER BY row_index, id",
+            (user_id, table_id, *sorted(row_indices)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def count_table_cells(user_id: str) -> int:
     init_db()
     with connect() as conn:
