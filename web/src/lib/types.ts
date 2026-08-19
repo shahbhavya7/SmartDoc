@@ -47,6 +47,23 @@ export interface Grounding {
 /** colpali branch experiment: which pipeline answers /ask. See backend/main.py. */
 export type RetrievalBackend = "hybrid" | "colpali";
 
+/**
+ * table-router branch: the composer's three-way mode. "auto" is UI-only --
+ * the server never sees this value, it means the request omits `backend`
+ * entirely so backend.router_graph decides. "hybrid"/"colpali" are the
+ * existing manual override, unchanged, for direct A/B testing.
+ */
+export type RetrievalMode = RetrievalBackend | "auto";
+
+/**
+ * table-router branch: which path actually answered a question. Set by
+ * backend.router_graph in Auto mode, and reported the same way for a manual
+ * override -- one vocabulary regardless of how the backend was chosen. Null
+ * only for the conversation_meta short-circuit, which never reaches a
+ * pipeline. See backend/main.py's AskResponse.
+ */
+export type RoutePath = "table_colpali" | "normal_hybrid" | "sql_aggregation";
+
 export interface AskResponse {
   answer: string;
   sources: Source[];
@@ -56,6 +73,15 @@ export interface AskResponse {
   session_id: string | null;
   /** Which pipeline actually answered -- 'hybrid' or 'colpali' (visual). */
   backend: RetrievalBackend;
+  /** table-router branch: which path answered. Null for conversation_meta. */
+  path: RoutePath | null;
+  /**
+   * table-router branch: end-to-end server time in milliseconds, sourced from
+   * the backend's own timer -- render this directly, never a client-side
+   * stopwatch, so it reflects actual processing time. Null only for
+   * conversation_meta.
+   */
+  latency_ms: number | null;
 }
 
 export interface DocumentRecord {

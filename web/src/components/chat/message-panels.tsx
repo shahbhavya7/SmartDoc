@@ -17,7 +17,34 @@ import { GroundingNotice } from "@/components/chat/grounding-notice";
 import { SourcesPanel } from "@/components/chat/sources-panel";
 import { useProgressiveText } from "@/components/chat/use-progressive-text";
 import { cn } from "@/lib/utils";
-import type { Grounding, Source } from "@/lib/types";
+import type { Grounding, RetrievalBackend, RoutePath, Source } from "@/lib/types";
+
+/** table-router branch: human label for the "Answered via" line. */
+const BACKEND_LABEL: Record<RetrievalBackend, string> = {
+  hybrid: "Hybrid RAG",
+  colpali: "ColPali",
+};
+
+/**
+ * table-router branch: `path` is the more specific signal (it distinguishes
+ * the SQL fast path from an ordinary hybrid answer), so it wins when present;
+ * `backend` is the fallback for the rare case a path wasn't recorded.
+ */
+function answeredViaLabel(
+  backend: RetrievalBackend | undefined,
+  path: RoutePath | null | undefined,
+): string | null {
+  if (path === "sql_aggregation") return "Exact match (SQL)";
+  if (path === "table_colpali") return "ColPali";
+  if (path === "normal_hybrid") return "Hybrid RAG";
+  if (backend) return BACKEND_LABEL[backend];
+  return null;
+}
+
+function formatLatency(ms: number | null | undefined): string | null {
+  if (ms === null || ms === undefined) return null;
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
 
 export function QuestionPanel({ content }: { content: string }) {
   return (
@@ -42,6 +69,9 @@ export function AnswerPanel({
   sources,
   grounding,
   queryType,
+  backend,
+  path,
+  latencyMs,
   /** True for the turn just answered: reveals the text progressively. */
   animate = false,
 }: {
@@ -49,6 +79,10 @@ export function AnswerPanel({
   sources: Source[];
   grounding: Grounding | null;
   queryType?: string;
+  /** table-router branch: which backend/path answered, and how long it took. */
+  backend?: RetrievalBackend;
+  path?: RoutePath | null;
+  latencyMs?: number | null;
   animate?: boolean;
 }) {
   const { visible, done } = useProgressiveText(content, animate);
@@ -79,11 +113,22 @@ export function AnswerPanel({
           <>
             <GroundingNotice grounding={grounding} />
             <SourcesPanel sources={sources} />
-            {queryType ? (
-              <p className="mt-3 text-[11px] uppercase tracking-wider text-muted-foreground/60">
-                {queryType.replace(/_/g, " ")}
-              </p>
-            ) : null}
+            {(() => {
+              const via = answeredViaLabel(backend, path);
+              const latency = formatLatency(latencyMs);
+              if (!via && !queryType) return null;
+              return (
+                <p className="mt-3 flex flex-wrap items-center gap-x-2 text-[11px] uppercase tracking-wider text-muted-foreground/60">
+                  {via ? (
+                    <span>
+                      Answered via: {via}
+                      {latency ? ` · ${latency}` : ""}
+                    </span>
+                  ) : null}
+                  {queryType ? <span>{queryType.replace(/_/g, " ")}</span> : null}
+                </p>
+              );
+            })()}
           </>
         ) : null}
       </div>

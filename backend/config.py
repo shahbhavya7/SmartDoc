@@ -76,6 +76,17 @@ REQUEST_MAX_RETRIES = _int("REQUEST_MAX_RETRIES", 3)
 # default does, which the brief accepts.
 RETRIEVAL_BACKEND = os.getenv("RETRIEVAL_BACKEND", "hybrid")
 
+# `table-router` branch. /ask's default mode ("auto", see AskRequest.mode in
+# backend/main.py) routes each question through backend.router_graph's
+# LangGraph classifier instead of a fixed RETRIEVAL_BACKEND. These two name
+# which pipeline each branch of that router lands on -- config, not a literal
+# "colpali"/"hybrid" baked into the graph, so the destination can be swapped
+# (e.g. to point TABLE_ROUTE_BACKEND at hybrid too, for an A/B test) without
+# touching backend/router_graph.py. Values are the same RetrievalBackend
+# space as RETRIEVAL_BACKEND above ("hybrid" or "colpali").
+TABLE_ROUTE_BACKEND = os.getenv("TABLE_ROUTE_BACKEND", "colpali")
+NORMAL_ROUTE_BACKEND = os.getenv("NORMAL_ROUTE_BACKEND", "hybrid")
+
 # ---------------------------------------------------------------------------
 # Chunking
 #

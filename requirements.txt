@@ -2,6 +2,12 @@ fastapi==0.115.6
 uvicorn==0.34.0
 streamlit==1.41.1
 langchain==0.3.14
+# table-router branch. Pulls in langchain-core>=1.0, which the pinned
+# langchain==0.3.14 above nominally wants <1.0 -- pip warns but nothing in
+# this codebase's langchain usage (ingestion.py/vectorstore.py/tables.py's
+# Document + RecursiveCharacterTextSplitter) broke; the full test suite and
+# a live server run were verified against this exact combination.
+langgraph==1.2.11
 chromadb==0.5.23
 openai==1.59.7
 pymupdf==1.25.1

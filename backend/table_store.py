@@ -991,12 +991,33 @@ def prepare(user_id: str, question: str) -> Probe:
 
     Returns a Probe with ``fire=False`` and a reason whenever SQL is pointless,
     so the diagnostics can say *why* nothing ran rather than only that nothing did.
+
+    Gated on ``PARALLEL_SQL_LOOKUP_ENABLED``: this is the entry point for
+    actually EXECUTING a speculative SQL lookup, and that costs a worker-thread
+    submission per call even when nothing fires. `table-router` branch:
+    :func:`classify_table_relatedness` needs the same resolution this function
+    does, but as a pure routing SIGNAL that must work regardless of whether SQL
+    lookup itself is enabled -- so it calls :func:`_probe_uncached` directly,
+    skipping this gate.
     """
-    probe = Probe(user_id=user_id, question=question)
     if not config.PARALLEL_SQL_LOOKUP_ENABLED:
+        probe = Probe(user_id=user_id, question=question)
         probe.reason = "flag off"
         return probe
+    return _probe_uncached(user_id, question)
 
+
+def _probe_uncached(user_id: str, question: str) -> Probe:
+    """The actual Decision 1 resolution, without the feature-flag gate.
+
+    Split out of :func:`prepare` so :func:`classify_table_relatedness` (the
+    `table-router` branch's classifier) can reuse the exact same fuzzy
+    entity/column resolution against the user's table vocabulary, independent
+    of whether SQL lookup EXECUTION is enabled -- routing to ColPali and
+    running the SQL fast-path are separate features with separate on/off
+    switches.
+    """
+    probe = Probe(user_id=user_id, question=question)
     vocab = vocabulary(user_id)
     probe.vocabulary_size = len(vocab.tables)
     if vocab.empty:
@@ -1103,6 +1124,88 @@ def prepare(user_id: str, question: str) -> Probe:
     probe.fire = bool(reasons)
     probe.reason = ", ".join(reasons) if reasons else "no column, entity, or numeric cue"
     return probe
+
+
+@dataclass(frozen=True)
+class TableRelatedness:
+    """Verdict for the `table-router` branch's LangGraph classifier node.
+
+    ``is_table_related`` is the routing bit; ``reason`` and ``probe`` are
+    carried through so a caller (the router node, or a log line) can explain
+    the classification without re-running resolution.
+    """
+
+    is_table_related: bool
+    reason: str
+    probe: Probe
+
+
+def classify_table_relatedness(user_id: str, question: str) -> TableRelatedness:
+    """Does ``question`` reference a specific row/cell/entity known to live in
+    a table, or ask about content/values inside one?
+
+    `table-router` branch: the CLASSIFIER node's decision signal. Reuses the
+    same fuzzy entity/column resolution as Decision 1 (:func:`_probe_uncached`)
+    rather than a second, drifting word-list -- "is this question about my
+    tables" and "should SQL fire" both start from the same underlying
+    question (does a term in it resolve against this user's column/entity
+    vocabulary?). Distinct from Decision 1 in two respects:
+
+    1. It runs regardless of ``PARALLEL_SQL_LOOKUP_ENABLED``, since routing to
+       ColPali is a separate concern from executing the SQL fast-path.
+    2. It gates on Decision 2's STRICT trust floor
+       (``PARALLEL_SQL_TRUST_THRESHOLD``, 85 by default), not Decision 1's
+       permissive fire floor (78, "fire on any hint"). Decision 1 can afford
+       to be permissive because Decision 2 vetoes a bad match before it is
+       ever stated as fact -- the router has no such second gate, and a
+       weak/ambiguous fuzzy hit routed to the wrong backend is not a no-op
+       the way a discarded SQL result is.
+    3. It re-checks a strong match with a SHORT query span against plain
+       edit-distance, via :func:`_confident_match` below. Measured: "What is
+       the process for requesting remote work?" fuzzy-matches the word
+       "work" against the stored fault-code entity "network link lost" at
+       WRatio 90 -- over even the strict floor -- because WRatio's
+       partial-ratio component rewards "work" appearing as a near-substring
+       fragment of "network". ``_resolve``'s own docstring already documents
+       this exact failure mode for a SHORT CANDIDATE ("Bo" inside "above")
+       and guards it there by combining WRatio with plain ``fuzz.ratio``; the
+       guard is keyed on ``len(hit[0])`` (the candidate's length) so it does
+       not cover the reverse case -- a short QUERY span against a long
+       candidate -- which is exactly this failure. That asymmetry is not
+       fixed in ``_resolve`` itself: doing so would also change Decision 1's
+       fire signal for the already-shipped SQL aggregation feature, which is
+       out of scope here. ``_confident_match`` applies the identical
+       combination rule, scoped to this classifier only.
+
+    A user with no stored tables (no ingested document produced one, or
+    Addendum 2 has never populated ``table_cells`` for them) can never be
+    classified table-related -- there is no vocabulary to match against, so
+    every question falls through to NORMAL_ROUTE_BACKEND.
+    """
+    probe = _probe_uncached(user_id, question)
+    if probe.vocabulary_size == 0:
+        return TableRelatedness(False, probe.reason or "no stored tables", probe)
+
+    trust = config.PARALLEL_SQL_TRUST_THRESHOLD
+    is_related = (
+        _confident_match(probe.column, trust)
+        or _confident_match(probe.entity, trust)
+        or _confident_match(probe.entity_type, trust)
+        or bool(probe.value_filters)
+        or bool(probe.aggregate)
+    )
+    return TableRelatedness(is_related, probe.reason, probe)
+
+
+def _confident_match(match: TermMatch, trust: float) -> bool:
+    """Is ``match`` a genuinely confident resolution, not a short-query-span
+    coincidence? See :func:`classify_table_relatedness` point 3 above.
+    """
+    if match.score < trust:
+        return False
+    if len(match.query_text) <= 6:
+        return fuzz.ratio(match.query_text, match.resolved) >= trust
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -49,6 +49,7 @@ Run with:
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -78,6 +79,8 @@ from backend.memory import (
     summarize_turn_and_store,
 )
 from backend.rag import GenerationError, InvalidQuestionError, RagError, query
+from backend.router_graph import RoutePath
+from backend.router_graph import run as run_router
 from backend.user_scope import ScopeError, user_scope
 from backend.vectorstore import VectorStoreError, collection_stats, get_chunks_where
 
@@ -302,6 +305,30 @@ class AskResponse(BaseModel):
             "(colpali_experiment, a separate visual/page-image pipeline). "
             "Selected by RETRIEVAL_BACKEND, overridable per-request via the "
             "`backend` query parameter on this endpoint."
+        ),
+    )
+    path: RoutePath | None = Field(
+        default=None,
+        description=(
+            "table-router branch: which path actually answered this question -- "
+            "'table_colpali' (the classifier judged it table-related and ColPali "
+            "answered), 'normal_hybrid' (judged normal, or a manual override, "
+            "and the hybrid pipeline's own retrieval/generation answered), or "
+            "'sql_aggregation' (an exact count/sum/max/min resolved by "
+            "backend.table_store's SQL fast path, ahead of generation -- this "
+            "always wins regardless of the table/normal classification). None "
+            "only for the conversation_meta short-circuit, which never reaches "
+            "either pipeline."
+        ),
+    )
+    latency_ms: int | None = Field(
+        default=None,
+        description=(
+            "table-router branch: end-to-end time in milliseconds, from this "
+            "request entering routing/answering to the answer (with citations) "
+            "being ready -- excludes only the meta-question short-circuit, which "
+            "never runs a pipeline. Sourced from the server's own timer, not a "
+            "client-side guess, so the frontend can render it directly."
         ),
     )
 
@@ -962,11 +989,17 @@ async def upload(
         "is used to resolve references (\"that policy\", \"the same band\"), and "
         "the summary is updated by a background task AFTER this response is "
         "sent -- summarization never adds to this call's latency.\n\n"
-        "colpali branch experiment: `backend` selects which pipeline answers "
-        "-- 'hybrid' (default, this description) or 'colpali' (a separate "
-        "visual/page-image pipeline, colpali_experiment). Omit it to use "
-        "RETRIEVAL_BACKEND's configured default. Session/memory persistence "
-        "is identical either way."
+        "table-router branch: by default (omit `backend`) each question is "
+        "classified table-related or normal by a LangGraph router and sent to "
+        "`TABLE_ROUTE_BACKEND` ('colpali' by default) or `NORMAL_ROUTE_BACKEND` "
+        "('hybrid' by default); an aggregation/counting question is always "
+        "forced to hybrid's SQL fast path regardless of that classification. "
+        "Passing `backend` bypasses routing and answers via that one pipeline "
+        "directly -- 'hybrid' (this description) or 'colpali' (a separate "
+        "visual/page-image pipeline, colpali_experiment) -- for manual A/B "
+        "testing. The response's `path` and `latency_ms` report which path "
+        "actually answered and how long it took, either way. Session/memory "
+        "persistence is identical regardless of routing."
     ),
     responses={404: {"model": ErrorResponse}},
 )
@@ -977,12 +1010,26 @@ def ask(
     backend: RetrievalBackend | None = Query(
         default=None,
         description=(
-            "colpali branch experiment: override RETRIEVAL_BACKEND for this "
-            "request only, e.g. for side-by-side testing without a restart."
+            "Bypass the Auto router and answer via this one pipeline directly "
+            "for this request only, e.g. for side-by-side testing. Omit for "
+            "Auto mode (the router decides per-question)."
         ),
     ),
 ) -> AskResponse | JSONResponse:
-    """Answer ``payload.question``, optionally as a turn in ``payload.session_id``."""
+    """Answer ``payload.question``, optionally as a turn in ``payload.session_id``.
+
+    table-router branch: with no ``backend`` query param (the frontend's
+    default "Auto" mode), routing is decided per-question by
+    ``backend.router_graph`` -- a LangGraph classifier that judges each
+    question table-related or normal and sends it to
+    ``config.TABLE_ROUTE_BACKEND`` / ``config.NORMAL_ROUTE_BACKEND``
+    respectively, with an aggregation/counting question always forced to
+    hybrid (the only backend with the SQL fast path) regardless of that
+    classification. Passing ``backend`` explicitly bypasses the router
+    entirely and answers via that one pipeline directly, unchanged from the
+    colpali branch's manual A/B toggle.
+    """
+    request_started = time.perf_counter()
     question = payload.question
     if len(question) > MAX_QUESTION_CHARS:
         raise QuestionTooLongError(
@@ -990,18 +1037,18 @@ def ask(
             f"{MAX_QUESTION_CHARS}-character limit. Please shorten it."
         )
 
-    # Per-request override takes precedence over the .env default -- the
-    # brief's requirement that switching never needs a restart. Falls back to
+    # A manual override takes precedence over routing entirely -- the manual
+    # A/B toggle's contract from before this router existed. Falls back to
     # "hybrid" (not whatever config.RETRIEVAL_BACKEND says) if the requested
     # backend is "colpali" but the experimental dependency isn't installed --
     # see _colpali_available above; the hybrid path must always work.
-    active_backend: RetrievalBackend = backend or config.RETRIEVAL_BACKEND  # type: ignore[assignment]
-    if active_backend == "colpali" and not _colpali_available:
+    manual_backend: RetrievalBackend | None = backend
+    if manual_backend == "colpali" and not _colpali_available:
         logger.warning(
-            "RETRIEVAL_BACKEND=colpali requested but colpali_experiment is "
-            "unavailable; falling back to hybrid."
+            "backend=colpali requested but colpali_experiment is unavailable; "
+            "falling back to hybrid."
         )
-        active_backend = "hybrid"
+        manual_backend = "hybrid"
 
     session = None
     if payload.session_id is not None:
@@ -1048,9 +1095,26 @@ def ask(
             grounding=None,
             diagnostics=None,
             session_id=session["id"] if session else None,
+            path=None,
+            latency_ms=None,
         )
 
-    if active_backend == "colpali":
+    conversation_context = session["summary"] if session else None
+    conversation_focus = session["last_document"] if session else None
+
+    if manual_backend is None:
+        # Auto mode: the router classifies and picks the destination itself.
+        routed = run_router(
+            user_id,
+            question,
+            conversation_context=conversation_context,
+            conversation_focus=conversation_focus,
+        )
+        response = routed.response
+        active_backend: RetrievalBackend = routed.backend_used
+        path: RoutePath = routed.path
+        latency_ms = routed.latency_ms
+    elif manual_backend == "colpali":
         # colpali_experiment.answer.answer() does its own per-user filtering
         # at the store layer (store.get_user_embeddings(user_id) is scoped in
         # SQL), so it needs no user_scope() -- that context manager exists
@@ -1058,6 +1122,9 @@ def ask(
         # never touches.
         visual_answer = _colpali_answer(user_id, question)
         response = _colpali_to_rag_response(visual_answer)
+        active_backend = "colpali"
+        path = "table_colpali"
+        latency_ms = round((time.perf_counter() - request_started) * 1000)
     else:
         # The scope is bound around the whole pipeline rather than passed into
         # it: retrieval is final code and takes no user argument, and binding
@@ -1068,9 +1135,17 @@ def ask(
             # Blank questions raise InvalidQuestionError inside query() itself.
             response = query(
                 question,
-                conversation_context=session["summary"] if session else None,
-                conversation_focus=session["last_document"] if session else None,
+                conversation_context=conversation_context,
+                conversation_focus=conversation_focus,
             )
+        active_backend = "hybrid"
+        sql_lookup = (response.diagnostics or {}).get("sql_lookup") or {}
+        path = (
+            "sql_aggregation"
+            if sql_lookup.get("answered_by") == "sql_aggregation"
+            else "normal_hybrid"
+        )
+        latency_ms = round((time.perf_counter() - request_started) * 1000)
 
     if session is not None:
         db.add_message(user_id, session["id"], "assistant", response.answer)
@@ -1099,6 +1174,8 @@ def ask(
         **response.to_dict(),
         session_id=session["id"] if session else None,
         backend=active_backend,
+        path=path,
+        latency_ms=latency_ms,
     )
 
 

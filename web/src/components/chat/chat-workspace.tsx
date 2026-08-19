@@ -47,7 +47,7 @@ import {
 } from "@/lib/answer-cache";
 import { useDocuments, useSessions } from "@/lib/hooks";
 import { sessionLabel } from "@/lib/format";
-import type { AskResponse, ChatMessage, RetrievalBackend } from "@/lib/types";
+import type { AskResponse, ChatMessage, RetrievalMode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** A turn still in flight, held outside the message list until it resolves. */
@@ -80,10 +80,12 @@ export function ChatWorkspace() {
   const [pending, setPending] = useState<PendingTurn | null>(null);
   const [turnError, setTurnError] = useState<string | null>(null);
   const [elapsed, setElapsed] = useState(0);
-  // colpali branch experiment: which pipeline answers the NEXT question.
-  // Per-request, not persisted -- switching is meant to be cheap, side-by-side
-  // testing, not a durable per-session setting.
-  const [retrievalBackend, setRetrievalBackend] = useState<RetrievalBackend>("hybrid");
+  // table-router branch: which mode answers the NEXT question -- "auto"
+  // (default: backend.router_graph classifies and picks the backend itself)
+  // or a manual override to one pipeline. Per-request, not persisted --
+  // switching is meant to be cheap, side-by-side testing, not a durable
+  // per-session setting.
+  const [retrievalMode, setRetrievalMode] = useState<RetrievalMode>("auto");
 
   const [creating, setCreating] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -310,6 +312,9 @@ export function ChatWorkspace() {
             sources: response.sources,
             grounding: response.grounding,
             query_type: response.query_type,
+            backend: response.backend,
+            path: response.path,
+            latency_ms: response.latency_ms,
           },
         }));
         rememberAnswer(lastAssistant.id, response);
@@ -332,8 +337,16 @@ export function ChatWorkspace() {
       setDraft("");
 
       try {
+        // "auto" means backend.router_graph decides -- omit `backend` entirely
+        // rather than sending the literal string, which the server would
+        // reject (RetrievalBackend is only "hybrid" | "colpali").
         const response = await authorizedFetch((token) =>
-          api.ask(token, trimmed, sessionId, retrievalBackend),
+          api.ask(
+            token,
+            trimmed,
+            sessionId,
+            retrievalMode === "auto" ? null : retrievalMode,
+          ),
         );
 
         // Optimistic rows so the answer appears the moment it arrives. Temporary
@@ -366,6 +379,9 @@ export function ChatWorkspace() {
             sources: response.sources,
             grounding: response.grounding,
             query_type: response.query_type,
+            backend: response.backend,
+            path: response.path,
+            latency_ms: response.latency_ms,
           },
         }));
         // This and only this answer gets the progressive reveal.
@@ -384,7 +400,7 @@ export function ChatWorkspace() {
         setDraft(trimmed);
       }
     },
-    [authorizedFetch, sessions, recordTurnCitations, retrievalBackend],
+    [authorizedFetch, sessions, recordTurnCitations, retrievalMode],
   );
 
   /**
@@ -574,6 +590,9 @@ export function ChatWorkspace() {
                   sources={meta?.sources ?? []}
                   grounding={meta?.grounding ?? null}
                   queryType={meta?.query_type}
+                  backend={meta?.backend}
+                  path={meta?.path}
+                  latencyMs={meta?.latency_ms}
                   animate={message.id === animatingId}
                 />
               );
@@ -612,8 +631,8 @@ export function ChatWorkspace() {
                 Answer using
               </span>
               <BackendToggle
-                value={retrievalBackend}
-                onChange={setRetrievalBackend}
+                value={retrievalMode}
+                onChange={setRetrievalMode}
                 disabled={!!pending || creating}
               />
             </div>

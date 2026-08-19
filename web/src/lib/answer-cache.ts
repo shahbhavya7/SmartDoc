@@ -30,6 +30,10 @@ export interface CachedAnswer {
   sources: AskResponse["sources"];
   grounding: AskResponse["grounding"];
   query_type: string;
+  /** table-router branch: which backend/path answered, and how long it took. */
+  backend: AskResponse["backend"];
+  path: AskResponse["path"];
+  latency_ms: AskResponse["latency_ms"];
 }
 
 type CacheShape = Record<string, CachedAnswer>;
@@ -70,6 +74,9 @@ export function rememberAnswer(messageId: string, response: AskResponse): void {
     sources: response.sources,
     grounding: response.grounding,
     query_type: response.query_type,
+    backend: response.backend,
+    path: response.path,
+    latency_ms: response.latency_ms,
   };
   write(cache);
 }
